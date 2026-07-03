@@ -33,7 +33,7 @@ import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR } from '../config.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
 import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
-import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
+import { schedulePluginUnlockAfterRespawn, getSessionClaudePid, hasBunChild } from './channel-plugin-unlock.js'
 import { getSecret } from './vault.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
@@ -705,7 +705,14 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // typically appears within 4-6s). Survey-rating modals from prior
     // sessions can also be present, so dismiss both. Errors are swallowed
     // -- the outbound pre-flight remains the safety net if this misses.
-    scheduleIdentitySetup(session, readAgentDisplayName(name))
+    scheduleIdentitySetup(
+      session,
+      readAgentDisplayName(name),
+      null,
+      // Channel agents: never type the /name into the pane while the plugin
+      // MCP init may still be pending (see CHANNEL_COLDSTART_HOLD_MS).
+      hasChannel ? { waitForChannelPluginMs: CHANNEL_COLDSTART_HOLD_MS } : {},
+    )
 
     // Colleague auto-unlock (2026-06-22): mirror the main session's
     // post-respawn unlock probe for channel-having sub-agents. After a restart
@@ -776,6 +783,51 @@ export function restartAgentProcess(name: string, opts: { fresh?: boolean } = {}
   return startAgentProcess(name, opts)
 }
 
+// Channel-plugin cold-start hold (2026-07-03 "absent plugin" root cause).
+//
+// Claude Code initialises the --channels plugin MCP server ASYNCHRONOUSLY after
+// the TUI renders. The init latency is network-bound (marketplace refresh):
+// 1-2s on a good day, 12-70s observed under a slow refresh. ANY keystroke
+// injected into the pane while that init is still pending silently aborts the
+// plugin MCP registration on CC 2.1.199 -- no MCP entry, no bun poller, deaf
+// bot, and the down-cascade then burns the whole restart budget on a condition
+// each restart re-creates. Verified by intervention: byte-identical launches
+// with vs. without early keystrokes -> with = plugin absent, without = healthy
+// poller (plugintest-exact vs agent-ive, 2026-07-03 13:49-13:52).
+//
+// So every automated sender that types into a CHANNEL agent's pane during the
+// cold-start window must first check this hold: true while the agent's claude
+// is younger than CHANNEL_COLDSTART_HOLD_MS and its bun poller has not yet
+// appeared. Channel-less agents never hold (they have no poller to wait for).
+export const CHANNEL_COLDSTART_HOLD_MS = 120_000
+
+function processAgeMsForHold(pid: number): number | null {
+  try {
+    const out = execSync(`/bin/ps -o etimes= -p ${pid}`, { timeout: 3000, encoding: 'utf-8' }).trim()
+    const s = parseInt(out, 10)
+    return Number.isFinite(s) ? s * 1000 : null
+  } catch {
+    return null
+  }
+}
+
+export function channelColdStartHoldActive(agentName: string): boolean {
+  try {
+    if (agentName === MAIN_AGENT_ID) return false // main comes up via channels.sh, not this path
+    const agentProvider = resolveAgentProvider(agentName)
+    const token = readChannelToken(agentProvider, join(channelStateDir(agentProvider, agentDir(agentName)), '.env'))
+    const hasChannel = !!token || (agentProvider === 'telegram' && !!parseTelegramToken(agentName))
+    if (!hasChannel) return false
+    const pid = getSessionClaudePid(agentSessionName(agentName))
+    if (pid == null) return false
+    const age = processAgeMsForHold(pid)
+    if (age == null || age > CHANNEL_COLDSTART_HOLD_MS) return false
+    return !hasBunChild(pid)
+  } catch {
+    return false // fail-open: never let the hold probe strand delivery
+  }
+}
+
 // Claude Code occasionally pops a "How is Claude doing this session? (optional)"
 // rating modal above the prompt input. The footer line still reads
 // "bypass permissions on (shift+tab to cycle)" so detectPaneState() classifies
@@ -844,8 +896,20 @@ const IDENTITY_SEND_DELAY_MS = 5000
 // (resumeMarveenSession / respawnMarveenSessionFresh), which previously left the
 // main session without its identity after auto-recovery. Fire-and-forget; all
 // errors are swallowed/logged so a missed setup never tears down the caller.
-export function scheduleIdentitySetup(session: string, displayName: string, host: string | null = null): void {
-  setTimeout(() => {
+// `opts.waitForChannelPluginMs`: for CHANNEL agents, the /name keystrokes were
+// the very injection that aborted the plugin MCP init on slow cold-starts (see
+// CHANNEL_COLDSTART_HOLD_MS above) -- the fixed 8s+5s schedule landed exactly
+// inside the 12-70s init window. When set, the setup polls every 5s and fires
+// only once the bun poller is up, or after the cap expires (the /name is
+// cosmetic; being late is free, being early kills the channel).
+export function scheduleIdentitySetup(
+  session: string,
+  displayName: string,
+  host: string | null = null,
+  opts: { waitForChannelPluginMs?: number } = {},
+): void {
+  const scheduledAt = Date.now()
+  const fire = (): void => {
     try {
       dismissSurveyModalIfPresent(session, host)
       dismissResumeSummaryModalIfPresent(session, host)
@@ -863,7 +927,24 @@ export function scheduleIdentitySetup(session: string, displayName: string, host
         logger.warn({ err, session, displayName }, 'Failed to set session /name')
       }
     }, IDENTITY_SEND_DELAY_MS)
-  }, MODAL_DISMISS_DELAY_MS)
+  }
+  const attempt = (): void => {
+    const waitMs = opts.waitForChannelPluginMs ?? 0
+    // Remote (ssh) sessions: no local pid to probe; keep the legacy timing.
+    if (waitMs > 0 && host == null) {
+      const pid = getSessionClaudePid(session)
+      if (pid != null && !hasBunChild(pid) && Date.now() - scheduledAt < waitMs) {
+        setTimeout(attempt, 5000)
+        return
+      }
+      logger.info(
+        { session, waitedMs: Date.now() - scheduledAt },
+        'Identity setup: channel plugin cold-start wait finished, sending /name',
+      )
+    }
+    fire()
+  }
+  setTimeout(attempt, MODAL_DISMISS_DELAY_MS)
 }
 
 // How many follow-up actions (retry-Enter OR clear-and-resend)

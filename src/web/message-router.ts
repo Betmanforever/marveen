@@ -9,6 +9,7 @@ import {
 import { readAgentRemoteHost, readAgentVoiceConfig } from './agent-config.js'
 import {
   agentSessionName,
+  channelColdStartHoldActive,
   isSessionReadyForPrompt,
   clearStaleParkedInput,
   sendPromptToSession,
@@ -105,6 +106,19 @@ export function startMessageRouter(): NodeJS.Timeout {
       if (!sessionExists) {
         if (!routerLoggedMisses.has(msg.id)) {
           logger.warn({ id: msg.id, to: msg.to_agent, session }, 'Agent message target session not running, will retry')
+          routerLoggedMisses.add(msg.id)
+        }
+        continue
+      }
+
+      // Channel-plugin cold-start hold: never inject a prompt while a freshly
+      // (re)started channel agent's plugin MCP init may still be pending --
+      // the keystrokes silently abort the registration (CC 2.1.199) and the
+      // agent comes up permanently deaf. The message stays pending; the next
+      // router tick retries (bun child appears or the hold window expires).
+      if (!host && channelColdStartHoldActive(msg.to_agent)) {
+        if (!routerLoggedMisses.has(msg.id)) {
+          logger.info({ id: msg.id, to: msg.to_agent, session }, 'Agent message held: target channel plugin still cold-starting, will retry')
           routerLoggedMisses.add(msg.id)
         }
         continue

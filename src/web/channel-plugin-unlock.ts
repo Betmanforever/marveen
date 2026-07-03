@@ -39,14 +39,18 @@ import type { ChannelProviderType } from '../channel-provider.js'
 
 const TMUX = resolveFromPath('tmux')
 
-// Mirror of scripts/channels.sh post-init grace. The plugin handshake
-// (bun spawn + Telegram getMe + sendMessage) usually completes within 15s
-// of the claude TUI being interactive. After scheduleIdentitySetup's
-// 8s modal-dismiss + 5s /name + a ~1s safety buffer, the prompt is ready
-// around T+15s. We wait another 20s on top of that so a healthy plugin
-// has time to write its bot.pid and spawn the bun child before we read.
-// Total: T+35s post-respawn.
-const UNLOCK_PROBE_DELAY_MS = 35_000
+// The plugin MCP init is ASYNC after the TUI renders and its latency is
+// network-bound (marketplace refresh): observed 1-2s on a quiet morning but
+// 12-70s under a slow refresh (2026-07-03 incident). Probing -- and above all
+// TYPING the /mcp unlock keystrokes -- while that init is still pending
+// silently aborts the plugin MCP registration on CC 2.1.199, which is exactly
+// the "absent plugin" this probe exists to fix. So the probe must fire only
+// after the worst-case init window. Ordering contract:
+//   identity /name wait cap (120s, agent-process.ts CHANNEL_COLDSTART_HOLD_MS)
+//   < this probe (150s) < channel-monitor AGENT_STARTUP_GRACE_MS (180s),
+// so the /name lands first, the unlock gets one clean shot, and only then may
+// the down-cascade restart.
+const UNLOCK_PROBE_DELAY_MS = 150_000
 
 // If the bun child still hasn't appeared the first time we look, give it
 // one more grace window before we conclude the plugin is wedged. Some
@@ -99,7 +103,7 @@ export function wasPluginConfirmedAbsent(session: string, withinMs: number): boo
   return at != null && Date.now() - at <= withinMs
 }
 
-function getSessionClaudePid(session: string): number | null {
+export function getSessionClaudePid(session: string): number | null {
   try {
     const raw = execFileSync(TMUX, ['list-panes', '-t', session, '-F', '#{pane_pid}'], {
       timeout: 3000,
@@ -118,7 +122,7 @@ function getSessionClaudePid(session: string): number | null {
 // loop, so bun's presence under the claude pid is the most reliable
 // liveness signal we have. Matches the channels.sh `pgrep -P <claude_pid>
 // bun` check so the two paths agree on what "plugin running" means.
-function hasBunChild(claudePid: number): boolean {
+export function hasBunChild(claudePid: number): boolean {
   try {
     const out = execFileSync('/usr/bin/pgrep', ['-P', String(claudePid), 'bun'], {
       timeout: 3000,
