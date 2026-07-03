@@ -33,6 +33,9 @@
 // the recovery thread and only fires once per respawn, so the cost is bounded.
 
 import { execFileSync } from 'node:child_process'
+import { existsSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
 import type { ChannelProviderType } from '../channel-provider.js'
@@ -40,17 +43,78 @@ import type { ChannelProviderType } from '../channel-provider.js'
 const TMUX = resolveFromPath('tmux')
 
 // The plugin MCP init is ASYNC after the TUI renders and its latency is
-// network-bound (marketplace refresh): observed 1-2s on a quiet morning but
-// 12-70s under a slow refresh (2026-07-03 incident). Probing -- and above all
-// TYPING the /mcp unlock keystrokes -- while that init is still pending
-// silently aborts the plugin MCP registration on CC 2.1.199, which is exactly
-// the "absent plugin" this probe exists to fix. So the probe must fire only
-// after the worst-case init window. Ordering contract:
-//   identity /name wait cap (120s, agent-process.ts CHANNEL_COLDSTART_HOLD_MS)
+// network-bound (marketplace refresh): observed 1-2s on a quiet morning,
+// 12-70s under a slow refresh, and 11.5 MINUTES under a stalled refresh
+// (both 2026-07-03 incidents). Probing -- and above all TYPING the /mcp
+// unlock keystrokes -- while that init is still pending silently aborts the
+// plugin MCP registration on CC 2.1.199, which is exactly the "absent plugin"
+// this probe exists to fix. The timers below are only the fast-path minimums;
+// the authoritative "init finished" signal is EVENT-based (bun poller up OR
+// plugin-cache .in_use/<pid> marker present -- see channelPluginInitPending),
+// and runUnlockProbe defers itself while that says pending. Ordering contract
+// for the fast path stays:
+//   identity /name wait (agent-process.ts, same event gate)
 //   < this probe (150s) < channel-monitor AGENT_STARTUP_GRACE_MS (180s),
-// so the /name lands first, the unlock gets one clean shot, and only then may
-// the down-cascade restart.
+// and all three defer together under a stalled init, so the /name still lands
+// first, the unlock still gets one clean shot, and only then may the
+// down-cascade restart.
 const UNLOCK_PROBE_DELAY_MS = 150_000
+
+// Hard ceiling on how long we treat the plugin init as "still pending" and
+// defer keystrokes / restarts (2026-07-03 second incident). The fixed 120/150s
+// caps above are calibrated to the 12-70s init range, but a stalled official
+// marketplace refresh serialised one observed init to 11.5 MINUTES (session
+// start 14:16:07, known_marketplaces.json write 14:27:33.842, the plugin's
+// .in_use/<pid> marker 88ms later) -- and the cap-expired /name + unlock
+// keystrokes at 14:18 landed mid-init and the MCP server never registered
+// ("No MCP servers configured", no bun, deaf agent, unrecoverable in place).
+// So "init finished" must be detected by EVENT, not timer: either the bun
+// poller is up (healthy) or the plugin cache .in_use/<pid> marker exists
+// (claude finished loading the plugin content -- possibly WITHOUT the MCP
+// registration, which the probe below then diagnoses). The ceiling only
+// bounds the wait when claude is wedged so hard it never writes the marker.
+export const CHANNEL_INIT_PENDING_MAX_MS = 15 * 60 * 1000
+
+// While the init is pending, re-check on this cadence.
+const INIT_PENDING_RECHECK_MS = 30_000
+
+// True iff claude wrote its plugin-cache in-use marker for this pid:
+// ~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/.in_use/<pid>.
+// Claude Code writes it when the plugin content finishes loading and unlinks
+// it on exit. Marker present + bun absent = init finished but the plugin MCP
+// server was never registered (or its poller died) -- typing is safe again.
+// Marker absent + bun absent = init still in flight -- nobody may type.
+export function hasPluginInUseMarker(claudePid: number): boolean {
+  const cacheRoot = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'plugins', 'cache')
+  let marketplaces: string[]
+  try { marketplaces = readdirSync(cacheRoot) } catch { return false }
+  for (const marketplace of marketplaces) {
+    let plugins: string[]
+    try { plugins = readdirSync(join(cacheRoot, marketplace)) } catch { continue }
+    for (const plugin of plugins) {
+      let versions: string[]
+      try { versions = readdirSync(join(cacheRoot, marketplace, plugin)) } catch { continue }
+      for (const version of versions) {
+        if (existsSync(join(cacheRoot, marketplace, plugin, version, '.in_use', String(claudePid)))) return true
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * True while the channel plugin init of `claudePid` must be treated as still
+ * pending: no bun poller yet AND no .in_use marker yet, and the process is
+ * younger than CHANNEL_INIT_PENDING_MAX_MS. Callers (identity /name, unlock
+ * probe, down-cascade) defer keystrokes and restarts while this holds --
+ * both provably abort or re-create the very init they are waiting on.
+ * Unknown age fails open (not pending) so a probe error can never strand
+ * message delivery or recovery forever.
+ */
+export function channelPluginInitPending(claudePid: number, processAgeMs: number | null): boolean {
+  if (processAgeMs == null || processAgeMs < 0 || processAgeMs > CHANNEL_INIT_PENDING_MAX_MS) return false
+  return !hasBunChild(claudePid) && !hasPluginInUseMarker(claudePid)
+}
 
 // If the bun child still hasn't appeared the first time we look, give it
 // one more grace window before we conclude the plugin is wedged. Some
@@ -184,6 +248,21 @@ function sendUnlockKeystrokes(session: string, provider: ChannelProviderType): v
       try { execFileSync(TMUX, ['send-keys', '-t', session, 'Escape'], { timeout: 5000 }) } catch { /* ignore */ }
       return
     }
+    if (/No MCP servers configured/.test(paneAfterOpen)) {
+      // The whole MCP registry is empty -- the channel plugin (and every other
+      // MCP server) missed registration entirely. This is the marketplace-stall
+      // aftermath: init finished AFTER the channels/MCP init window closed, so
+      // CC 2.1.199 never registered the server and never will in this session.
+      // Distinct from the includes(provider) check below, which can false-match
+      // the provider name in unrelated pane text (the 2026-07-03 14:18:48 probe
+      // matched "telegram" from the startup banner and typed Enter into this
+      // very dialog). No keystroke can help; record the absent verdict so the
+      // down-cascade escalates after a single restart.
+      logger.warn({ session, provider }, 'channel-plugin-unlock: /mcp reports "No MCP servers configured" -- plugin MCP registration was missed, unrecoverable in place')
+      markPluginAbsent(session)
+      try { execFileSync(TMUX, ['send-keys', '-t', session, 'Escape'], { timeout: 5000 }) } catch { /* ignore */ }
+      return
+    }
     if (!paneAfterOpen.includes(provider)) {
       // Plugin is not in the MCP list (never loaded, not Failed/disabled) --
       // the unlock sequence cannot help and would target the wrong entry.
@@ -230,6 +309,8 @@ interface UnlockProbeState {
   session: string
   provider: ChannelProviderType
   retriesLeft: number
+  // When the probe was scheduled; bounds the init-pending deferral below.
+  scheduledAt: number
 }
 
 function runUnlockProbe(state: UnlockProbeState): void {
@@ -247,6 +328,21 @@ function runUnlockProbe(state: UnlockProbeState): void {
       { session: state.session, claudePid, provider: state.provider },
       'channel-plugin-unlock: bun child present, plugin healthy - no unlock needed',
     )
+    return
+  }
+
+  // Init still pending (no bun AND no .in_use marker): the plugin load is
+  // serialised behind the marketplace refresh, which stalled to 11.5 min in
+  // the 2026-07-03 incident. Typing /mcp now would abort the registration --
+  // exactly what this probe exists to repair. Defer until the marker appears
+  // (init finished) or the pending ceiling passes (claude wedged; proceed so
+  // the absent diagnosis can still be recorded).
+  if (!hasPluginInUseMarker(claudePid) && Date.now() - state.scheduledAt < CHANNEL_INIT_PENDING_MAX_MS) {
+    logger.info(
+      { session: state.session, claudePid, waitedMs: Date.now() - state.scheduledAt },
+      'channel-plugin-unlock: plugin init still pending (no bun, no .in_use marker), deferring probe',
+    )
+    setTimeout(() => runUnlockProbe(state), INIT_PENDING_RECHECK_MS)
     return
   }
 
@@ -289,8 +385,9 @@ function runUnlockProbe(state: UnlockProbeState): void {
  * probe from a previous respawn cannot toggle a healthy plugin to Disable.
  */
 export function schedulePluginUnlockAfterRespawn(session: string, provider: ChannelProviderType): void {
+  const scheduledAt = Date.now()
   setTimeout(
-    () => runUnlockProbe({ session, provider, retriesLeft: UNLOCK_PROBE_MAX_RETRIES }),
+    () => runUnlockProbe({ session, provider, retriesLeft: UNLOCK_PROBE_MAX_RETRIES, scheduledAt }),
     UNLOCK_PROBE_DELAY_MS,
   )
   logger.info(

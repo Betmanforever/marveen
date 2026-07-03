@@ -33,7 +33,7 @@ import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR } from '../config.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
 import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
-import { schedulePluginUnlockAfterRespawn, getSessionClaudePid, hasBunChild } from './channel-plugin-unlock.js'
+import { schedulePluginUnlockAfterRespawn, getSessionClaudePid, hasBunChild, hasPluginInUseMarker, channelPluginInitPending, CHANNEL_INIT_PENDING_MAX_MS } from './channel-plugin-unlock.js'
 import { getSecret } from './vault.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
@@ -710,8 +710,11 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
       readAgentDisplayName(name),
       null,
       // Channel agents: never type the /name into the pane while the plugin
-      // MCP init may still be pending (see CHANNEL_COLDSTART_HOLD_MS).
-      hasChannel ? { waitForChannelPluginMs: CHANNEL_COLDSTART_HOLD_MS } : {},
+      // MCP init may still be pending (see CHANNEL_COLDSTART_HOLD_MS). The cap
+      // is the wedged-claude ceiling; the actual release is event-based (bun
+      // poller or .in_use marker), so a healthy start still fires within
+      // seconds and a stalled marketplace refresh holds as long as needed.
+      hasChannel ? { waitForChannelPluginMs: CHANNEL_INIT_PENDING_MAX_MS } : {},
     )
 
     // Colleague auto-unlock (2026-06-22): mirror the main session's
@@ -797,8 +800,14 @@ export function restartAgentProcess(name: string, opts: { fresh?: boolean } = {}
 //
 // So every automated sender that types into a CHANNEL agent's pane during the
 // cold-start window must first check this hold: true while the agent's claude
-// is younger than CHANNEL_COLDSTART_HOLD_MS and its bun poller has not yet
-// appeared. Channel-less agents never hold (they have no poller to wait for).
+// has neither a bun poller NOR the plugin-cache .in_use/<pid> marker (the
+// event signals that the init finished -- see channelPluginInitPending). The
+// 2026-07-03 SECOND incident showed why a fixed timer cannot bound this: a
+// stalled marketplace refresh serialised the init to 11.5 minutes, the 120s
+// cap expired mid-init, and the /name landed exactly in the window that kills
+// the MCP registration. CHANNEL_COLDSTART_HOLD_MS remains the fast-path
+// floor; CHANNEL_INIT_PENDING_MAX_MS is the wedged-claude ceiling.
+// Channel-less agents never hold (they have no poller to wait for).
 export const CHANNEL_COLDSTART_HOLD_MS = 120_000
 
 function processAgeMsForHold(pid: number): number | null {
@@ -820,9 +829,10 @@ export function channelColdStartHoldActive(agentName: string): boolean {
     if (!hasChannel) return false
     const pid = getSessionClaudePid(agentSessionName(agentName))
     if (pid == null) return false
-    const age = processAgeMsForHold(pid)
-    if (age == null || age > CHANNEL_COLDSTART_HOLD_MS) return false
-    return !hasBunChild(pid)
+    // Event-gated: pending while neither the bun poller nor the .in_use
+    // marker exists, bounded by the wedged-claude ceiling (15 min) instead of
+    // the old fixed 120s cap that expired mid-init under a stalled refresh.
+    return channelPluginInitPending(pid, processAgeMsForHold(pid))
   } catch {
     return false // fail-open: never let the hold probe strand delivery
   }
@@ -933,7 +943,12 @@ export function scheduleIdentitySetup(
     // Remote (ssh) sessions: no local pid to probe; keep the legacy timing.
     if (waitMs > 0 && host == null) {
       const pid = getSessionClaudePid(session)
-      if (pid != null && !hasBunChild(pid) && Date.now() - scheduledAt < waitMs) {
+      // Keep waiting while the plugin init is provably still in flight: no bun
+      // poller AND no .in_use marker. The marker check releases the wait as
+      // soon as claude finishes loading the plugin content even when the MCP
+      // registration was missed (bun never comes) -- the /name is cosmetic,
+      // late is free, early kills the channel.
+      if (pid != null && !hasBunChild(pid) && !hasPluginInUseMarker(pid) && Date.now() - scheduledAt < waitMs) {
         setTimeout(attempt, 5000)
         return
       }

@@ -141,8 +141,48 @@ describe('absent-plugin verdict feeds the down-cascade restart budget', () => {
     const sendEnd = helper.indexOf('\n}\n', sendStart)
     const sendBody = helper.slice(sendStart, sendEnd > sendStart ? sendEnd : undefined)
     const absentLogIdx = sendBody.indexOf('provider plugin absent from /mcp list')
-    const markIdx = sendBody.indexOf('markPluginAbsent(')
+    // Search from the absent log onward: the "No MCP servers configured"
+    // branch above legitimately calls markPluginAbsent earlier.
+    const markIdx = sendBody.indexOf('markPluginAbsent(', absentLogIdx)
     expect(markIdx, 'markPluginAbsent not called in the absent branch').toBeGreaterThan(absentLogIdx)
+  })
+
+  it('records the absent verdict when /mcp shows "No MCP servers configured"', () => {
+    // 2026-07-03 second incident: the whole MCP registry can be empty when a
+    // stalled marketplace refresh pushed the plugin load past the channels/MCP
+    // init window. The includes(provider) check false-matches provider names in
+    // unrelated pane text ("telegram" in the startup banner), so the empty-
+    // registry signature must be tested FIRST and must record the absent
+    // verdict without typing any further keystroke.
+    const sendStart = helper.indexOf('function sendUnlockKeystrokes')
+    const sendEnd = helper.indexOf('\n}\n', sendStart)
+    const sendBody = helper.slice(sendStart, sendEnd > sendStart ? sendEnd : undefined)
+    const emptyIdx = sendBody.indexOf('No MCP servers configured')
+    expect(emptyIdx, 'empty-registry signature not checked').toBeGreaterThan(0)
+    const providerCheckIdx = sendBody.indexOf('paneAfterOpen.includes(provider)')
+    expect(providerCheckIdx).toBeGreaterThan(emptyIdx)
+    const markIdx = sendBody.indexOf('markPluginAbsent(', emptyIdx)
+    expect(markIdx, 'markPluginAbsent not called in the empty-registry branch').toBeGreaterThan(emptyIdx)
+    expect(markIdx).toBeLessThan(providerCheckIdx)
+  })
+
+  it('defers the probe while the plugin init is still pending (no bun, no .in_use marker)', () => {
+    // Typing /mcp during a pending init aborts the MCP registration (CC
+    // 2.1.199); the probe must reschedule itself instead of typing while
+    // channelPluginInitPending semantics hold (marker absent, under ceiling).
+    expect(helper).toMatch(/export\s+function\s+hasPluginInUseMarker\b/)
+    expect(helper).toMatch(/export\s+function\s+channelPluginInitPending\b/)
+    const probeStart = helper.indexOf('function runUnlockProbe')
+    const probeEnd = helper.indexOf('\n}\n', probeStart)
+    const probeBody = helper.slice(probeStart, probeEnd > probeStart ? probeEnd : undefined)
+    const pendingIdx = probeBody.indexOf('hasPluginInUseMarker(')
+    const sendIdx = probeBody.indexOf('sendUnlockKeystrokes(')
+    expect(pendingIdx, 'pending-init gate missing from runUnlockProbe').toBeGreaterThan(0)
+    expect(pendingIdx).toBeLessThan(sendIdx)
+    // The pending branch must reschedule, not fall through to the keystrokes.
+    const between = probeBody.slice(pendingIdx, sendIdx)
+    expect(between).toMatch(/setTimeout\(\(\) => runUnlockProbe\(state\)/)
+    expect(between).toMatch(/return\b/)
   })
 
   it('exports the accessors the monitor reads and clears', () => {

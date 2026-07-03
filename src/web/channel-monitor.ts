@@ -21,7 +21,7 @@ import {
 } from './agent-process.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
 import { probeTelegramConflict } from './channel-conflict-probe.js'
-import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent } from './channel-plugin-unlock.js'
+import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent, channelPluginInitPending } from './channel-plugin-unlock.js'
 import {
   detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, type PaneErrorAlertState, type PaneState,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
@@ -1328,6 +1328,17 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       if (t.isMarveen) {
         if (shouldEscalateMarveenDown()) handleMarveenDown()
       } else {
+        // Marketplace-stall guard (2026-07-03 second incident): while the
+        // plugin init is provably still in flight (no bun poller AND no
+        // plugin-cache .in_use marker yet -- a stalled official-marketplace
+        // refresh serialised one observed init to 11.5 minutes), a restart
+        // would tear down a session that is about to come up healthy and
+        // re-enter the same stall with the context lost. Defer until the init
+        // resolves either way or the 15-min wedged-claude ceiling passes.
+        if (channelPluginInitPending(claudePid, getProcessAgeMs(claudePid))) {
+          logger.info({ agent: t.agentName, provider: t.provider, claudePid }, 'Channel plugin probe reports down but plugin init is still pending (no bun, no .in_use marker) -- deferring')
+          continue
+        }
         if (!agentDownSince.has(t.session)) agentDownSince.set(t.session, Date.now())
         const lastRestart = agentLastRestart.get(t.agentName!)
         const failures = agentRestartFailures.get(t.agentName!) ?? 0
