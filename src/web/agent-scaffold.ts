@@ -173,7 +173,7 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
   if (existsSync(settingsPath)) {
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
-  const ctx = { HOME: homedir(), AGENT_DIR: agentRoot }
+  const ctx = { HOME: homedir(), AGENT_DIR: agentRoot, INSTALL_DIR: PROJECT_ROOT }
   const denyList = profile.filesystem.deny.map(p => resolveProfilePlaceholders(p, ctx))
   // Self-pace tool-name deny: every sub-agent (NOT the main agent) is denied the
   // Claude Code runtime self-scheduling tools. A whole-tool-name deny IS enforced

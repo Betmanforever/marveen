@@ -48,9 +48,13 @@ export function loadProfileTemplate(id: string): ProfileTemplate {
   return HARDCODED_DEFAULT_PROFILE
 }
 
-export function resolveProfilePlaceholders(value: string, ctx: { HOME: string; AGENT_DIR: string }): string {
-  return value
+export function resolveProfilePlaceholders(value: string, ctx: { HOME: string; AGENT_DIR: string; INSTALL_DIR?: string }): string {
+  let out = value
     .replace(/\$\{HOME\}/g, ctx.HOME)
     .replace(/\$\{AGENT_DIR\}/g, ctx.AGENT_DIR)
     .replace(/\$\{WORKDIR\}/g, ctx.AGENT_DIR)
+  // Install root, for allow-listing the fixed agent-wrapper scripts
+  // (scripts/agent-wrappers/*) by their exact absolute path.
+  if (ctx.INSTALL_DIR) out = out.replace(/\$\{INSTALL_DIR\}/g, ctx.INSTALL_DIR)
+  return out
 }

@@ -10,9 +10,12 @@
       "Edit(${AGENT_DIR}/**)",
       "Read(${HOME}/Downloads/**)",
       "Bash(ls:*)",
-      "Bash(cat:*)",
+      "Bash(${INSTALL_DIR}/scripts/agent-wrappers/check-allowlist.sh:*)",
+      "Bash(${INSTALL_DIR}/scripts/agent-wrappers/memo.sh:*)",
+      "Bash(${INSTALL_DIR}/scripts/agent-wrappers/msg-wolfe.sh:*)",
       "WebFetch(*)",
-      "WebSearch(*)"
+      "WebSearch(*)",
+      "mcp__plugin_telegram_telegram__reply"
     ],
     "deny": [
       "Read(${HOME}/.ssh/**)",
@@ -22,7 +25,10 @@
       "Read(**/.env)",
       "Bash(sudo:*)",
       "Bash(rm:*)",
-      "Bash(curl -X POST:*)"
+      "Bash(curl -X POST:*)",
+      "Bash(curl -d:*)",
+      "Bash(curl --data:*)",
+      "Bash(wget:*)"
     ]
   }
 }
