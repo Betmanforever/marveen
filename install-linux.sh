@@ -221,6 +221,9 @@ command -v npm &>/dev/null || fail "npm nem talalhato a nodejs csomag utan sem. 
 
 ok "ffmpeg $(ffmpeg -version | awk 'NR==1 {print $3}')"
 ok "git $(git --version | awk '{print $3}')"
+# The system commits on its own (auto-update, fix commits) -> git needs an
+# identity. Warn/prompt if missing; never set it silently (kanban #4e76c59a).
+check_git_identity
 ok "make $(make --version | awk 'NR==1 {print $3}')"
 ok "lsof $(lsof -v 2>&1 | awk '/^    revision:/ {print $2}')"
 ok "node $(node --version)"

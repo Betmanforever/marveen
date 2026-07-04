@@ -124,6 +124,10 @@ if [ "$MISSING" -eq 1 ]; then
   echo -e "${GREEN}$(_t macos.deps_installed)${NC}"
 fi
 
+# The system commits on its own (auto-update, fix commits) -> git needs an
+# identity. Warn/prompt if missing; never set it silently (kanban #4e76c59a).
+check_git_identity
+
 # Bun (required by Telegram channels plugin)
 export PATH="$HOME/.bun/bin:$PATH"
 if ! command -v bun &>/dev/null; then
