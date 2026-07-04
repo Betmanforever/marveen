@@ -19,9 +19,22 @@
       "Bash(pwd:*)",
       "Bash(curl:*)",
       "WebFetch(*)",
-      "WebSearch(*)"
+      "WebSearch(*)",
+      "Skill"
     ],
     "deny": [
+      "Skill(telegram:access)",
+      "Skill(telegram:access *)",
+      "Skill(telegram:configure)",
+      "Skill(telegram:configure *)",
+      "Skill(update-config)",
+      "Skill(update-config *)",
+      "Skill(fewer-permission-prompts)",
+      "Skill(fewer-permission-prompts *)",
+      "Skill(schedule)",
+      "Skill(schedule *)",
+      "Skill(loop)",
+      "Skill(loop *)",
       "Read(${HOME}/.ssh/**)",
       "Read(${HOME}/.aws/**)",
       "Read(${HOME}/.gnupg/**)",
