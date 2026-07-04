@@ -3,6 +3,7 @@ import {
   detectPaneState,
   detectsThinkingBlockError,
   detectsBlockingMenu,
+  detectsPermissionDialog,
   detectsPastePlaceholder,
   isReadyForPrompt,
   shouldRetrySubmit,
@@ -1737,6 +1738,114 @@ describe('detectsBlockingMenu', () => {
       '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
     ].join('\n')
     expect(detectsBlockingMenu(quoted)).toBe(false)
+  })
+})
+
+describe('detectsPermissionDialog', () => {
+  // A Claude Code tool-approval dialog. It shares the navigable-modal footer
+  // with the /mcp menu (so detectsBlockingMenu is also true -- this is why the
+  // monitor's menu-recovery path fired the harmful Escape on Charlie's dialog),
+  // but Escape here rejects the pending tool call and aborts the turn -- the
+  // monitor must NOT Escape. The exact footer wording is representative and
+  // must be calibrated against a live `tmux capture-pane` of a real dialog.
+  const PERMISSION_DIALOG = [
+    '   Bash command',
+    '',
+    '   git push origin develop',
+    '',
+    '   Do you want to proceed?',
+    '   ❯ 1. Yes',
+    "     2. Yes, and don't ask again for git push commands in this project",
+    '     3. No, and tell Claude what to do differently',
+    '',
+    '   ↑/↓ to navigate · Enter to confirm · Esc to cancel',
+  ].join('\n')
+
+  // Edit-approval variant carrying only the "tell Claude" option phrase.
+  const EDIT_DIALOG = [
+    '   Edit file',
+    '   src/foo.ts',
+    '',
+    '   Do you want to make this edit to foo.ts?',
+    '   ❯ 1. Yes',
+    '     2. No, and tell Claude what to do differently',
+    '',
+    '   ↑/↓ to navigate · Enter to confirm · Esc to cancel',
+  ].join('\n')
+
+  // Plan-mode approval: different question wording ("Would you like to
+  // proceed?") and option phrases ("auto-accept edits" / "keep planning").
+  const PLAN_DIALOG = [
+    '   Ready to code?',
+    '',
+    '   Here is my plan: ...',
+    '',
+    '   Would you like to proceed?',
+    '   ❯ 1. Yes, and auto-accept edits',
+    '     2. Yes, and manually approve edits',
+    '     3. No, keep planning',
+    '',
+    '   ↑/↓ to navigate · Enter to confirm · Esc to cancel',
+  ].join('\n')
+
+  // The /mcp manager modal -- a navigable menu, NOT a permission dialog.
+  const MCP_MENU = [
+    '   Manage MCP servers',
+    '   5 servers',
+    '',
+    '   ❯ claude.ai Canva · ✔ connected · 39 tools',
+    '',
+    '   ↑/↓ to navigate · Enter to confirm · Esc to cancel',
+  ].join('\n')
+
+  it('detects a tool-approval dialog (question + numbered Yes + option phrase)', () => {
+    expect(detectsPermissionDialog(PERMISSION_DIALOG)).toBe(true)
+  })
+
+  it('detects an edit-approval dialog on the "tell Claude" option phrase', () => {
+    expect(detectsPermissionDialog(EDIT_DIALOG)).toBe(true)
+  })
+
+  it('detects a plan-mode approval ("Would you like to" + auto-accept/keep-planning)', () => {
+    expect(detectsPermissionDialog(PLAN_DIALOG)).toBe(true)
+    expect(detectsBlockingMenu(PLAN_DIALOG)).toBe(true)
+  })
+
+  it('is false for the /mcp navigable menu (Escape-safe, not a dialog)', () => {
+    expect(detectsPermissionDialog(MCP_MENU)).toBe(false)
+  })
+
+  it('is false for a normal idle prompt', () => {
+    expect(detectsPermissionDialog(IDLE_BYPASS)).toBe(false)
+    expect(detectsPermissionDialog(IDLE_STRICT)).toBe(false)
+  })
+
+  it('is false for a busy turn', () => {
+    expect(detectsPermissionDialog(BUSY_FULL_FOOTER)).toBe(false)
+    expect(detectsPermissionDialog(BUSY_TOKENS_ONLY)).toBe(false)
+  })
+
+  it('is false for an empty pane', () => {
+    expect(detectsPermissionDialog('')).toBe(false)
+    expect(detectsPermissionDialog('   \n  ')).toBe(false)
+  })
+
+  it('does not trigger on a reply that merely quotes the question in prose', () => {
+    const quoted = [
+      '  A CC ilyenkor azt kerdezi: "Do you want to proceed?" -- de itt nincs dialogus.',
+      '',
+      SEP,
+      '❯ ',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(detectsPermissionDialog(quoted)).toBe(false)
+  })
+
+  it('the permission dialog is ALSO a blocking menu (shared modal footer)', () => {
+    // Confirms the ordering contract the monitor relies on: detectsBlockingMenu
+    // fires first, then detectsPermissionDialog decides Escape-vs-escalate.
+    expect(detectsBlockingMenu(PERMISSION_DIALOG)).toBe(true)
   })
 })
 
