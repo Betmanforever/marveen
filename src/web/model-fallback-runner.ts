@@ -73,9 +73,14 @@ const lastSwitchAt = new Map<string, number>()
 // replay that still shows the old line cannot restart the loop. A genuinely
 // NEW failure produces a different line (fresh timestamp-free wording is rare
 // but possible; the flap-breaker below caps that residual case).
-interface HandledLine { line: string; missingSweeps: number }
+interface HandledLine { line: string; missingSweeps: number; expiresAt?: number }
 const handledLine = new Map<string, HandledLine>()
 const HANDLED_LINE_CLEAR_SWEEPS = 3
+// After a revert the tombstone is time-boxed (audit T1): a byte-identical
+// REAL new failure must eventually re-trigger -- otherwise a probe false
+// positive would leave the agent stuck on a dead model behind a silent
+// tombstone. Past the TTL the flap-breaker (C-B) handles a recurrence loudly.
+const TOMBSTONE_REVERT_TTL_MS = 45 * 60_000
 
 // Two-tick confirmation (audit F3): an access failure must be visible in two
 // CONSECUTIVE sweeps before acting. A transient render (an agent cat-ing a
@@ -243,7 +248,8 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   // record; clear it only after the line has been gone for several sweeps.
   const tomb = handledLine.get(name)
   if (tomb) {
-    if (pane.includes(tomb.line)) tomb.missingSweeps = 0
+    if (tomb.expiresAt && nowMs > tomb.expiresAt) handledLine.delete(name)
+    else if (pane.includes(tomb.line)) tomb.missingSweeps = 0
     else if (++tomb.missingSweeps >= HANDLED_LINE_CLEAR_SWEEPS) handledLine.delete(name)
   }
 
@@ -335,6 +341,10 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
     downgraded.delete(name)
     probeConfirmed.delete(name)
     lastProbeAt.delete(name)
+    // Time-box the surviving tombstone (T1): a byte-identical genuine new
+    // failure re-triggers after the TTL instead of being swallowed forever.
+    const tombAtRevert = handledLine.get(name)
+    if (tombAtRevert) tombAtRevert.expiresAt = nowMs + TOMBSTONE_REVERT_TTL_MS
     if (wasStickyRevert) {
       // Count probe-driven reverts for the flap-breaker (C-B).
       const hist = stickyRevertHistory.get(name)

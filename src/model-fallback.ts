@@ -178,6 +178,8 @@ export function sanitizeFailureSnippet(line: string): string {
     .replace(/["'`\\[\]]/g, ' ')
     .replace(/API Error/gi, 'API-Err')
     .replace(/_error/gi, '-err')
+    .replace(/credit balance/gi, 'credit-bal')
+    .replace(/usage limit/gi, 'usage-lim')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120)
