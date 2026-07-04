@@ -138,6 +138,46 @@ export function detectsModelAccessFailure(pane: string): string | null {
   return null
 }
 
+// Known-transient API-error phrasings: normal retry territory, never a reason
+// to switch models and not interesting for the unrecognized-error telemetry.
+const TRANSIENT_ERROR_RX = /rate_limit|overloaded|429|529|timed? ?out|connection|ECONN|network/i
+
+/**
+ * Telemetry helper (audit F8): the first live-region line that carries an
+ * API-error anchor but matches NO known cause and NO known-transient class --
+ * i.e. a wording we might need to add to ACCESS_CAUSE_RX. The exact error text
+ * of future entitlement changes is unknown in advance; the runner logs these
+ * so the pattern list can be extended from evidence instead of guesses.
+ */
+export function detectsUnrecognizedApiError(pane: string): string | null {
+  if (!pane || !pane.trim()) return null
+  const lines = pane.split('\n').slice(-USAGE_LIMIT_BANNER_REGION_LINES)
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line) continue
+    if (!ACCESS_ERROR_ANCHOR.test(line)) continue
+    if (ACCESS_CAUSE_RX.some((rx) => rx.test(line))) continue
+    if (TRANSIENT_ERROR_RX.test(line)) continue
+    if (USAGE_LIMIT_RX.test(line)) continue
+    return line.slice(0, 300)
+  }
+  return null
+}
+
+/**
+ * Strip a pane line for inclusion in an inter-agent message (audit C3): the
+ * line is UNTRUSTED terminal content and the message lands in another agent's
+ * context -- a prompt-injection channel. Keep it short, printable, quote-safe.
+ */
+export function sanitizeFailureSnippet(line: string): string {
+  return line
+    .replace(/[^\x20-\x7EáéíóöőúüűÁÉÍÓÖŐÚÜŰ]/g, ' ')
+    .replace(/["'`\\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120)
+}
+
 /**
  * The next model one step down the chain from `current`, or null if already at
  * the bottom. An unrecognised current model is treated as the primary, so the

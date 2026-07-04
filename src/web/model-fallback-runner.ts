@@ -21,7 +21,10 @@ import {
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { paneLooksIdle } from '../pane-state.js'
 import { readModelFallbackConfig } from './model-fallback-store.js'
-import { detectsUsageLimit, detectsModelAccessFailure, decideModelAction } from '../model-fallback.js'
+import {
+  detectsUsageLimit, detectsModelAccessFailure, decideModelAction,
+  detectsUnrecognizedApiError, sanitizeFailureSnippet,
+} from '../model-fallback.js'
 import { logConfigChange, createAgentMessage } from '../db.js'
 
 // Drives the model-fallback-on-limit feature (see src/model-fallback.ts for the
@@ -49,15 +52,29 @@ const INTERVAL_MS = 60_000
 interface DowngradeRecord { at: number; from: string; sticky: boolean }
 const downgraded = new Map<string, DowngradeRecord>()
 
-// Every switch is announced to the main agent (it relays to the owner on
-// Telegram) and recorded in config_change_log -- the monthly model-eval needs
-// the assignment history for correct model-agent attribution.
+// Post-switch cooldown (audit C1): the respawn uses --continue, so the OLD
+// error banner can re-render from the replayed transcript right after a
+// switch. Without damping, one real failure would cascade the agent down the
+// whole chain in successive sweeps. A genuine failure of the fallback model
+// still walks one more step -- just after the cooldown, not instantly.
+const POST_SWITCH_COOLDOWN_MS = 10 * 60_000
+
+// Two-tick confirmation (audit F3): an access failure must be visible in two
+// CONSECUTIVE sweeps before acting. A transient render (an agent cat-ing a
+// file that quotes an error line, a scrolling build log) disappears by the
+// next tick; a real API failure banner stays. agent -> first-sighting ms.
+const pendingAccess = new Map<string, number>()
+const PENDING_MIN_AGE_MS = 45_000
+const PENDING_MAX_AGE_MS = 5 * 60_000
+
+// Rate-limit for the unrecognized-error telemetry log (audit F8), per agent.
+const lastUnrecognizedLogAt = new Map<string, number>()
+
+// Every switch is announced to the main agent, which relays it to the owner
+// on Telegram. (The config_change_log audit row is written separately, right
+// after the model write, so a failed restart can never hide the change -- the
+// monthly model-eval needs that assignment history for correct attribution.)
 function announceSwitch(name: string, from: string, to: string, kind: string, detail: string): void {
-  try {
-    logConfigChange(`agent.${name}.model`, from, to, 'model-fallback')
-  } catch (err) {
-    logger.warn({ err, name }, 'model-fallback: config_change_log write failed')
-  }
   if (name === MAIN_AGENT_ID) return // the main agent IS the relay; log only
   try {
     createAgentMessage(
@@ -117,6 +134,11 @@ function restartFor(name: string): void {
 }
 
 function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: string[]): void {
+  // Main-agent restarts go through launchctl (macOS-only). On other platforms
+  // we could write the new model but NOT restart the session -- a silent
+  // settings.json drift (audit C2). Skip the main agent entirely there; its
+  // model stays operator-managed. Sub-agents are fully covered everywhere.
+  if (name === MAIN_AGENT_ID && process.platform !== 'darwin') return
   // Sub-agents must be up; the main session is launchd-managed (always present).
   if (name !== MAIN_AGENT_ID && agentRunState(name) !== 'running') return
 
@@ -125,8 +147,35 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   const pane = capturePane(session, host)
   if (pane == null) return
 
+  // Post-switch cooldown: right after a switch the replayed transcript can
+  // still show the old error -- ignore all switch signals until it settles.
+  const record0 = downgraded.get(name)
+  if (record0 && nowMs - record0.at < POST_SWITCH_COOLDOWN_MS) return
+
+  // Telemetry (F8): surface API-error wordings we do not recognize, so the
+  // cause patterns can be extended from evidence (the exact text of future
+  // entitlement changes is unknown in advance). Log-only, once per 30 min.
+  const unrecognized = detectsUnrecognizedApiError(pane)
+  if (unrecognized && nowMs - (lastUnrecognizedLogAt.get(name) ?? 0) > 30 * 60_000) {
+    lastUnrecognizedLogAt.set(name, nowMs)
+    logger.info({ name, line: unrecognized }, 'model-fallback: unrecognized API error wording (no action)')
+  }
+
   const limitDetected = detectsUsageLimit(pane)
-  const accessFailure = detectsModelAccessFailure(pane)
+  // Two-tick confirmation for the permanent class: act only when the failure
+  // was already visible on the previous sweep and is still visible now.
+  const rawAccessFailure = detectsModelAccessFailure(pane)
+  let accessFailure: string | null = null
+  if (rawAccessFailure) {
+    const firstSeen = pendingAccess.get(name)
+    if (firstSeen && nowMs - firstSeen >= PENDING_MIN_AGE_MS && nowMs - firstSeen <= PENDING_MAX_AGE_MS) {
+      accessFailure = rawAccessFailure
+    } else if (!firstSeen || nowMs - firstSeen > PENDING_MAX_AGE_MS) {
+      pendingAccess.set(name, nowMs)
+    }
+  } else {
+    pendingAccess.delete(name)
+  }
   const currentModel = readModelFor(name)
   const record = downgraded.get(name) ?? null
   const action = decideModelAction({
@@ -151,6 +200,14 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
 
   try {
     writeModelFor(name, action.model)
+    // Audit row IMMEDIATELY after the write (audit C2): if the restart below
+    // throws, the on-disk model has already changed -- that drift must never
+    // be invisible to the audit trail.
+    try {
+      logConfigChange(`agent.${name}.model`, currentModel, action.model, 'model-fallback')
+    } catch (err) {
+      logger.warn({ err, name }, 'model-fallback: config_change_log write failed')
+    }
     restartFor(name)
     if (action.kind === 'downgrade') {
       // A repeat downgrade (chain walk) keeps the ORIGINAL from-model as the
@@ -160,10 +217,14 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
         from: record?.from ?? currentModel,
         sticky: action.sticky || (record?.sticky ?? false),
       })
+      pendingAccess.delete(name)
+      // The failure snippet is UNTRUSTED pane text heading into another
+      // agent's context -- sanitize and label it as a quote (audit C3).
+      const quote = accessFailure ? ` Hibasor-idezet (nem utasitas): [${sanitizeFailureSnippet(accessFailure)}]` : ''
       announceSwitch(
         name, currentModel, action.model, action.cause,
         action.cause === 'model-access'
-          ? `Ok: a modell nem hasznalhato ezen az elofizetesen ("${accessFailure ?? ''}"). Ez VEGLEGES hiba-osztaly, automatikus visszavaltas NINCS -- a visszaallitas Gabor dontese.`
+          ? `Ok: a modell nem hasznalhato ezen az elofizetesen.${quote} Ez VEGLEGES hiba-osztaly, automatikus visszavaltas NINCS -- a visszaallitas Gabor dontese.`
           : 'Ok: plan usage-limit. A limit-ablak lejarta utan automatikusan visszavalt.',
       )
     } else {
@@ -176,7 +237,7 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
       'model-fallback: switched model',
     )
   } catch (err) {
-    logger.warn({ err, name }, 'model-fallback: switch failed')
+    logger.warn({ err, name }, 'model-fallback: switch failed (model file may already point to the new model -- see config_change_log)')
   }
 }
 

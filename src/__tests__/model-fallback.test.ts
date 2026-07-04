@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest'
 import {
   detectsUsageLimit,
   detectsModelAccessFailure,
+  detectsUnrecognizedApiError,
+  sanitizeFailureSnippet,
   nextFallbackModel,
   decideModelAction,
   normalizeModelFallbackConfig,
@@ -56,20 +58,30 @@ describe('nextFallbackModel', () => {
   })
 })
 
+// Trigger fixtures are built by CONCATENATION so this source file, rendered in
+// an agent's tmux pane (an agent editing or cat-ing it), never contains a
+// literal anchor+cause line -- the runtime strings still match. Self-trigger
+// guard for the fleet that develops its own watchdog (audit F3 companion).
+const ERR = 'API ' + 'Error'
+const NOTFOUND = 'not_' + 'found_error'
+const PERM = 'permission' + '_error'
+const INVALID = 'invalid_' + 'request_error'
+const BILLING = 'billing' + '_error'
+
 describe('detectsModelAccessFailure', () => {
   it('matches API-error lines with a model/credit cause on the SAME line', () => {
-    expect(detectsModelAccessFailure('  ⎿  API Error: 404 not_found_error: model claude-fable-5 not found'))
+    expect(detectsModelAccessFailure(`  ⎿  ${ERR}: 404 ${NOTFOUND}: model claude-fable-5 not ` + 'found'))
       .toContain('not found')
-    expect(detectsModelAccessFailure('  ⎿  API Error: 403 permission_error: your plan does not have access to this model'))
+    expect(detectsModelAccessFailure(`  ⎿  ${ERR}: 403 ${PERM}: your plan does not have access to this ` + 'model'))
       .toContain('does not have access')
-    expect(detectsModelAccessFailure('  ⎿  API Error: 400 invalid_request_error: this model requires usage credits'))
+    expect(detectsModelAccessFailure(`  ⎿  ${ERR}: 400 ${INVALID}: this model requires usage ` + 'credits'))
       .toContain('usage credits')
-    expect(detectsModelAccessFailure('  ⎿  API Error: 400 billing_error: credit balance is too low'))
+    expect(detectsModelAccessFailure(`  ⎿  ${ERR}: 400 ${BILLING}: credit balance is too ` + 'low'))
       .toContain('credit balance')
   })
 
   it('matches the standalone credit-balance TUI banner', () => {
-    expect(detectsModelAccessFailure('Credit balance too low · Add funds to continue')).not.toBeNull()
+    expect(detectsModelAccessFailure('Credit balance too ' + 'low · Add funds to continue')).not.toBeNull()
   })
 
   it('does NOT match conversation text without an API-error anchor (self-trigger guard)', () => {
@@ -79,16 +91,41 @@ describe('detectsModelAccessFailure', () => {
 
   it('does NOT match the temporary classes: usage limit / rate limit / overloaded', () => {
     expect(detectsModelAccessFailure('You have reached your usage limit. Try again later.')).toBeNull()
-    expect(detectsModelAccessFailure('  ⎿  API Error: 429 rate_limit_error: too many requests')).toBeNull()
-    expect(detectsModelAccessFailure('  ⎿  API Error: 529 overloaded_error: server busy')).toBeNull()
+    expect(detectsModelAccessFailure(`  ⎿  ${ERR}: 429 rate_limit_error: too many requests`)).toBeNull()
+    expect(detectsModelAccessFailure(`  ⎿  ${ERR}: 529 overloaded_error: server busy`)).toBeNull()
   })
 
   it('ignores matching lines up in scrollback outside the live region', () => {
     const scrollback = [
-      '  ⎿  API Error: 404 not_found_error: model x not found',
+      `  ⎿  ${ERR}: 404 ${NOTFOUND}: model x not ` + 'found',
       ...Array(40).fill('normal output line'),
     ].join('\n')
     expect(detectsModelAccessFailure(scrollback)).toBeNull()
+  })
+})
+
+describe('detectsUnrecognizedApiError', () => {
+  it('surfaces an anchored line with no known cause (telemetry for new wordings)', () => {
+    expect(detectsUnrecognizedApiError(`  ⎿  ${ERR}: 400 ${INVALID}: some brand new wording we have never seen`))
+      .toContain('brand new wording')
+  })
+  it('stays silent on recognized causes, transients and usage-limit lines', () => {
+    expect(detectsUnrecognizedApiError(`  ⎿  ${ERR}: 404 ${NOTFOUND}: model x not ` + 'found')).toBeNull()
+    expect(detectsUnrecognizedApiError(`  ⎿  ${ERR}: 429 rate_limit_error: slow down`)).toBeNull()
+    expect(detectsUnrecognizedApiError(`  ⎿  ${ERR}: 500 request timed out, retrying`)).toBeNull()
+    expect(detectsUnrecognizedApiError('plain conversation line')).toBeNull()
+  })
+})
+
+describe('sanitizeFailureSnippet', () => {
+  it('strips quotes, control chars and caps the length', () => {
+    const nasty = 'x'.repeat(200) + '[31m"`\'\\ danger'
+    const out = sanitizeFailureSnippet(nasty)
+    expect(out.length).toBeLessThanOrEqual(120)
+    expect(out).not.toMatch(/["'`\\]/)
+  })
+  it('keeps ordinary error text readable', () => {
+    expect(sanitizeFailureSnippet(`${ERR}: 403 model access denied`)).toContain('403 model access denied')
   })
 })
 
