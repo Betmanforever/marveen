@@ -10,6 +10,8 @@
       "Edit(${AGENT_DIR}/**)",
       "Read(${HOME}/Downloads/**)",
       "Bash(ls:*)",
+      "Bash(date:*)",
+      "Bash(mkdir:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/check-allowlist.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/memo.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/msg-wolfe.sh:*)",
@@ -20,6 +22,12 @@
       "mcp__plugin_telegram_telegram__reply"
     ],
     "deny": [
+      "Write(${AGENT_DIR}/.claude/settings.json)",
+      "Edit(${AGENT_DIR}/.claude/settings.json)",
+      "Write(${AGENT_DIR}/.claude/hooks/**)",
+      "Edit(${AGENT_DIR}/.claude/hooks/**)",
+      "Write(${AGENT_DIR}/CLAUDE.md)",
+      "Edit(${AGENT_DIR}/CLAUDE.md)",
       "Read(${HOME}/.ssh/**)",
       "Read(${HOME}/.aws/**)",
       "Read(${HOME}/.gnupg/**)",
