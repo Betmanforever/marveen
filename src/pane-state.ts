@@ -57,7 +57,19 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 // shift+tab hint OR any `·`-separated tail ending in a known idle action (ctrl+t
 // / ↓ to manage). Busy states are filtered above (esc to interrupt / busy
 // indicators / paste placeholder), so this stays idle-specific.
-const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage))|\? for shortcuts/
+//
+// STRICT-MODE ROTATING-TIP HOLE (2026-07-04): non-bypass agents (strict
+// profiles) never render `bypass permissions on`, so they relied entirely on
+// the `? for shortcuts` alternative. But Claude Code rotates a HINT in that same
+// left footer slot (`? for shortcuts`, `gh auth login`, other onboarding tips);
+// when it showed `gh auth login · ← for agents` NOTHING matched, detectPaneState
+// read 'unknown', isSessionReadyForPrompt never went true, and inter-agent
+// messages to alex/charlie/ive were silently undeliverable across restarts
+// (only neo, in bypass mode, kept working). Fix: anchor on the STABLE
+// `← for agents` (ASCII `<-` variant too) suffix, which is present regardless of
+// the rotating tip. Busy/menu states are filtered above, so this stays
+// idle-specific.
+const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage))|\? for shortcuts|(?:←|<-) for agents/
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
 // is mid-flight, even if the footer looks idle for a frame.
@@ -384,6 +396,56 @@ export function detectsBlockingMenu(pane: string): boolean {
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return false
   if (IDLE_FOOTER_RX.test(pane)) return false
   return MENU_NAV_RX.test(footerRegion) || MENU_ESC_RX.test(footerRegion)
+}
+
+// A tool-approval / permission dialog is a SPECIAL CASE of a blocking modal:
+// detectsBlockingMenu() returns true for it (same "Esc to cancel" footer), but
+// the recovery Escape here does NOT mean "close the modal, conversation
+// untouched" -- it means "reject the pending tool call AND abort the turn". A
+// session Escaped out of a permission dialog is left idle with an interrupted
+// turn and never resumes on its own (observed 2026-07-04: Charlie stalled ~40m
+// after the menu-recovery Escape cancelled a live tool call). The monitor must
+// recognise this shape and NOT auto-Escape -- escalate to a human instead.
+//
+// The markers are the option lines unique to the CC permission prompt; they do
+// not appear in the /mcp manager or the model/theme pickers:
+//   "Do you want to proceed?" / "Do you want to make this edit to ..."
+//   "❯ 1. Yes"
+//   "2. Yes, and don't ask again ..."
+//   "3. No, and tell Claude what to do differently (esc)"
+// A match needs EITHER the highly specific option phrase (unique to the
+// permission prompt, never in the /mcp menu or a reply body), OR the question
+// line paired with a numbered "Yes" option on its own line -- the pair keeps a
+// reply that merely quotes "Do you want to ..." in prose from tripping it. Bias
+// is deliberately toward sensitivity: a false positive only costs a skipped
+// auto-Escape + an alert (safe); a false negative re-opens the turn-aborting
+// bug. Calibrate the phrasing against a live `tmux capture-pane` of an actual
+// dialog before narrowing.
+// Option phrases unique to an approval prompt across its variants: tool-approval
+// ("don't ask again" / "tell Claude what to do differently") and plan-mode
+// ("auto-accept edits" / "keep planning"). None appear in the /mcp manager or
+// the model/theme pickers.
+const PERMISSION_OPTION_RX = /(?:don'?t ask again|tell Claude what to do differently|auto-accept edits|keep planning)/i
+// Both the tool-approval ("Do you want to proceed?") and plan-mode ("Would you
+// like to proceed?") question wordings.
+const PERMISSION_QUESTION_RX = /\b(?:Do you want to|Would you like to)\b/i
+const PERMISSION_YES_OPTION_RX = /^\s*❯?\s*\d+\.\s+Yes\b/m
+
+/**
+ * True when the pane is parked in a Claude Code tool-approval / permission
+ * dialog (a blocking modal where Escape rejects the tool call and aborts the
+ * turn, not a navigable menu Escape can safely dismiss). Pure + dependency-free
+ * for unit testing. Callers use this to SUPPRESS the menu-recovery Escape.
+ */
+export function detectsPermissionDialog(pane: string): boolean {
+  if (!pane || !pane.trim()) return false
+  for (const rx of BUSY_INDICATORS) {
+    if (rx.test(pane)) return false
+  }
+  if (BUSY_ESC_TO_INTERRUPT_RX.test(pane.split('\n').slice(-LIVE_FOOTER_REGION_LINES).join('\n'))) return false
+  if (IDLE_FOOTER_RX.test(pane)) return false
+  if (PERMISSION_OPTION_RX.test(pane)) return true
+  return PERMISSION_QUESTION_RX.test(pane) && PERMISSION_YES_OPTION_RX.test(pane)
 }
 
 export interface DetectPaneStateOptions {

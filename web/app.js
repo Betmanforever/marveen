@@ -1984,7 +1984,8 @@ const AVATARS = [
   '05_pirate.png', '06_scientist_girl.png', '07_astronaut.png', '08_viking.png',
   '09_cowgirl.png', '10_detective.png', '11_chef.png', '12_witch.png',
   '13_samurai.png', '14_fairy_girl.png', '15_firefighter.png', '16_punk_girl.png',
-  '17_explorer.png', '18_dj.png', '19_princess.png', '20_alien.png'
+  '17_explorer.png', '18_dj.png', '19_princess.png', '20_alien.png',
+  '21_wolfe.png'
 ]
 
 let selectedAvatar = null

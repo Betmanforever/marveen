@@ -13,6 +13,8 @@
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/check-allowlist.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/memo.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/msg-wolfe.sh:*)",
+      "Bash(${INSTALL_DIR}/scripts/agent-wrappers/daily-log.sh:*)",
+      "Bash(${INSTALL_DIR}/scripts/agent-wrappers/memo-search.sh:*)",
       "WebFetch(*)",
       "WebSearch(*)",
       "mcp__plugin_telegram_telegram__reply"

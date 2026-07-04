@@ -6,6 +6,7 @@ import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
+import { createAgentMessage } from '../db.js'
 import {
   agentHasChannel,
   agentSessionName,
@@ -23,7 +24,7 @@ import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller
 import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent, channelPluginInitPending } from './channel-plugin-unlock.js'
 import {
-  detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, type PaneErrorAlertState, type PaneState,
+  detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, detectsPermissionDialog, type PaneErrorAlertState, type PaneState,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
   parkedInputText, shouldClearTruncatedPreamble,
   parkedInputRowCount, submitLanded, decideStuckInputAction,
@@ -395,6 +396,22 @@ const paneMenuState: Map<string, PaneErrorAlertState> = new Map()
 const MENU_RECOVER_CONFIRM_MS = 45_000
 const MENU_RECOVER_DEDUP_MS = 5 * 60 * 1000
 const MENU_RECOVER_CLEAR_MS = 2 * 60 * 1000
+
+// A permission dialog is NOT auto-recovered (Escape would reject the tool call),
+// so it can legitimately sit for a human-decision timescale. The 5-min menu
+// dedup would then emit ~12 operator alerts/hour. Throttle the escalation alert
+// on its own longer timer (the Escape-suppression itself is unconditional).
+const paneDialogAlertAt: Map<string, number> = new Map()
+const DIALOG_ESCALATE_DEDUP_MS = 30 * 60 * 1000
+
+// Nudge injected (via the tested inter-agent message router, NOT a raw
+// send-keys) after a recovery Escape pops a real menu on a sub-agent. The
+// Escape can land on a modal that was covering a mid-turn tool call; the turn
+// then sits idle and never resumes on its own (observed 2026-07-04: Charlie
+// stalled ~40m). Framed as a main-agent message so the sub-agent treats it as a
+// trusted coordinator prompt. The router holds it until the session is
+// idle-ready, so enqueueing immediately after the Escape is safe.
+const MENU_RECOVER_NUDGE = 'Automatikus recovery-Escape ment ki a sessionodbe (egy beragadt menu feloldasara). Ha ez megszakitott egy folyamatban levo lepest, folytasd onnan ahol abbamaradt, es ha elakadtal jelezz.'
 
 type MarveenRecoveryStage = 'soft' | 'save' | 'resume' | 'hard' | 'gave_up'
 interface MarveenDownState {
@@ -1237,18 +1254,51 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       })
       if (decision.next.firstSeenAt === null) {
         paneMenuState.delete(t.session)
+        // Modal fully cleared: reset the dialog-escalation throttle so a future
+        // dialog on this session alerts promptly rather than inheriting a stale
+        // timestamp.
+        paneDialogAlertAt.delete(t.session)
       } else {
         paneMenuState.set(t.session, decision.next)
       }
       if (decision.alert) {
         const label = t.isMarveen ? BOT_NAME : (t.agentName ?? t.session)
-        logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
-        try {
-          execFileSync(TMUX, ['send-keys', '-t', t.session, 'Escape'], { timeout: 5000 })
-        } catch (err) {
-          logger.warn({ err, session: t.session }, 'Menu-recovery Escape failed')
+        // D1: a permission/tool-approval dialog has the same navigable-modal
+        // footer as a /mcp menu, but Escape there REJECTS the pending tool call
+        // and aborts the turn -- it is NOT the safe "close modal, conversation
+        // untouched" that the menu recovery assumes. Never auto-Escape it;
+        // escalate to a human, who can approve/deny deliberately.
+        if (pane != null && detectsPermissionDialog(pane)) {
+          // Escape-suppression is unconditional; the operator alert is throttled
+          // on its own 30-min timer so a dialog held for a human decision does
+          // not spam (the 5-min menu dedup would emit ~12 alerts/hour).
+          const lastDialogAlert = paneDialogAlertAt.get(t.session) ?? 0
+          if (Date.now() - lastDialogAlert >= DIALOG_ESCALATE_DEDUP_MS) {
+            paneDialogAlertAt.set(t.session, Date.now())
+            logger.warn({ session: t.session, agent: label }, 'Session parked in a permission dialog -- NOT sending Escape, escalating to operator')
+            sendAlert(`⚠️ A(z) ${label} session engedely-dialogusban all es dontesre var. NEM kuldtem Escape-et (az elutasitana a folyamatban levo muveletet es megszakitana a kort). Nezd meg es dontsd el: tmux attach -t ${t.session}`)
+          }
+        } else {
+          paneDialogAlertAt.delete(t.session)
+          logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
+          try {
+            execFileSync(TMUX, ['send-keys', '-t', t.session, 'Escape'], { timeout: 5000 })
+          } catch (err) {
+            logger.warn({ err, session: t.session }, 'Menu-recovery Escape failed')
+          }
+          sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
+          // D2: for a sub-agent, nudge the session so a turn the Escape may have
+          // interrupted actually resumes -- otherwise it can sit idle silently.
+          // Routed as a main-agent inter-agent message (trusted-peer), so it
+          // reuses the session-ready / cold-start-hold delivery guards.
+          if (!t.isMarveen && t.agentName) {
+            try {
+              createAgentMessage(MAIN_AGENT_ID, t.agentName, MENU_RECOVER_NUDGE)
+            } catch (err) {
+              logger.warn({ err, session: t.session }, 'Menu-recovery nudge enqueue failed')
+            }
+          }
         }
-        sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
       }
     }
 
