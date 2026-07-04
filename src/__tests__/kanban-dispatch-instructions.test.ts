@@ -25,4 +25,17 @@ describe('kanbanMoveInstructions', () => {
     expect(out).toContain('$(cat ')
     expect(out).toContain('.dashboard-token')
   })
+
+  // Estimate-vs-actual tracking (#87a97029): the assigned agent estimates its
+  // own work time BEFORE starting -- but only when the card has none yet.
+  it('asks for a pre-work estimate when the card has no estimate', () => {
+    const out = kanbanMoveInstructions('abc123', 'cody', true)
+    expect(out).toContain('/api/kanban/abc123/estimate')
+    expect(out).toContain('"by":"cody"')
+    expect(out.indexOf('MIELŐTT nekilátsz')).toBeLessThan(out.indexOf('Amikor VÉGEZTÉL'))
+  })
+
+  it('omits the estimate step when the card is already estimated (default)', () => {
+    expect(kanbanMoveInstructions('abc123', 'cody')).not.toContain('/estimate')
+  })
 })

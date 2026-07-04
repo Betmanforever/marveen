@@ -5,7 +5,7 @@ import {
   deleteKanbanCard, moveKanbanCard, archiveKanbanCard, unarchiveKanbanCard,
   getKanbanComments, addKanbanComment, listKanbanProjects,
   getKanbanCard, getChildCards, getDb,
-  createAgentMessage, markKanbanCardDispatched,
+  createAgentMessage, markKanbanCardDispatched, setKanbanCardEstimate,
   getKanbanSeqByIdPrefix,
   listLabels, getLabel, createLabel, updateLabel, deleteLabel,
   addLabelToCard, removeLabelFromCard, getLabelsForAllCards, getLabelsForCard,
@@ -30,13 +30,27 @@ import type { RouteContext } from './types.js'
 // alternative to spawning a separate per-session card for every agent run: the
 // result goes where the work was asked for, with zero extra board clutter. The
 // token is read from the store at call time (never embedded in the message).
-export function kanbanMoveInstructions(id: string, target: string): string {
+export function kanbanMoveInstructions(id: string, target: string, needsEstimate = false): string {
   const tokenPath = join(STORE_DIR, '.dashboard-token')
   const base = `http://${WEB_HOST}:${WEB_PORT}`
   const auth = `-H "Authorization: Bearer $(cat ${tokenPath})"`
   const moveUrl = `${base}/api/kanban/${id}/move`
   const commentUrl = `${base}/api/kanban/${id}/comments`
+  const estimateUrl = `${base}/api/kanban/${id}/estimate`
+  // Estimate-vs-actual tracking (#87a97029): the assigned agent gives its OWN
+  // pre-work estimate, so it learns to estimate accurately over time. Asked
+  // only when the card has no estimate yet (the endpoint is once-only anyway).
+  const estimateStep = [
+    'MIELŐTT nekilátsz: becsüld meg a saját munkaidődet erre a feladatra (tizedes óra, pl. 0.5 = fél óra), és rögzítsd:',
+    `  curl -s -X POST ${estimateUrl} \\`,
+    `    ${auth} \\`,
+    `    -H 'Content-Type: application/json' \\`,
+    `    -d '{"hours": BECSULT_ORA, "by":"${target}"}'`,
+    'A becslés egyszeri és nem módosítható -- a cél hogy idővel pontosan tanulj tippelni, ezért ne "biztosra" becsülj, hanem őszintén.',
+    '',
+  ]
   return [
+    ...(needsEstimate ? estimateStep : []),
     'A kártyát in_progress-re húzták. Amikor VÉGEZTÉL, két lépés (mindkettő a kártyára kerül, a web UI-ban látszik):',
     '',
     '1) Írj egy rövid eredmény-összefoglalót kommentként (1-2 mondat: mi lett a vége):',
@@ -73,7 +87,7 @@ function fireKanbanDispatch(id: string): void {
     })
     if (!target) return
     const desc = (card.description ?? '').trim()
-    const content = `[Kanban feladat #${id}]: ${card.title}${desc ? ' — ' + desc : ''}\n\n${kanbanMoveInstructions(id, target)}`
+    const content = `[Kanban feladat #${id}]: ${card.title}${desc ? ' — ' + desc : ''}\n\n${kanbanMoveInstructions(id, target, card.estimated_hours == null)}`
     createAgentMessage(MAIN_AGENT_ID, target, content)
     markKanbanCardDispatched(id)
     logger.info({ id, target, assignee: card.assignee }, 'Kanban in_progress dispatch fired')
@@ -218,6 +232,30 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
       return true
     }
     json(res, { error: 'Kártya nem található' }, 404)
+    return true
+  }
+
+  // Once-only pre-work estimate from the assigned agent (#87a97029). 409 on a
+  // second attempt: the estimate is the BEFORE-work guess, revising it later
+  // would corrupt the accuracy metric.
+  const kanbanEstimateMatch = path.match(/^\/api\/kanban\/([^/]+)\/estimate$/)
+  if (kanbanEstimateMatch && method === 'POST') {
+    const id = decodeURIComponent(kanbanEstimateMatch[1])
+    const body = await readBody(req)
+    const { hours, by } = JSON.parse(body.toString()) as { hours?: unknown; by?: unknown }
+    const h = typeof hours === 'number' ? hours : NaN
+    if (!Number.isFinite(h) || h <= 0 || h > 1000) {
+      json(res, { error: 'hours: pozitív szám kell (tizedes óra, max 1000)' }, 400)
+      return true
+    }
+    if (typeof by !== 'string' || !by.trim()) {
+      json(res, { error: 'by: a becslő agent azonosítója kötelező' }, 400)
+      return true
+    }
+    const result = setKanbanCardEstimate(id, h, by.trim())
+    if (result === 'not_found') { json(res, { error: 'Kártya nem található' }, 404); return true }
+    if (result === 'conflict') { json(res, { error: 'A kártyán már van becslés (egyszeri, nem módosítható)' }, 409); return true }
+    json(res, { ok: true })
     return true
   }
 
