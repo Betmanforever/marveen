@@ -178,6 +178,8 @@ export function sanitizeFailureSnippet(line: string): string {
     .replace(/["'`\\[\]]/g, ' ')
     .replace(/API Error/gi, 'API-Err')
     .replace(/_error/gi, '-err')
+    .replace(/credit balance/gi, 'credit-bal')
+    .replace(/usage limit/gi, 'usage-lim')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120)
@@ -211,6 +213,9 @@ export interface ModelFallbackFacts {
   downgradedFrom?: string | null
   /** True when the downgrade was access-failure driven: never auto-revert. */
   downgradeSticky?: boolean
+  /** True when a live probe confirmed the pre-downgrade model works again
+   * (the reset-trigger for sticky downgrades: quota refilled, credit added). */
+  preferredUsable?: boolean
   /** Current time (ms epoch). */
   now: number
   /** Revert window in ms. */
@@ -226,10 +231,13 @@ export type ModelAction =
  * Decide what to do for one agent. Pure: the runner gates the I/O (idle pane,
  * actual write+restart) separately.
  *
- *   - access failure & a lower model exists -> STICKY downgrade (no auto-revert:
- *     the error is permanent, climbing back is an operator decision).
+ *   - access failure & a lower model exists -> STICKY downgrade (no
+ *     time-based auto-revert: the error is permanent as far as waiting goes).
  *   - limit detected & a lower model exists -> downgrade (auto-reverts later).
  *   - already at the bottom -> nothing (cannot go lower).
+ *   - sticky downgrade & a probe confirmed the preferred model works again
+ *     (quota reset / usage credit added) -> revert to it. This is the
+ *     reset-trigger: sticky means "do not revert on a TIMER", not "never".
  *   - no signal & non-sticky downgrade aged past the window -> revert to the
  *     agent's own pre-downgrade model (falling back to chain[0] when the
  *     origin was not recorded, e.g. after a dashboard restart).
@@ -245,7 +253,12 @@ export function decideModelAction(f: ModelFallbackFacts): ModelAction {
     }
     return { kind: 'none' }
   }
-  if (f.downgradeSticky) return { kind: 'none' }
+  if (f.downgradeSticky) {
+    if (f.preferredUsable && f.downgradedFrom && f.currentModel !== f.downgradedFrom) {
+      return { kind: 'revert', model: f.downgradedFrom }
+    }
+    return { kind: 'none' }
+  }
   if (f.downgradedAt !== null && f.now - f.downgradedAt >= f.revertAfterMs) {
     const target = f.downgradedFrom ?? f.chain[0]
     if (target && f.currentModel !== target) return { kind: 'revert', model: target }

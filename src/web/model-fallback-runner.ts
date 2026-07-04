@@ -1,14 +1,17 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, PROJECT_ROOT } from '../config.js'
+import { resolveFromPath } from '../platform.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import {
   listAgentNames,
   readAgentRemoteHost,
   readAgentModel,
   writeAgentModel,
+  readAgentAuthMode,
   resolveModelId,
   DEFAULT_MODEL,
 } from './agent-config.js'
@@ -53,18 +56,31 @@ interface DowngradeRecord {
   at: number
   from: string
   sticky: boolean
-  /** The exact failure line already acted on (audit R1): the --continue replay
-   * can keep showing it indefinitely; an identical line never re-triggers. */
-  line: string | null
 }
 const downgraded = new Map<string, DowngradeRecord>()
 
 // Post-switch cooldown (audit C1): the respawn uses --continue, so the OLD
 // error banner can re-render from the replayed transcript right after a
-// switch. Without damping, one real failure would cascade the agent down the
-// whole chain in successive sweeps. A genuine failure of the fallback model
-// still walks one more step -- just after the cooldown, not instantly.
+// switch. Applies to BOTH directions (audit C-A): a revert must get the same
+// damping, or the replayed line re-downgrades minutes after a revert.
 const POST_SWITCH_COOLDOWN_MS = 10 * 60_000
+const lastSwitchAt = new Map<string, number>()
+
+// Handled-line tombstone (audit R1 + C-A): the exact failure line already
+// acted on never re-triggers, and -- crucially -- the tombstone SURVIVES the
+// revert (it is not part of the downgrade record). It is cleared only after
+// the line has been absent from the pane for several consecutive sweeps, so a
+// replay that still shows the old line cannot restart the loop. A genuinely
+// NEW failure produces a different line (fresh timestamp-free wording is rare
+// but possible; the flap-breaker below caps that residual case).
+interface HandledLine { line: string; missingSweeps: number; expiresAt?: number }
+const handledLine = new Map<string, HandledLine>()
+const HANDLED_LINE_CLEAR_SWEEPS = 3
+// After a revert the tombstone is time-boxed (audit T1): a byte-identical
+// REAL new failure must eventually re-trigger -- otherwise a probe false
+// positive would leave the agent stuck on a dead model behind a silent
+// tombstone. Past the TTL the flap-breaker (C-B) handles a recurrence loudly.
+const TOMBSTONE_REVERT_TTL_MS = 45 * 60_000
 
 // Two-tick confirmation (audit F3): an access failure must be visible in two
 // CONSECUTIVE sweeps before acting. A transient render (an agent cat-ing a
@@ -76,6 +92,75 @@ const PENDING_MAX_AGE_MS = 5 * 60_000
 
 // Rate-limit for the unrecognized-error telemetry log (audit F8), per agent.
 const lastUnrecognizedLogAt = new Map<string, number>()
+
+// --- Reset-trigger probe (Gabor, 2026-07-04): sticky means "no TIMER revert",
+// not "never revert". While a sticky downgrade is active, probe the preferred
+// model hourly with a minimal headless call; when it succeeds (quota reset,
+// usage credit added), the next sweep reverts through the normal action path
+// (idle guard, audit row, restart, announce). Cost: one one-word prompt per
+// hour per downgraded agent, zero when nothing is downgraded. The probe runs
+// under the DASHBOARD's own auth (the owner's shared subscription), which is
+// exactly the entitlement shared-auth agents use -- dedicated-API-key agents
+// are skipped (their entitlement is a different account; manual revert there).
+const CLAUDE_BIN = resolveFromPath('claude')
+const PROBE_INTERVAL_MS = 60 * 60_000
+const PROBE_TIMEOUT_MS = 120_000
+const probeInFlight = new Set<string>()
+const lastProbeAt = new Map<string, number>()
+const probeConfirmed = new Set<string>()
+
+// Flap-breaker (audit C-B): probe-driven reverts are counted per agent within
+// a 24h window. The probe interval doubles per revert (1h -> 2h -> 4h), and
+// after MAX_PROBE_REVERTS the auto-revert is disabled for that agent -- an
+// intermittently failing model (gradual rollout, flaky entitlement) must not
+// bounce an agent between models forever. Disabling is announced ONCE; from
+// there climbing back is an operator decision.
+interface StickyRevertHistory { count: number; lastRevertAt: number; capNotified: boolean }
+const stickyRevertHistory = new Map<string, StickyRevertHistory>()
+const FLAP_WINDOW_MS = 24 * 3_600_000
+const MAX_PROBE_REVERTS = 2
+
+function maybeProbePreferred(name: string, record: DowngradeRecord, nowMs: number): void {
+  if (!record.sticky || probeConfirmed.has(name) || probeInFlight.has(name)) return
+  if (!record.from.startsWith('claude-')) return
+  if (name !== MAIN_AGENT_ID && readAgentAuthMode(name) === 'api') return
+  const hist = stickyRevertHistory.get(name)
+  if (hist && nowMs - hist.lastRevertAt > FLAP_WINDOW_MS) stickyRevertHistory.delete(name)
+  const activeHist = stickyRevertHistory.get(name)
+  if (activeHist && activeHist.count >= MAX_PROBE_REVERTS) {
+    if (!activeHist.capNotified) {
+      activeHist.capNotified = true
+      announceSwitch(name, record.from, readModelFor(name), 'flap-stop',
+        `A preferalt modell (${record.from}) 24 oran belul tobbszor visszavaltas utan ujra elhasalt -- az automatikus visszavaltast ennel az agentnel KIKAPCSOLTAM. A visszaallitas manualis dontes.`)
+    }
+    return
+  }
+  // First probe a full interval after the switch, then hourly -- doubled per
+  // prior revert within the flap window.
+  const interval = PROBE_INTERVAL_MS * 2 ** Math.min(activeHist?.count ?? 0, 3)
+  if (nowMs - (lastProbeAt.get(name) ?? record.at) < interval) return
+  probeInFlight.add(name)
+  lastProbeAt.set(name, nowMs)
+  execFile(
+    CLAUDE_BIN,
+    // Bare probe (audit P3): neutral cwd so no project CLAUDE.md is loaded,
+    // and strict empty MCP config so no MCP servers spin up -- the point is a
+    // one-word entitlement check on the expensive model, not a real session.
+    ['-p', 'Reply with exactly: ok', '--model', record.from, '--max-turns', '1',
+      '--strict-mcp-config', '--mcp-config', '{}'],
+    { timeout: PROBE_TIMEOUT_MS, cwd: tmpdir() },
+    (err) => {
+      probeInFlight.delete(name)
+      if (!err) {
+        probeConfirmed.add(name)
+        logger.info({ name, model: record.from }, 'model-fallback: probe OK, preferred model usable again')
+      } else {
+        // Transient failures (network) just delay the revert by one interval.
+        logger.debug({ name, model: record.from }, 'model-fallback: probe failed, preferred model still unusable')
+      }
+    },
+  )
+}
 
 // Every switch is announced to the main agent, which relays it to the owner
 // on Telegram. (The config_change_log audit row is written separately, right
@@ -154,10 +239,19 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   const pane = capturePane(session, host)
   if (pane == null) return
 
-  // Post-switch cooldown: right after a switch the replayed transcript can
-  // still show the old error -- ignore all switch signals until it settles.
-  const record0 = downgraded.get(name)
-  if (record0 && nowMs - record0.at < POST_SWITCH_COOLDOWN_MS) return
+  // Post-switch cooldown, BOTH directions (C1 + C-A): right after a downgrade
+  // OR a revert the replayed transcript can still show the old error --
+  // ignore all switch signals until it settles.
+  if (nowMs - (lastSwitchAt.get(name) ?? 0) < POST_SWITCH_COOLDOWN_MS) return
+
+  // Handled-line tombstone upkeep (C-A): the tombstone outlives the downgrade
+  // record; clear it only after the line has been gone for several sweeps.
+  const tomb = handledLine.get(name)
+  if (tomb) {
+    if (tomb.expiresAt && nowMs > tomb.expiresAt) handledLine.delete(name)
+    else if (pane.includes(tomb.line)) tomb.missingSweeps = 0
+    else if (++tomb.missingSweeps >= HANDLED_LINE_CLEAR_SWEEPS) handledLine.delete(name)
+  }
 
   // Telemetry (F8): surface API-error wordings we do not recognize, so the
   // cause patterns can be extended from evidence (the exact text of future
@@ -172,9 +266,9 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   // Two-tick confirmation for the permanent class: act only when the failure
   // was already visible on the previous sweep and is still visible now. An
   // already-handled line (identical to the one we switched on) never
-  // re-triggers -- the replayed transcript can show it indefinitely (R1).
+  // re-triggers -- the replayed transcript can show it indefinitely (R1/C-A).
   let rawAccessFailure = detectsModelAccessFailure(pane)
-  if (rawAccessFailure && record0?.line && rawAccessFailure === record0.line) rawAccessFailure = null
+  if (rawAccessFailure && handledLine.get(name)?.line === rawAccessFailure) rawAccessFailure = null
   let accessFailure: string | null = null
   if (rawAccessFailure) {
     const firstSeen = pendingAccess.get(name)
@@ -188,6 +282,7 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   }
   const currentModel = readModelFor(name)
   const record = downgraded.get(name) ?? null
+  if (record?.sticky) maybeProbePreferred(name, record, nowMs)
   const action = decideModelAction({
     limitDetected,
     accessFailure,
@@ -196,6 +291,7 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
     downgradedAt: record?.at ?? null,
     downgradedFrom: record?.from ?? null,
     downgradeSticky: record?.sticky ?? false,
+    preferredUsable: probeConfirmed.has(name),
     now: nowMs,
     revertAfterMs,
   })
@@ -225,6 +321,8 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   // State update BEFORE the restart attempt (audit R2): a throwing restart
   // must still arm the cooldown/sticky record, or the next sweep would read
   // the new model as "current" and walk the chain one step further.
+  const wasStickyRevert = action.kind === 'revert' && (record?.sticky ?? false)
+  lastSwitchAt.set(name, nowMs)
   if (action.kind === 'downgrade') {
     // A repeat downgrade (chain walk) keeps the ORIGINAL from-model as the
     // revert target; stickiness escalates but never de-escalates.
@@ -232,11 +330,31 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
       at: nowMs,
       from: record?.from ?? currentModel,
       sticky: action.sticky || (record?.sticky ?? false),
-      line: accessFailure ?? record?.line ?? null,
     })
+    // Tombstone the acted-on line so it never re-triggers -- not even after a
+    // later revert removes the downgrade record (C-A).
+    if (accessFailure) handledLine.set(name, { line: accessFailure, missingSweeps: 0 })
     pendingAccess.delete(name)
+    probeConfirmed.delete(name)
+    lastProbeAt.delete(name)
   } else {
     downgraded.delete(name)
+    probeConfirmed.delete(name)
+    lastProbeAt.delete(name)
+    // Time-box the surviving tombstone (T1): a byte-identical genuine new
+    // failure re-triggers after the TTL instead of being swallowed forever.
+    const tombAtRevert = handledLine.get(name)
+    if (tombAtRevert) tombAtRevert.expiresAt = nowMs + TOMBSTONE_REVERT_TTL_MS
+    if (wasStickyRevert) {
+      // Count probe-driven reverts for the flap-breaker (C-B).
+      const hist = stickyRevertHistory.get(name)
+      const withinWindow = hist && nowMs - hist.lastRevertAt < FLAP_WINDOW_MS
+      stickyRevertHistory.set(name, {
+        count: withinWindow ? hist.count + 1 : 1,
+        lastRevertAt: nowMs,
+        capNotified: false,
+      })
+    }
   }
   let restartOk = true
   try {
@@ -258,7 +376,9 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
     )
   } else {
     announceSwitch(name, currentModel, action.model, 'revert',
-      'A limit-ablak lejart, az agent visszakapta az eredeti modelljet.' + restartNote)
+      (wasStickyRevert
+        ? 'A preferalt modell ujra elerheto (oras headless proba sikeres -- kvota/credit feloldodott), automatikus visszavaltas.'
+        : 'A limit-ablak lejart, az agent visszakapta az eredeti modelljet.') + restartNote)
   }
   logger.info(
     { name, from: currentModel, to: action.model, action: action.kind, restartOk },
@@ -271,6 +391,12 @@ export function startModelFallbackRunner(): NodeJS.Timeout {
     const cfg = readModelFallbackConfig()
     if (!cfg.enabled) {
       if (downgraded.size > 0) downgraded.clear() // re-seed cleanly if re-enabled
+      pendingAccess.clear()
+      probeConfirmed.clear()
+      lastProbeAt.clear()
+      lastSwitchAt.clear()
+      handledLine.clear()
+      stickyRevertHistory.clear()
       return
     }
     const now = Date.now()
