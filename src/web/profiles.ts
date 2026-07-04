@@ -13,7 +13,33 @@ export interface ProfileTemplate {
   label: string
   description: string
   permissionMode: 'strict' | 'permissive'
-  filesystem: { allow: string[]; deny: string[] }
+  filesystem: {
+    allow: string[]
+    deny: string[]
+    // Optional Claude Code permission tuning, emitted into settings.json as-is.
+    // defaultMode: e.g. 'acceptEdits' -- auto-accepts edits/creates in the
+    // working dir + additionalDirectories (deny rules still apply). Used by
+    // strict profiles so an allowlisted-dir file CREATION is non-interactive
+    // without --dangerously-skip-permissions. additionalDirectories: dir paths
+    // (placeholders resolved) that extend the acceptEdits scope, e.g. the
+    // agent's own AGENT_DIR when the launch cwd is elsewhere.
+    defaultMode?: string
+    additionalDirectories?: string[]
+  }
+}
+
+// Claude Code settings.json permission rules anchor a SINGLE leading slash at
+// the PROJECT root, not the filesystem root; a filesystem-absolute path needs a
+// DOUBLE leading slash. Profile rules resolve to real absolute paths
+// (/home/...), so the Read/Write/Edit (and deny Read) FILESYSTEM rules must be
+// re-anchored to `//` or they never match the agent's own dir -- the root cause
+// of an allowlisted Write(${AGENT_DIR}/**) still prompting on file creation.
+// Bash(...) rules are command-string matches (NOT filesystem-anchored) and MUST
+// stay single-slash; relative globs (**/.env) and non-path rules are untouched.
+// Pure + exported so the anchor transform is unit-testable.
+export function absolutizeFsPermissionRule(rule: string): string {
+  const m = rule.match(/^(Read|Write|Edit)\((\/[^/].*)\)$/)
+  return m ? `${m[1]}(/${m[2]})` : rule
 }
 
 export const PROFILES_DIR = join(PROJECT_ROOT, 'templates', 'profiles')

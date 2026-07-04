@@ -6,7 +6,7 @@ import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { agentDir, agentConfigRoot } from './agent-config.js'
-import { resolveProfilePlaceholders, type ProfileTemplate } from './profiles.js'
+import { resolveProfilePlaceholders, absolutizeFsPermissionRule, type ProfileTemplate } from './profiles.js'
 
 // Identity values the template substitution injects. Pulled out so the
 // substitution is a pure, parameterizable function (the runtime binds these to
@@ -174,17 +174,30 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const ctx = { HOME: homedir(), AGENT_DIR: agentRoot, INSTALL_DIR: PROJECT_ROOT }
-  const denyList = profile.filesystem.deny.map(p => resolveProfilePlaceholders(p, ctx))
+  const denyList = profile.filesystem.deny.map(p => absolutizeFsPermissionRule(resolveProfilePlaceholders(p, ctx)))
   // Self-pace tool-name deny: every sub-agent (NOT the main agent) is denied the
   // Claude Code runtime self-scheduling tools. A whole-tool-name deny IS enforced
   // even under --dangerously-skip-permissions (deny is checked BEFORE the bypass
   // allow), so this is a fail-closed layer; the self-pace-gate hook below covers
   // the Bash escape routes a name-deny cannot reach. (2026-06-26 autonom-kor fix.)
   if (agentGetsGovernanceGates(name)) denyList.push(...SELF_PACE_TOOL_DENY)
-  existing.permissions = {
-    allow: profile.filesystem.allow.map(p => resolveProfilePlaceholders(p, ctx)),
+  // absolutizeFsPermissionRule re-anchors filesystem Read/Write/Edit rules to
+  // `//` so they actually match the agent's own dir (single-slash anchors at the
+  // project root, not filesystem root -- the root cause of allowlisted-dir file
+  // creation still prompting). Bash/tool-name rules pass through unchanged.
+  const permObj: Record<string, unknown> = {
+    allow: profile.filesystem.allow.map(p => absolutizeFsPermissionRule(resolveProfilePlaceholders(p, ctx))),
     deny: denyList,
   }
+  // Optional strict-profile permission tuning (e.g. acceptEdits + AGENT_DIR in
+  // additionalDirectories) so allowlisted-dir file CREATION is non-interactive
+  // without --dangerously-skip-permissions. Emitted only when the profile sets
+  // them; deny rules still apply in every mode.
+  if (profile.filesystem.defaultMode) permObj.defaultMode = profile.filesystem.defaultMode
+  if (profile.filesystem.additionalDirectories?.length) {
+    permObj.additionalDirectories = profile.filesystem.additionalDirectories.map(d => resolveProfilePlaceholders(d, ctx))
+  }
+  existing.permissions = permObj
   // Governance hard-gates: every sub-agent (NOT the main agent) gets PreToolUse
   // hooks. Re-applied on every spawn (this function regenerates settings.json),
   // so they survive respawns. (a) email-send block -- outbound email routes
