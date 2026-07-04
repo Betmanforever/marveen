@@ -20,6 +20,8 @@ import {
   agentSessionName,
   restartAgentProcess,
   capturePane,
+  FLEET_OAUTH_TOKEN_PATH,
+  hasFleetOauthToken,
 } from './agent-process.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { paneLooksIdle } from '../pane-state.js'
@@ -108,6 +110,7 @@ const PROBE_TIMEOUT_MS = 120_000
 const probeInFlight = new Set<string>()
 const lastProbeAt = new Map<string, number>()
 const probeConfirmed = new Set<string>()
+let probeAuthWarned = false
 
 // Flap-breaker (audit C-B): probe-driven reverts are counted per agent within
 // a 24h window. The probe interval doubles per revert (1h -> 2h -> 4h), and
@@ -139,6 +142,25 @@ function maybeProbePreferred(name: string, record: DowngradeRecord, nowMs: numbe
   // prior revert within the flap window.
   const interval = PROBE_INTERVAL_MS * 2 ** Math.min(activeHist?.count ?? 0, 3)
   if (nowMs - (lastProbeAt.get(name) ?? record.at) < interval) return
+  // Auth: the dashboard host has NO ~/.claude/.credentials.json (verified on
+  // this install) -- without the fleet OAuth token env every probe would die
+  // as "Not logged in" and silently read as "model unusable". Inject the same
+  // token the spawn path uses; without the token file, probing is impossible
+  // and the sticky revert stays a manual operation (warn once per boot).
+  if (!hasFleetOauthToken()) {
+    if (!probeAuthWarned) {
+      probeAuthWarned = true
+      logger.warn('model-fallback: no fleet OAuth token (store/.claude-oauth-token) -- reset-trigger probe disabled, sticky revert is manual')
+    }
+    return
+  }
+  let oauthToken: string
+  try {
+    oauthToken = readFileSync(FLEET_OAUTH_TOKEN_PATH, 'utf-8').trim()
+  } catch (err) {
+    logger.warn({ err }, 'model-fallback: fleet OAuth token unreadable, probe skipped')
+    return
+  }
   probeInFlight.add(name)
   lastProbeAt.set(name, nowMs)
   execFile(
@@ -146,9 +168,15 @@ function maybeProbePreferred(name: string, record: DowngradeRecord, nowMs: numbe
     // Bare probe (audit P3): neutral cwd so no project CLAUDE.md is loaded,
     // and strict empty MCP config so no MCP servers spin up -- the point is a
     // one-word entitlement check on the expensive model, not a real session.
+    // NOTE: the CLI rejects a bare '{}' ("mcpServers: expected record") --
+    // the empty-server form MUST be {"mcpServers":{}} (verified on 2.1.201).
     ['-p', 'Reply with exactly: ok', '--model', record.from, '--max-turns', '1',
-      '--strict-mcp-config', '--mcp-config', '{}'],
-    { timeout: PROBE_TIMEOUT_MS, cwd: tmpdir() },
+      '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'],
+    {
+      timeout: PROBE_TIMEOUT_MS,
+      cwd: tmpdir(),
+      env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
+    },
     (err) => {
       probeInFlight.delete(name)
       if (!err) {
@@ -312,9 +340,14 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   }
   // Audit row IMMEDIATELY after the write (audit C2): if anything below
   // throws, the on-disk model has already changed -- that drift must never
-  // be invisible to the audit trail.
+  // be invisible to the audit trail. The actor carries the cause as a suffix
+  // (model-fallback:usage-limit|model-access|revert) so the weekly report and
+  // the monthly model-eval can classify events without guessing.
+  const auditActor = action.kind === 'downgrade'
+    ? `model-fallback:${action.cause}`
+    : 'model-fallback:revert'
   try {
-    logConfigChange(`agent.${name}.model`, currentModel, action.model, 'model-fallback')
+    logConfigChange(`agent.${name}.model`, currentModel, action.model, auditActor)
   } catch (err) {
     logger.warn({ err, name }, 'model-fallback: config_change_log write failed')
   }

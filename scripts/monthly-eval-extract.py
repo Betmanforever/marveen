@@ -104,6 +104,13 @@ def main() -> int:
             "m6_correction_memories": [], "m6_inbound_corrections": [],
             # M7 (kanban #87a97029): estimate-vs-actual work-time accuracy.
             "m7_estimation": {"samples": [], "hits": 0, "n": 0},
+            # M8 (Gabor, 2026-07-04): auto model-fallback events -- how often
+            # the agent's model had to be switched, sticky (billing) vs
+            # usage-limit, and total time spent downgraded. Feeds the monthly
+            # model-assignment review: frequent fallbacks mean the chain or
+            # the primary assignment needs adjusting.
+            "m8_fallback": {"events": [], "downgrades": 0, "sticky": 0,
+                            "usage_limit": 0, "reverts": 0, "downgraded_hours": 0.0},
         })
 
     # M1: done kanban cards (updated_at approximates the closing time -- no
@@ -143,6 +150,44 @@ def main() -> int:
                                   "actual_h": round(actual, 2), "ratio": round(ratio, 2), "hit": hit})
             m7["n"] += 1
             m7["hits"] += 1 if hit else 0
+
+    # M8: model-fallback events from config_change_log
+    # (key='agent.<name>.model', actor='model-fallback:<cause>'; legacy rows
+    # may carry a bare 'model-fallback' actor -> cause 'unknown'). Downgraded
+    # time = downgrade -> next revert per agent; an open downgrade counts to
+    # the end of the reporting window.
+    fb_open: dict[str, int] = {}  # agent -> downgrade start epoch
+    for r in conn.execute(
+            "SELECT key, old_value, new_value, actor, created_at FROM config_change_log"
+            " WHERE actor LIKE 'model-fallback%' AND created_at BETWEEN ? AND ?"
+            " ORDER BY created_at", (ep0, ep1)):
+        key = r["key"] or ""
+        agent = key[len("agent."):-len(".model")] if key.startswith("agent.") and key.endswith(".model") else key
+        b = bucket(canon_assignee(agent))
+        if b is None:
+            continue
+        cause = r["actor"].split(":", 1)[1] if ":" in r["actor"] else "unknown"
+        m8 = b["m8_fallback"]
+        m8["events"].append({"from": r["old_value"], "to": r["new_value"],
+                             "cause": cause, "at": r["created_at"]})
+        if cause == "revert":
+            m8["reverts"] += 1
+            start = fb_open.pop(agent, None)
+            if start is not None:
+                m8["downgraded_hours"] += round((r["created_at"] - start) / 3600.0, 2)
+        else:
+            m8["downgrades"] += 1
+            if cause == "model-access":
+                m8["sticky"] += 1
+            elif cause == "usage-limit":
+                m8["usage_limit"] += 1
+            # chain-walk repeats keep the ORIGINAL start for the time calc
+            fb_open.setdefault(agent, r["created_at"])
+    for agent, start in fb_open.items():
+        b = bucket(canon_assignee(agent))
+        if b is not None:
+            b["m8_fallback"]["downgraded_hours"] += round((ep1 - start) / 3600.0, 2)
+            b["m8_fallback"]["open_at_month_end"] = True
 
     for r in conn.execute(
             "SELECT agent_id, COUNT(*) n FROM daily_logs WHERE date >= ? AND date <= ?"
