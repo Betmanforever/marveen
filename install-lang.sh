@@ -38,6 +38,17 @@ _t() {
     hu:prompt_install_claude) echo "Telepítsem most? (i/n) " ;;
     en:prompt_login) echo "  Would you like to log in now? (y/n) " ;;
     hu:prompt_login) echo "  Szeretnéd most bejelentkezni? (i/n) " ;;
+    # ── Git identity check (kanban #4e76c59a) ─────────────────────────
+    en:git_id_missing) echo "git user.name / user.email is not configured -- the system itself commits (auto-update, fixes), so this must be set before any commit." ;;
+    hu:git_id_missing) echo "A git user.name / user.email nincs beallitva -- a rendszer maga is commitol (auto-update, javitasok), ezert ez commit elott kotelezo." ;;
+    en:git_id_ask_name) echo "  Your git name (leave blank to skip, nothing is set automatically): " ;;
+    hu:git_id_ask_name) echo "  A git neved (uresen hagyva kihagyod, semmit nem allitunk be automatikusan): " ;;
+    en:git_id_ask_email) echo "  Your git email (leave blank to skip): " ;;
+    hu:git_id_ask_email) echo "  A git emailed (uresen hagyva kihagyod): " ;;
+    en:git_id_skip) echo "Skipped -- set it before committing: git config --global user.name \"...\" ; git config --global user.email \"...\"" ;;
+    hu:git_id_skip) echo "Kihagyva -- allitsd be commit elott: git config --global user.name \"...\" ; git config --global user.email \"...\"" ;;
+    en:git_id_noninteractive) echo "Non-interactive install -- set it before committing: git config --global user.name \"...\" ; git config --global user.email \"...\"" ;;
+    hu:git_id_noninteractive) echo "Nem-interaktiv telepites -- allitsd be commit elott: git config --global user.name \"...\" ; git config --global user.email \"...\"" ;;
     en:prompt_your_name) echo "  Your name? " ;;
     hu:prompt_your_name) echo "  Mi a neved? " ;;
     en:prompt_channel_select_macos) echo "  Choose (1/2) [1]: " ;;
@@ -327,4 +338,40 @@ _t() {
     # ── Fallback: return the key itself ──────────────────────────────
     *) echo "$key" ;;
   esac
+}
+
+# Git identity preflight (kanban #4e76c59a): the system itself commits (auto-
+# update, fix commits), so it needs git user.name + user.email. NEVER set
+# silently -- if missing, prompt the USER interactively (they type their own
+# values) or, in a non-interactive run, print a clear warning. Never blocks the
+# install. Sourced by both installers; call after the git presence check.
+check_git_identity() {
+  command -v git >/dev/null 2>&1 || return 0
+  local name email
+  name="$(git config --get user.name 2>/dev/null || true)"
+  email="$(git config --get user.email 2>/dev/null || true)"
+  if [ -n "$name" ] && [ -n "$email" ]; then
+    return 0
+  fi
+  echo ""
+  echo "  ! $(_t git_id_missing)"
+  # Real interactivity test: try to OPEN /dev/tty. `[ -r /dev/tty ]` passes even
+  # in a curl|bash / no-controlling-terminal run, where the actual read then
+  # errors -- so open it for real and fall back to the warning if that fails.
+  if { true < /dev/tty; } 2>/dev/null; then
+    local in_name in_email
+    printf "%s" "$(_t git_id_ask_name)" > /dev/tty
+    IFS= read -r in_name < /dev/tty || in_name=""
+    printf "%s" "$(_t git_id_ask_email)" > /dev/tty
+    IFS= read -r in_email < /dev/tty || in_email=""
+    if [ -n "$in_name" ] && [ -n "$in_email" ]; then
+      git config --global user.name "$in_name"
+      git config --global user.email "$in_email"
+      echo "  ✓ git: $in_name <$in_email>"
+    else
+      echo "  ! $(_t git_id_skip)"
+    fi
+  else
+    echo "  ! $(_t git_id_noninteractive)"
+  fi
 }
