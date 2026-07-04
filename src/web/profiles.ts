@@ -26,6 +26,12 @@ export interface ProfileTemplate {
     defaultMode?: string
     additionalDirectories?: string[]
   }
+  // Profile-specific behavioural CLAUDE.md blocks (markdown, placeholders
+  // resolved at scaffold time). Appended verbatim to the generated CLAUDE.md so
+  // a NEW agent on this profile inherits the strict-profile operating rules
+  // (one-command Bash, path-scope, own isolated memory path) instead of relying
+  // on a hand-patch to each live file. Template is the single source.
+  claudeMdSections?: string[]
 }
 
 // Claude Code settings.json permission rules anchor a SINGLE leading slash at

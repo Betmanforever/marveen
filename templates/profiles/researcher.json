@@ -41,5 +41,11 @@
       "Bash(wget:*)",
       "Bash(git push:*)"
     ]
-  }
+  },
+  "claudeMdSections": [
+    "FONTOS: Strict permission-profilon futsz. Nyers curl POST (curl -X POST / -d / --data), wget es szabad python3 -c TILTOTT vagy jovahagyasi promptba fut, amit senki nem hagy jova - a session lefagy. A dashboard API-t KIZAROLAG az allow-listazott fix wrapper scripteken keresztul erd el (a Bearer tokent a script kezeli, neked nem kell): a wrapperek a ${INSTALL_DIR}/scripts/agent-wrappers/ mappaban vannak (memo.sh, memo-search.sh, msg-wolfe.sh, daily-log.sh, check-allowlist.sh).",
+    "KRITIKUS: EGY Bash-hivasban CSAK EGY egyszeru parancsot adj ki, SOHA ne fuzz ossze tobbet `;`, `&&` vagy `$(...)` paranccsal -- meg akkor sem, ha minden egyes resz kulon-kulon engedelyezett lenne (pl. `ls` engedelyezett, de `ls ...; echo ---; ls ...` mar nem, mert a rendszer az osszefuzott parancsot statikusan nem tudja ellenorizni, es jovahagyast ker ra, amit senki nem lat meg -- a session orokre lefagy). Ha tobb lepes kell, indits kulon Bash-hivast mindegyikhez.",
+    "KRITIKUS (ismetlodo eles eset): Bash `ls`/`Read` egy olyan utvonalra, ami a SAJAT konyvtaradon (`${AGENT_DIR}/`) KIVUL van -- akar egy kozos projekt-mappa, akar a sajat `/tmp` scratchpad-jeid korabbi session-jei -- jovahagyasi promptba fagyaszthat, fuggetlenul attol hogy az adott parancs egyebkent allowlistelt-e. Ez szandekos vedelem, nem hiba -- de senki nem ul ott hogy jovahagyja. Ha barmit a sajat konyvtaradon kivul kellene megnezned, NE probald Bash/Read-del -- kuldj uzenetet mr-wolfe-nak (msg-wolfe.sh), o megnezi es atadja neked.",
+    "FONTOS: a SAJAT fajl-alapu Claude Code memoriad (a beepitett, session-perzisztens memoria-rendszer) az IZOLALT konfigod alatt van (a rendszer-prompt megadja a pontos utvonalat, `${AGENT_DIR}/.claude-config/...` alatt), a Write-scope-odon BELUL -- ez biztonsagosan hasznalhato. NE probalj a `~/.claude/projects/...` (HOME-alapu) utvonalra irni -- az egy MASIK, megosztott hely, ami minden agent kozott kozos, ezert az AGENT_DIR-eden kivul esik es jovahagyasi promptba fagyaszt."
+  ]
 }
