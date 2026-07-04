@@ -14,11 +14,17 @@
 // src/web/model-fallback-store.ts.
 
 // Resolved full model IDs, mirroring MODEL_ALIASES in src/web/agent-config.ts.
-// chain[0] is the primary (what we revert UP to); each subsequent entry is the
-// next downgrade target. Kept as literals here to preserve the zero-import,
-// trivially-testable property of this module.
+// The full fleet ladder (Gabor's final order, 2026-07-04): each agent's HOME
+// RUNG on it is a monthly-review decision; the chain itself walks STRICTLY
+// CHEAPER per pricing confirmed from the primary source (Fable $10/$50 ->
+// Opus 4.8 $5/$25 -> Sonnet 5 $3/$15, intro $2/$10 through 2026-08-31 ->
+// Sonnet 4.6, same list price but older tier -> Haiku $1/$5) -- downgrading
+// onto a pricier model during limit exhaustion would be counterproductive.
+// Kept as literals to preserve the zero-import, trivially-testable property.
 export const DEFAULT_MODEL_CHAIN: readonly string[] = [
+  'claude-fable-5',
   'claude-opus-4-8[1m]',
+  'claude-sonnet-5',
   'claude-sonnet-4-6',
   'claude-haiku-4-5-20251001',
 ]
@@ -185,15 +191,24 @@ export function sanitizeFailureSnippet(line: string): string {
     .slice(0, 120)
 }
 
+// Where an UNRECOGNISED current model lands when it must downgrade. With the
+// full fleet ladder in the default chain (Fable at [0]), an unknown model --
+// a future release, a non-Claude experiment -- must NOT fall to chain[0]
+// (that is now the priciest rung); the fleet-default rung is the safe
+// landing. Falls back to chain[1] when the operator's chain has no such rung.
+const UNKNOWN_MODEL_LANDING = 'claude-sonnet-5'
+
 /**
- * The next model one step down the chain from `current`, or null if already at
- * the bottom. An unrecognised current model is treated as the primary, so the
- * first downgrade target (chain[1]) applies.
+ * The next model one step down the chain from `current`, or null if already
+ * at the bottom. An unrecognised current model lands on the fleet-default
+ * rung (see UNKNOWN_MODEL_LANDING).
  */
 export function nextFallbackModel(current: string, chain: string[]): string | null {
   if (chain.length < 2) return null
   const idx = chain.indexOf(current)
-  if (idx < 0) return chain[1] ?? null
+  if (idx < 0) {
+    return chain.includes(UNKNOWN_MODEL_LANDING) ? UNKNOWN_MODEL_LANDING : (chain[1] ?? null)
+  }
   if (idx >= chain.length - 1) return null
   return chain[idx + 1]
 }
