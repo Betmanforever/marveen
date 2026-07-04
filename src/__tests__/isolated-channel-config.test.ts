@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
-  mkdtempSync, mkdirSync, writeFileSync, rmSync, lstatSync, readlinkSync, readFileSync, existsSync,
+  mkdtempSync, mkdirSync, writeFileSync, rmSync, lstatSync, readlinkSync, readFileSync, existsSync, symlinkSync,
 } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -44,6 +44,12 @@ function seedSharedClaude(home: string) {
       [TG]: [{ scope: 'project', projectPath: '/some/other/agent', installPath: '/x', version: '0.0.6' }],
     },
   }))
+  // shared/global channel state (a DIFFERENT sub-agent's live bot state, or a
+  // pre-fleet-isolation leftover) -- must never be what an isolated agent's
+  // "channels" entry resolves to; see the per-agent tests below.
+  const sharedChannels = join(claude, 'channels', 'telegram')
+  mkdirSync(sharedChannels, { recursive: true })
+  writeFileSync(join(sharedChannels, 'access.json'), JSON.stringify({ allowFrom: ['SOMEONE_ELSES_SENDER'] }))
 }
 
 beforeEach(() => {
@@ -122,6 +128,51 @@ describe('ensureIsolatedChannelConfigDir', () => {
   it('returns null (degraded, not fatal) when the shared ~/.claude is absent', () => {
     rmSync(join(SANDBOX, 'home', '.claude'), { recursive: true, force: true })
     expect(ensureIsolatedChannelConfigDir('testagent', 'telegram')).toBeNull()
+  })
+
+  it('symlinks "channels" to the agent\'s OWN per-agent state dir, not the shared one', () => {
+    // channelStateDir(provider, agentDir) reads/writes agentDir/.claude/channels/<provider>/
+    // -- the bot poller, check-allowlist.sh, and dashboard channel routes all use
+    // that path. The isolated CLAUDE_CONFIG_DIR's "channels" entry must resolve
+    // there too, so Claude-Code-native tools using the literal "~/.claude/channels/..."
+    // path (e.g. the official /telegram:access skill) land on the same file.
+    const ownChannels = join(SANDBOX, 'agents', 'testagent', '.claude', 'channels', 'telegram')
+    mkdirSync(ownChannels, { recursive: true })
+    writeFileSync(join(ownChannels, 'access.json'), JSON.stringify({ allowFrom: ['REAL_OWNER_SENDER'] }))
+
+    const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const link = join(cfg, 'channels')
+    expect(lstatSync(link).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(link)).toBe(join(SANDBOX, 'agents', 'testagent', '.claude', 'channels'))
+    expect(readlinkSync(link)).not.toBe(join(SANDBOX, 'home', '.claude', 'channels'))
+    const seen = JSON.parse(readFileSync(join(link, 'telegram', 'access.json'), 'utf-8'))
+    expect(seen.allowFrom).toEqual(['REAL_OWNER_SENDER'])
+  })
+
+  it('self-heals a stale "channels" symlink that still points at the old shared target', () => {
+    // Before this fix, "channels" was symlinked like every other generic entry
+    // -- straight at the shared ~/.claude/channels. Agents provisioned under
+    // that code (already-running fleet members) carry that stale symlink on
+    // disk; the next respawn must correct it without manual cleanup.
+    const ownChannels = join(SANDBOX, 'agents', 'testagent', '.claude', 'channels')
+    mkdirSync(ownChannels, { recursive: true })
+    const cfg = join(SANDBOX, 'agents', 'testagent', '.claude-config')
+    mkdirSync(cfg, { recursive: true })
+    symlinkSync(join(SANDBOX, 'home', '.claude', 'channels'), join(cfg, 'channels'))
+    expect(readlinkSync(join(cfg, 'channels'))).toBe(join(SANDBOX, 'home', '.claude', 'channels'))
+
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+
+    expect(readlinkSync(join(cfg, 'channels'))).toBe(ownChannels)
+  })
+
+  it('leaves an already-correct "channels" symlink untouched (no needless relink)', () => {
+    mkdirSync(join(SANDBOX, 'agents', 'testagent', '.claude', 'channels'), { recursive: true })
+    const first = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const before = lstatSync(join(first, 'channels'))
+    const second = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const after = lstatSync(join(second, 'channels'))
+    expect(after.ino).toBe(before.ino)
   })
 })
 

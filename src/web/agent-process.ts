@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, readlinkSync, symlinkSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
@@ -176,14 +176,36 @@ export function ensureIsolatedChannelConfigDir(
         }
         continue
       }
+      // "channels" is special: Marveen keeps each sub-agent's LIVE channel-plugin
+      // state (bot token, provider access.json incl. Telegram pairing/allowlist)
+      // at agentDir/.claude/channels/<provider>/ -- see channelStateDir() in
+      // channel-provider.ts, which every bot poller, check-allowlist.sh, and the
+      // dashboard's own channel routes read/write. That is a per-agent directory,
+      // NOT the shared ~/.claude/channels/ this isolation dir otherwise mirrors.
+      // Symlinking "channels" to the shared dir (like every other entry here)
+      // pointed Claude-Code-native tools -- notably the official /telegram:access
+      // skill, whose instructions literally say "~/.claude/channels/telegram/
+      // access.json" -- at the WRONG (global, shared) access.json for every
+      // sub-agent, since CLAUDE_CONFIG_DIR resolves "~/.claude" to this isolated
+      // dir. Point it at the agent's own state dir instead so the skill (and any
+      // other tool trusting "~/.claude/channels") lands on the same file the bot
+      // process actually reads. (Found 2026-07-03: Ive's pairing worked around
+      // this only because the executing agent substituted the correct path from
+      // context, not because the skill's literal path was right.)
+      const symlinkTarget = entry === 'channels' ? join(cwd, '.claude', 'channels') : join(realClaude, entry)
       const link = join(cfg, entry)
       let needsLink = true
       try {
-        if (lstatSync(link).isSymbolicLink()) needsLink = false
-        else rmSync(link, { recursive: true, force: true })
+        const st = lstatSync(link)
+        if (st.isSymbolicLink()) {
+          needsLink = readlinkSync(link) !== symlinkTarget
+          if (needsLink) rmSync(link, { force: true })
+        } else {
+          rmSync(link, { recursive: true, force: true })
+        }
       } catch { /* absent -> create */ }
       if (needsLink) {
-        try { symlinkSync(join(realClaude, entry), link) }
+        try { symlinkSync(symlinkTarget, link) }
         catch (err) { logger.warn({ err, entry, name }, 'isolated-config: symlink failed') }
       }
     }

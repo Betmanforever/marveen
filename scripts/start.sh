@@ -52,6 +52,9 @@ elif [ "$OS" = "Linux" ]; then
     echo $! > "$INSTALL_DIR/store/dashboard.pid"
     nohup bash "$INSTALL_DIR/scripts/channels.sh" > "$INSTALL_DIR/store/channels.log" 2>&1 &
     echo $! > "$INSTALL_DIR/store/channels.pid"
+    # Event-driven agent-worker health watcher (replaces the old */5 heartbeat).
+    # flock inside the script makes this a no-op if one is already running.
+    setsid nohup bash "$INSTALL_DIR/scripts/worker-guard.sh" > "$INSTALL_DIR/store/worker-guard.log" 2>&1 &
   fi
 fi
 
