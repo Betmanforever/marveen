@@ -1241,7 +1241,9 @@ export function deleteKanbanCard(id: string): boolean {
 }
 
 export function getKanbanComments(cardId: string): KanbanComment[] {
-  return db.prepare('SELECT * FROM kanban_comments WHERE card_id = ? ORDER BY created_at ASC').all(cardId) as KanbanComment[]
+  // id ASC tiebreaks comments created in the same (1s-resolution) second, so
+  // "the latest comment" is deterministic (used by restart context injection).
+  return db.prepare('SELECT * FROM kanban_comments WHERE card_id = ? ORDER BY created_at ASC, id ASC').all(cardId) as KanbanComment[]
 }
 
 // Lookup a kanban card's `seq` (its sqlite rowid) by the 8-char hex id stored
