@@ -84,6 +84,105 @@ export function detectsUsageLimit(pane: string): boolean {
   return USAGE_LIMIT_RX.test(region)
 }
 
+// --- Permanent model-access failures ("auto model drop", 2026-07-04) ---
+//
+// A separate failure class from the usage-limit banner: the configured model is
+// no longer USABLE on this auth at all -- moved off the plan's included tier
+// onto paid usage credit, retired, or access revoked. Claude Code's native
+// `fallbackModel` (settings.json) never triggers on billing/auth errors per the
+// official docs, so this is the layer that catches them. Key semantic
+// difference: a usage-limit downgrade auto-reverts after the window (the limit
+// resets); a model-access downgrade is STICKY -- auto-reverting would re-trip
+// the same permanent error every revert window, so climbing back is an
+// operator decision.
+//
+// A line triggers only when an API-error ANCHOR and a model/credit CAUSE
+// co-occur on the SAME line, inside the live bottom region. Rationale: agent
+// panes contain ordinary conversation text that can mention models or credits
+// (an agent may even be editing this very file); the same-line anchor plus the
+// region cap keeps false positives rare, and a false switch is recoverable
+// (logged to config_change_log, announced to the main agent, reversible).
+const ACCESS_ERROR_ANCHOR = /API Error|not_found_error|permission_error|invalid_request_error|billing_error/i
+
+const ACCESS_CAUSE_RX = [
+  /model .{0,60}not (found|available|supported|included)/i,
+  /(does not|doesn'?t) have access to .{0,40}model/i,
+  /no access to (this |the )?model/i,
+  /invalid model/i,
+  /model .{0,40}(retired|no longer available)/i,
+  /(requires?|needs?) .{0,30}usage credits?/i,
+  /(out of|insufficient|not enough) .{0,20}credits?/i,
+  /credit balance is too low/i,
+]
+
+// Banner phrasings Claude Code renders WITHOUT an API-error prefix. Short and
+// literal; extend here when a new provider wording shows up in the wild.
+const ACCESS_BANNER_RX = [
+  /credit balance too low/i,
+]
+
+/**
+ * The first pane line showing a PERMANENT model-access failure (trimmed,
+ * capped), or null. Same live-region scoping as detectsUsageLimit.
+ */
+export function detectsModelAccessFailure(pane: string): string | null {
+  if (!pane || !pane.trim()) return null
+  const lines = pane.split('\n').slice(-USAGE_LIMIT_BANNER_REGION_LINES)
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line) continue
+    const anchored = ACCESS_ERROR_ANCHOR.test(line) && ACCESS_CAUSE_RX.some((rx) => rx.test(line))
+    const banner = ACCESS_BANNER_RX.some((rx) => rx.test(line))
+    if (anchored || banner) return line.slice(0, 300)
+  }
+  return null
+}
+
+// Known-transient API-error phrasings: normal retry territory, never a reason
+// to switch models and not interesting for the unrecognized-error telemetry.
+const TRANSIENT_ERROR_RX = /rate_limit|overloaded|429|529|timed? ?out|connection|ECONN|network/i
+
+/**
+ * Telemetry helper (audit F8): the first live-region line that carries an
+ * API-error anchor but matches NO known cause and NO known-transient class --
+ * i.e. a wording we might need to add to ACCESS_CAUSE_RX. The exact error text
+ * of future entitlement changes is unknown in advance; the runner logs these
+ * so the pattern list can be extended from evidence instead of guesses.
+ */
+export function detectsUnrecognizedApiError(pane: string): string | null {
+  if (!pane || !pane.trim()) return null
+  const lines = pane.split('\n').slice(-USAGE_LIMIT_BANNER_REGION_LINES)
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line) continue
+    if (!ACCESS_ERROR_ANCHOR.test(line)) continue
+    if (ACCESS_CAUSE_RX.some((rx) => rx.test(line))) continue
+    if (TRANSIENT_ERROR_RX.test(line)) continue
+    if (USAGE_LIMIT_RX.test(line)) continue
+    return line.slice(0, 300)
+  }
+  return null
+}
+
+/**
+ * Strip a pane line for inclusion in an inter-agent message (audit C3): the
+ * line is UNTRUSTED terminal content and the message lands in another agent's
+ * context -- a prompt-injection channel. Keep it short, printable, quote-safe.
+ * Anchor tokens are defused (audit R3): the quote will be rendered in the
+ * RECIPIENT'S pane, and an intact "API Error ... model ..." line there could
+ * echo-trigger this very detector against the recipient.
+ */
+export function sanitizeFailureSnippet(line: string): string {
+  return line
+    .replace(/[^\x20-\x7EáéíóöőúüűÁÉÍÓÖŐÚÜŰ]/g, ' ')
+    .replace(/["'`\\[\]]/g, ' ')
+    .replace(/API Error/gi, 'API-Err')
+    .replace(/_error/gi, '-err')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120)
+}
+
 /**
  * The next model one step down the chain from `current`, or null if already at
  * the bottom. An unrecognised current model is treated as the primary, so the
@@ -100,12 +199,18 @@ export function nextFallbackModel(current: string, chain: string[]): string | nu
 export interface ModelFallbackFacts {
   /** Whether the agent's pane currently shows a usage-limit banner. */
   limitDetected: boolean
+  /** First pane line showing a permanent model-access failure, or null. */
+  accessFailure?: string | null
   /** The agent's current resolved model id. */
   currentModel: string
   /** Primary-first model chain. */
   chain: string[]
   /** When this agent was last downgraded (ms epoch), or null if on primary. */
   downgradedAt: number | null
+  /** The model the agent ran BEFORE its first downgrade (revert target). */
+  downgradedFrom?: string | null
+  /** True when the downgrade was access-failure driven: never auto-revert. */
+  downgradeSticky?: boolean
   /** Current time (ms epoch). */
   now: number
   /** Revert window in ms. */
@@ -114,27 +219,36 @@ export interface ModelFallbackFacts {
 
 export type ModelAction =
   | { kind: 'none' }
-  | { kind: 'downgrade'; model: string }
+  | { kind: 'downgrade'; model: string; sticky: boolean; cause: 'model-access' | 'usage-limit' }
   | { kind: 'revert'; model: string }
 
 /**
  * Decide what to do for one agent. Pure: the runner gates the I/O (idle pane,
  * actual write+restart) separately.
  *
- *   - limit detected & a lower model exists -> downgrade to it.
- *   - limit detected & already at the bottom -> nothing (cannot go lower).
- *   - no limit & downgraded long enough ago -> revert to the primary (chain[0]).
- *   - otherwise -> nothing.
+ *   - access failure & a lower model exists -> STICKY downgrade (no auto-revert:
+ *     the error is permanent, climbing back is an operator decision).
+ *   - limit detected & a lower model exists -> downgrade (auto-reverts later).
+ *   - already at the bottom -> nothing (cannot go lower).
+ *   - no signal & non-sticky downgrade aged past the window -> revert to the
+ *     agent's own pre-downgrade model (falling back to chain[0] when the
+ *     origin was not recorded, e.g. after a dashboard restart).
  */
 export function decideModelAction(f: ModelFallbackFacts): ModelAction {
-  if (f.limitDetected) {
+  const accessFailure = f.accessFailure ?? null
+  if (accessFailure || f.limitDetected) {
     const next = nextFallbackModel(f.currentModel, f.chain)
-    if (next && next !== f.currentModel) return { kind: 'downgrade', model: next }
+    if (next && next !== f.currentModel) {
+      return accessFailure
+        ? { kind: 'downgrade', model: next, sticky: true, cause: 'model-access' }
+        : { kind: 'downgrade', model: next, sticky: false, cause: 'usage-limit' }
+    }
     return { kind: 'none' }
   }
+  if (f.downgradeSticky) return { kind: 'none' }
   if (f.downgradedAt !== null && f.now - f.downgradedAt >= f.revertAfterMs) {
-    const primary = f.chain[0]
-    if (primary && f.currentModel !== primary) return { kind: 'revert', model: primary }
+    const target = f.downgradedFrom ?? f.chain[0]
+    if (target && f.currentModel !== target) return { kind: 'revert', model: target }
   }
   return { kind: 'none' }
 }
