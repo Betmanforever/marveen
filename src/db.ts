@@ -177,6 +177,20 @@ export function initDatabase(dbPathOverride?: string): void {
   } catch {
     // column already exists
   }
+  // Migration (kanban #87a97029): estimate vs actual work-time tracking with
+  // model correlation. estimated_hours + estimated_by (the estimating agent,
+  // whose model is looked up like the monthly model-eval); work_started_at set
+  // on the first move to in_progress, work_completed_at on the move to done.
+  // Actual hours = (work_completed_at - work_started_at)/3600, computed on read.
+  // All nullable -> existing cards are untouched (no estimate / no timing).
+  for (const col of [
+    'estimated_hours REAL',
+    'estimated_by TEXT',
+    'work_started_at INTEGER',
+    'work_completed_at INTEGER',
+  ]) {
+    try { db.exec(`ALTER TABLE kanban_cards ADD COLUMN ${col}`) } catch { /* already exists */ }
+  }
   // Migration: add agent_id, category, auto_generated columns to memories
   try {
     db.exec("ALTER TABLE memories ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'marveen'")
@@ -1066,6 +1080,33 @@ export interface KanbanCard {
   // is woken (kanban -> agent dispatch). NULL = never dispatched; the once-only
   // guard so re-dragging a card does not re-prompt the agent.
   dispatched_at: number | null
+  // Estimate-vs-actual work-time tracking (kanban #87a97029). All nullable.
+  estimated_hours: number | null   // the estimate
+  estimated_by: string | null      // estimating agent id (model looked up separately)
+  work_started_at: number | null   // first move to in_progress
+  work_completed_at: number | null // move to done
+}
+
+// Actual worked hours from the timing stamps, or null when not fully tracked
+// (e.g. a card that never passed through in_progress). Pure + exported.
+export function kanbanActualHours(card: Pick<KanbanCard, 'work_started_at' | 'work_completed_at'>): number | null {
+  const { work_started_at: s, work_completed_at: e } = card
+  if (s == null || e == null || e < s) return null
+  return (e - s) / 3600
+}
+
+// Estimation accuracy: actual/estimated ratio, and whether it lands in the
+// target band (default 0.9-1.1 = "hit", the 90% goal). Pure + exported.
+export function estimationAccuracy(
+  estimatedHours: number | null | undefined,
+  actualHours: number | null | undefined,
+  band = 0.1,
+): { ratio: number | null; hit: boolean | null } {
+  if (estimatedHours == null || actualHours == null || estimatedHours <= 0) {
+    return { ratio: null, hit: null }
+  }
+  const ratio = actualHours / estimatedHours
+  return { ratio, hit: ratio >= 1 - band && ratio <= 1 + band }
 }
 
 export interface KanbanComment {
@@ -1108,6 +1149,8 @@ export function createKanbanCard(card: {
   project?: string
   parent_id?: string
   due_date?: number
+  estimated_hours?: number
+  estimated_by?: string
 }): void {
   const now = Math.floor(Date.now() / 1000)
   const status = card.status ?? 'planned'
@@ -1115,26 +1158,53 @@ export function createKanbanCard(card: {
     'SELECT MAX(sort_order) as m FROM kanban_cards WHERE status = ? AND archived_at IS NULL'
   ).get(status) as { m: number | null }
   const sortOrder = (maxRow?.m ?? -1) + 1
+  // If the card is born in_progress, stamp work_started_at so timing is tracked.
+  const workStarted = status === 'in_progress' ? now : null
 
   db.prepare(
-    `INSERT INTO kanban_cards (id, title, description, status, assignee, priority, project, parent_id, due_date, sort_order, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO kanban_cards (id, title, description, status, assignee, priority, project, parent_id, due_date, sort_order, created_at, updated_at, estimated_hours, estimated_by, work_started_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     card.id, card.title, card.description ?? null, status,
     card.assignee ?? null, card.priority ?? 'normal',
-    card.project ?? null, card.parent_id ?? null, card.due_date ?? null, sortOrder, now, now
+    card.project ?? null, card.parent_id ?? null, card.due_date ?? null, sortOrder, now, now,
+    card.estimated_hours ?? null, card.estimated_by ?? null, workStarted
   )
+}
+
+// Compute the work-timing stamps for a status transition. Pure + exported:
+// work_started_at is set ONCE on the first in_progress; work_completed_at on
+// done. Returns only the fields that should change (undefined = leave as-is).
+export function kanbanTimingForTransition(
+  prev: Pick<KanbanCard, 'status' | 'work_started_at' | 'work_completed_at'>,
+  next: KanbanCard['status'],
+  now: number,
+): { work_started_at?: number; work_completed_at?: number } {
+  const out: { work_started_at?: number; work_completed_at?: number } = {}
+  if (next === 'in_progress' && prev.work_started_at == null) out.work_started_at = now
+  if (next === 'done') {
+    if (prev.work_started_at == null) out.work_started_at = now // direct planned->done: 0h, not null
+    out.work_completed_at = now
+  }
+  return out
 }
 
 export function updateKanbanCard(id: string, fields: Partial<Omit<KanbanCard, 'id' | 'created_at'>>): boolean {
   const card = getKanbanCard(id)
   if (!card) return false
   const now = Math.floor(Date.now() / 1000)
+  // Auto-capture work timing when this update changes the status (same rule as
+  // moveKanbanCard), unless the caller passed explicit timing overrides.
+  const timing = fields.status && fields.status !== card.status
+    ? kanbanTimingForTransition(card, fields.status, now)
+    : {}
   const f = { ...card, ...fields, updated_at: now }
+  const ws = fields.work_started_at ?? timing.work_started_at ?? card.work_started_at
+  const wc = fields.work_completed_at ?? timing.work_completed_at ?? card.work_completed_at
   return db.prepare(
-    `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, sort_order=?, updated_at=?, archived_at=?
+    `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, sort_order=?, updated_at=?, archived_at=?, estimated_hours=?, estimated_by=?, work_started_at=?, work_completed_at=?
      WHERE id=?`
-  ).run(f.title, f.description, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.sort_order, f.updated_at, f.archived_at, id).changes > 0
+  ).run(f.title, f.description, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.sort_order, f.updated_at, f.archived_at, f.estimated_hours, f.estimated_by, ws, wc, id).changes > 0
 }
 
 export function getChildCards(parentId: string): KanbanCard[] {
@@ -1143,9 +1213,14 @@ export function getChildCards(parentId: string): KanbanCard[] {
 
 export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrder: number): boolean {
   const now = Math.floor(Date.now() / 1000)
+  const card = getKanbanCard(id)
+  if (!card) return false
+  const t = kanbanTimingForTransition(card, status, now)
+  const ws = t.work_started_at ?? card.work_started_at
+  const wc = t.work_completed_at ?? card.work_completed_at
   return db.prepare(
-    'UPDATE kanban_cards SET status=?, sort_order=?, updated_at=? WHERE id=?'
-  ).run(status, sortOrder, now, id).changes > 0
+    'UPDATE kanban_cards SET status=?, sort_order=?, updated_at=?, work_started_at=?, work_completed_at=? WHERE id=?'
+  ).run(status, sortOrder, now, ws, wc, id).changes > 0
 }
 
 // Stamp the once-only kanban -> agent dispatch guard. Returns false if the
