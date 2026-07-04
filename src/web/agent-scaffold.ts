@@ -375,7 +375,27 @@ export function scaffoldAgentDir(name: string) {
   }
 }
 
-export async function generateClaudeMd(name: string, description: string, model: string): Promise<string> {
+// Pure + exported: resolve a profile's claudeMdSections placeholders
+// (${AGENT_DIR}/${HOME}/${INSTALL_DIR} via resolveProfilePlaceholders, plus
+// ${AGENT_NAME}) and join them into a mandatory-copy block for the CLAUDE.md
+// generator. Empty/absent -> '' (no block appended).
+export function renderProfileClaudeMdSections(
+  sections: string[] | undefined,
+  ctx: { HOME: string; AGENT_DIR: string; INSTALL_DIR?: string },
+  agentName: string,
+): string {
+  if (!sections?.length) return ''
+  return sections
+    .map(s => resolveProfilePlaceholders(s, ctx).replace(/\$\{AGENT_NAME\}/g, agentName))
+    .join('\n\n')
+}
+
+export async function generateClaudeMd(name: string, description: string, model: string, profile?: ProfileTemplate): Promise<string> {
+  const profileBlock = renderProfileClaudeMdSections(
+    profile?.claudeMdSections,
+    { HOME: homedir(), AGENT_DIR: agentDir(name), INSTALL_DIR: PROJECT_ROOT },
+    name,
+  )
   // Distribution-safe default-drive line: only emit a concrete folder when this
   // install has one configured (OWNER_DRIVE_FOLDER). A fresh install with no
   // configured folder tells the agent to ask the owner instead of baking in
@@ -508,7 +528,7 @@ Ezeket ${OWNER_NAME} adta, a flotta minden kolléga-asszisztensére kötelezőek
 5. **Céges email-válasz előtt KÖTELEZŐ a kontextus beolvasása.** Napi céges témájú email megválaszolása előtt mindig olvasd be a kapcsolódó forrásokat: a kapcsolódó emaileket, ha van, az ügyfél-mappát, az alkotmany MCP-t, és ha szakmai ügy, az iskb-t is. A Circleback (megbeszélés-átiratok) szintén kulcsfontosságú - rengeteg infó a meetingeken hangzik el.
 6. **Eredmény-fájlok a közös Drive mappába.** Az elkészült eredmény-fájlokat külön kérés nélkül is a közösen használt Drive mappába tedd (lásd 1. szabály).
 7. **Login-automatizálás / külső credential / futtatható szkript -> ELŐBB szólj a Főnöknek.** Mielőtt bármilyen külső szolgáltatásba automatikus bejelentkezést, jelszó-/credential-kezelést, vagy futtatható szkriptet (pl. Playwright/böngésző-automatizálás, scraper, login-szkript) írsz vagy futtatsz, jelezd a ${BOT_NAME} Főnöknek (${MAIN_AGENT_ID}) inter-agent üzenettel - ő koordinálja és ${OWNER_NAME}-val egyezteti (a 4. szabály szellemében). Credential-t SOHA ne égess nyersen kódba; ha titok kell, kérd a Főnöktől a biztonságos tárolás módját.
-
+${profileBlock ? `\n## Profil-specifikus működési szabályok (KÖTELEZŐ, másold be pontosan)\n\n${profileBlock}\n` : ''}
 Output ONLY the markdown content, no code fences.`
 
   const { text, error } = await runAgent(prompt)

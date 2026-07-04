@@ -640,7 +640,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     logger.info({ name, description }, 'Generating agent CLAUDE.md and SOUL.md...')
     try {
       const [claudeMd, soulMd] = await Promise.all([
-        generateClaudeMd(name, description, model),
+        generateClaudeMd(name, description, model, loadProfileTemplate(profileId)),
         generateSoulMd(name, description),
       ])
       atomicWriteFileSync(join(agentDir(name), 'CLAUDE.md'), claudeMd)
