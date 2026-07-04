@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import {
   initDatabase, createKanbanCard, moveKanbanCard, updateKanbanCard, getKanbanCard,
   kanbanActualHours, estimationAccuracy, kanbanTimingForTransition,
+  setKanbanCardEstimate,
 } from '../db.js'
 
 // Estimate-vs-actual work-time tracking (kanban #87a97029). Actual hours come
@@ -81,5 +82,35 @@ describe('end-to-end timing via the real card lifecycle', () => {
     createKanbanCard({ id: 'C2', title: 'y', assignee: 'neo' })
     updateKanbanCard('C2', { status: 'in_progress' })
     expect(getKanbanCard('C2')!.work_started_at).not.toBeNull()
+  })
+})
+
+// The agent's own pre-work estimate (Gabor's UX decision on #87a97029): set
+// once via the dispatch flow, never revised -- a second attempt is a conflict.
+describe('setKanbanCardEstimate', () => {
+  beforeEach(() => { initDatabase(':memory:') })
+
+  it('records the first estimate with the estimating agent', () => {
+    createKanbanCard({ id: 'E1', title: 'x', assignee: 'neo' })
+    expect(setKanbanCardEstimate('E1', 1.5, 'neo')).toBe('ok')
+    const c = getKanbanCard('E1')!
+    expect(c.estimated_hours).toBe(1.5)
+    expect(c.estimated_by).toBe('neo')
+  })
+
+  it('is once-only: a second estimate is a conflict', () => {
+    createKanbanCard({ id: 'E2', title: 'x' })
+    expect(setKanbanCardEstimate('E2', 2, 'neo')).toBe('ok')
+    expect(setKanbanCardEstimate('E2', 4, 'neo')).toBe('conflict')
+    expect(getKanbanCard('E2')!.estimated_hours).toBe(2)
+  })
+
+  it('conflicts too when the estimate came in at card creation', () => {
+    createKanbanCard({ id: 'E3', title: 'x', estimated_hours: 3, estimated_by: 'alex' })
+    expect(setKanbanCardEstimate('E3', 1, 'neo')).toBe('conflict')
+  })
+
+  it('reports a missing card', () => {
+    expect(setKanbanCardEstimate('NOPE', 1, 'neo')).toBe('not_found')
   })
 })

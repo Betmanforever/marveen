@@ -1230,6 +1230,23 @@ export function markKanbanCardDispatched(id: string): boolean {
   return db.prepare('UPDATE kanban_cards SET dispatched_at=? WHERE id=?').run(now, id).changes > 0
 }
 
+// Record the agent's own pre-work estimate (kanban #87a97029, Gabor's UX
+// decision: the ASSIGNED AGENT estimates when it starts, so it learns to
+// estimate over time). Once-only: revising the estimate mid-work would corrupt
+// the accuracy metric, so a second attempt is a conflict -- manual override
+// stays possible via updateKanbanCard (the admin PUT path).
+export function setKanbanCardEstimate(
+  id: string, hours: number, by: string,
+): 'ok' | 'not_found' | 'conflict' {
+  const card = getKanbanCard(id)
+  if (!card) return 'not_found'
+  if (card.estimated_hours != null) return 'conflict'
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare('UPDATE kanban_cards SET estimated_hours=?, estimated_by=?, updated_at=? WHERE id=?')
+    .run(hours, by, now, id)
+  return 'ok'
+}
+
 export function archiveKanbanCard(id: string): boolean {
   const now = Math.floor(Date.now() / 1000)
   return db.prepare('UPDATE kanban_cards SET archived_at=?, updated_at=? WHERE id=?').run(now, now, id).changes > 0
