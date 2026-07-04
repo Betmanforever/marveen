@@ -41,6 +41,18 @@ const IDLE_STRICT = [
   '  ? for shortcuts',
 ].join('\n')
 
+// Strict-profile idle pane where Claude Code rotated a different hint into the
+// left footer slot (`gh auth login` instead of `? for shortcuts`). The stable
+// `← for agents` suffix is the idle anchor. Regression for the 2026-07-04
+// fleet-wide delivery hole (alex/charlie/ive undeliverable across restarts).
+const IDLE_STRICT_GH_HINT = [
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  gh auth login · ← for agents',
+].join('\n')
+
 const BUSY_FULL_FOOTER = [
   '✢ Combobulating… (52s · ↓ 2.6k tokens · thinking some more)',
   '',
@@ -389,6 +401,32 @@ describe('detectPaneState', () => {
 
   it('detects idle on strict-mode footer ("? for shortcuts")', () => {
     expect(detectPaneState(IDLE_STRICT)).toBe('idle')
+  })
+
+  it('detects idle when a rotating tip ("gh auth login") displaces "? for shortcuts", via the "← for agents" anchor', () => {
+    // Regression: strict agents were mis-read 'unknown' (undeliverable) when CC
+    // rotated `gh auth login` into the footer hint slot.
+    expect(detectPaneState(IDLE_STRICT_GH_HINT)).toBe('idle')
+    expect(isReadyForPrompt(IDLE_STRICT_GH_HINT)).toBe(true)
+  })
+
+  it('accepts the ASCII "<- for agents" variant of the anchor', () => {
+    const asciiArrow = [SEP, '❯ ', SEP, '  gh auth login · <- for agents'].join('\n')
+    expect(detectPaneState(asciiArrow)).toBe('idle')
+  })
+
+  it('the busy guard still wins when a busy strict pane carries the "← for agents" footer', () => {
+    // Guard-order proof: the new idle anchor must NOT override the busy
+    // classification when a live turn renders esc-to-interrupt alongside it.
+    const busyWithAnchor = [
+      '✢ Combobulating… (52s · ↓ 2.6k tokens · thinking)',
+      '',
+      SEP,
+      '❯ ',
+      SEP,
+      '  gh auth login · ← for agents · esc to interrupt',
+    ].join('\n')
+    expect(detectPaneState(busyWithAnchor)).toBe('busy')
   })
 
   it('detects idle when the footer shows the multi-shell indicator', () => {

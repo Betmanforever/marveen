@@ -57,7 +57,19 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 // shift+tab hint OR any `·`-separated tail ending in a known idle action (ctrl+t
 // / ↓ to manage). Busy states are filtered above (esc to interrupt / busy
 // indicators / paste placeholder), so this stays idle-specific.
-const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage))|\? for shortcuts/
+//
+// STRICT-MODE ROTATING-TIP HOLE (2026-07-04): non-bypass agents (strict
+// profiles) never render `bypass permissions on`, so they relied entirely on
+// the `? for shortcuts` alternative. But Claude Code rotates a HINT in that same
+// left footer slot (`? for shortcuts`, `gh auth login`, other onboarding tips);
+// when it showed `gh auth login · ← for agents` NOTHING matched, detectPaneState
+// read 'unknown', isSessionReadyForPrompt never went true, and inter-agent
+// messages to alex/charlie/ive were silently undeliverable across restarts
+// (only neo, in bypass mode, kept working). Fix: anchor on the STABLE
+// `← for agents` (ASCII `<-` variant too) suffix, which is present regardless of
+// the rotating tip. Busy/menu states are filtered above, so this stays
+// idle-specific.
+const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage))|\? for shortcuts|(?:←|<-) for agents/
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
 // is mid-flight, even if the footer looks idle for a frame.
