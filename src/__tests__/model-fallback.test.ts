@@ -178,11 +178,35 @@ describe('decideModelAction', () => {
     })).toEqual({ kind: 'downgrade', model: SONNET, sticky: true, cause: 'model-access' })
   })
 
-  it('a sticky downgrade never auto-reverts, no matter how old', () => {
+  it('a sticky downgrade never auto-reverts on a TIMER, no matter how old', () => {
     expect(decideModelAction({
       ...base, limitDetected: false, currentModel: SONNET,
       downgradedAt: 0, downgradedFrom: 'claude-fable-5', downgradeSticky: true,
     })).toEqual({ kind: 'none' })
+  })
+
+  it('a sticky downgrade DOES revert when a probe confirms the preferred model works again', () => {
+    expect(decideModelAction({
+      ...base, limitDetected: false, currentModel: SONNET,
+      downgradedAt: 999_999, downgradedFrom: 'claude-fable-5', downgradeSticky: true,
+      preferredUsable: true,
+    })).toEqual({ kind: 'revert', model: 'claude-fable-5' })
+  })
+
+  it('a probe-confirmed sticky revert needs a recorded origin (no guess after restart)', () => {
+    expect(decideModelAction({
+      ...base, limitDetected: false, currentModel: SONNET,
+      downgradedAt: 0, downgradedFrom: null, downgradeSticky: true, preferredUsable: true,
+    })).toEqual({ kind: 'none' })
+  })
+
+  it('a still-visible access failure blocks the probe-confirmed revert', () => {
+    // failure signal wins: downgrade path is evaluated first
+    expect(decideModelAction({
+      ...base, limitDetected: false, accessFailure: 'API x model y',
+      currentModel: SONNET, downgradedAt: 0, downgradedFrom: 'claude-fable-5',
+      downgradeSticky: true, preferredUsable: true,
+    })).toEqual({ kind: 'downgrade', model: HAIKU, sticky: true, cause: 'model-access' })
   })
 
   it('a non-sticky revert returns to the agent OWN pre-downgrade model, not chain[0]', () => {

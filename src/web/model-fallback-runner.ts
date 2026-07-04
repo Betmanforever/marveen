@@ -1,14 +1,16 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, PROJECT_ROOT } from '../config.js'
+import { resolveFromPath } from '../platform.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import {
   listAgentNames,
   readAgentRemoteHost,
   readAgentModel,
   writeAgentModel,
+  readAgentAuthMode,
   resolveModelId,
   DEFAULT_MODEL,
 } from './agent-config.js'
@@ -76,6 +78,48 @@ const PENDING_MAX_AGE_MS = 5 * 60_000
 
 // Rate-limit for the unrecognized-error telemetry log (audit F8), per agent.
 const lastUnrecognizedLogAt = new Map<string, number>()
+
+// --- Reset-trigger probe (Gabor, 2026-07-04): sticky means "no TIMER revert",
+// not "never revert". While a sticky downgrade is active, probe the preferred
+// model hourly with a minimal headless call; when it succeeds (quota reset,
+// usage credit added), the next sweep reverts through the normal action path
+// (idle guard, audit row, restart, announce). Cost: one one-word prompt per
+// hour per downgraded agent, zero when nothing is downgraded. The probe runs
+// under the DASHBOARD's own auth (the owner's shared subscription), which is
+// exactly the entitlement shared-auth agents use -- dedicated-API-key agents
+// are skipped (their entitlement is a different account; manual revert there).
+const CLAUDE_BIN = resolveFromPath('claude')
+const PROBE_INTERVAL_MS = 60 * 60_000
+const PROBE_TIMEOUT_MS = 120_000
+const probeInFlight = new Set<string>()
+const lastProbeAt = new Map<string, number>()
+const probeConfirmed = new Set<string>()
+
+function maybeProbePreferred(name: string, record: DowngradeRecord, nowMs: number): void {
+  if (!record.sticky || probeConfirmed.has(name) || probeInFlight.has(name)) return
+  if (!record.from.startsWith('claude-')) return
+  if (name !== MAIN_AGENT_ID && readAgentAuthMode(name) === 'api') return
+  // First probe a full interval after the switch (lastProbeAt seeds from the
+  // switch time), then hourly.
+  if (nowMs - (lastProbeAt.get(name) ?? record.at) < PROBE_INTERVAL_MS) return
+  probeInFlight.add(name)
+  lastProbeAt.set(name, nowMs)
+  execFile(
+    CLAUDE_BIN,
+    ['-p', 'Reply with exactly: ok', '--model', record.from, '--max-turns', '1'],
+    { timeout: PROBE_TIMEOUT_MS },
+    (err) => {
+      probeInFlight.delete(name)
+      if (!err) {
+        probeConfirmed.add(name)
+        logger.info({ name, model: record.from }, 'model-fallback: probe OK, preferred model usable again')
+      } else {
+        // Transient failures (network) just delay the revert by one interval.
+        logger.debug({ name, model: record.from }, 'model-fallback: probe failed, preferred model still unusable')
+      }
+    },
+  )
+}
 
 // Every switch is announced to the main agent, which relays it to the owner
 // on Telegram. (The config_change_log audit row is written separately, right
@@ -188,6 +232,7 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   }
   const currentModel = readModelFor(name)
   const record = downgraded.get(name) ?? null
+  if (record?.sticky) maybeProbePreferred(name, record, nowMs)
   const action = decideModelAction({
     limitDetected,
     accessFailure,
@@ -196,6 +241,7 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
     downgradedAt: record?.at ?? null,
     downgradedFrom: record?.from ?? null,
     downgradeSticky: record?.sticky ?? false,
+    preferredUsable: probeConfirmed.has(name),
     now: nowMs,
     revertAfterMs,
   })
@@ -225,6 +271,7 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
   // State update BEFORE the restart attempt (audit R2): a throwing restart
   // must still arm the cooldown/sticky record, or the next sweep would read
   // the new model as "current" and walk the chain one step further.
+  const wasStickyRevert = action.kind === 'revert' && (record?.sticky ?? false)
   if (action.kind === 'downgrade') {
     // A repeat downgrade (chain walk) keeps the ORIGINAL from-model as the
     // revert target; stickiness escalates but never de-escalates.
@@ -235,8 +282,12 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
       line: accessFailure ?? record?.line ?? null,
     })
     pendingAccess.delete(name)
+    probeConfirmed.delete(name)
+    lastProbeAt.delete(name)
   } else {
     downgraded.delete(name)
+    probeConfirmed.delete(name)
+    lastProbeAt.delete(name)
   }
   let restartOk = true
   try {
@@ -258,7 +309,9 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
     )
   } else {
     announceSwitch(name, currentModel, action.model, 'revert',
-      'A limit-ablak lejart, az agent visszakapta az eredeti modelljet.' + restartNote)
+      (wasStickyRevert
+        ? 'A preferalt modell ujra elerheto (oras headless proba sikeres -- kvota/credit feloldodott), automatikus visszavaltas.'
+        : 'A limit-ablak lejart, az agent visszakapta az eredeti modelljet.') + restartNote)
   }
   logger.info(
     { name, from: currentModel, to: action.model, action: action.kind, restartOk },
@@ -271,6 +324,9 @@ export function startModelFallbackRunner(): NodeJS.Timeout {
     const cfg = readModelFallbackConfig()
     if (!cfg.enabled) {
       if (downgraded.size > 0) downgraded.clear() // re-seed cleanly if re-enabled
+      pendingAccess.clear()
+      probeConfirmed.clear()
+      lastProbeAt.clear()
       return
     }
     const now = Date.now()
