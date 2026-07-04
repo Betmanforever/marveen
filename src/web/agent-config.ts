@@ -7,12 +7,17 @@ import { safeJoin } from './sanitize.js'
 
 export const AGENTS_BASE_DIR = join(PROJECT_ROOT, 'agents')
 
-export const DEFAULT_MODEL = 'claude-opus-4-8[1m]'
+// Fleet default since 2026-07-04 (Gabor's decision): Sonnet 5 -- near-Opus
+// agentic quality at a substantially lower price ($3/$15 vs Opus 4.8 $5/$25).
+// Opus 4.8 and Fable 5 remain per-agent premium choices, not the default.
+export const DEFAULT_MODEL = 'claude-sonnet-5'
 
 // Map short model names to full Claude model IDs (backwards compat with old configs)
 export const MODEL_ALIASES: Record<string, string> = {
   'opus': 'claude-opus-4-8[1m]',
-  'sonnet': 'claude-sonnet-4-6',
+  'sonnet': 'claude-sonnet-5',
+  'sonnet-5': 'claude-sonnet-5',
+  'sonnet-4-6': 'claude-sonnet-4-6',
   'haiku': 'claude-haiku-4-5-20251001',
   'inherit': DEFAULT_MODEL,
 }

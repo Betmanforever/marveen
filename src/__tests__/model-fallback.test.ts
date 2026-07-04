@@ -12,9 +12,12 @@ import {
 } from '../model-fallback.js'
 
 const CHAIN = [...DEFAULT_MODEL_CHAIN]
-const PRIMARY = CHAIN[0]
-const SONNET = CHAIN[1]
-const HAIKU = CHAIN[2]
+// Full fleet ladder: [fable, opus-4-8[1m], sonnet-5, sonnet-4-6, haiku]
+const FABLE = CHAIN[0]
+const OPUS = CHAIN[1]
+const SONNET5 = CHAIN[2]
+const SONNET46 = CHAIN[3]
+const HAIKU = CHAIN[4]
 
 describe('detectsUsageLimit', () => {
   it('matches Claude plan usage-limit banners in the live region', () => {
@@ -43,18 +46,22 @@ describe('detectsUsageLimit', () => {
 
 describe('nextFallbackModel', () => {
   it('walks one step down the chain', () => {
-    expect(nextFallbackModel(PRIMARY, CHAIN)).toBe(SONNET)
-    expect(nextFallbackModel(SONNET, CHAIN)).toBe(HAIKU)
+    expect(nextFallbackModel(FABLE, CHAIN)).toBe(OPUS)
+    expect(nextFallbackModel(OPUS, CHAIN)).toBe(SONNET5)
+    expect(nextFallbackModel(SONNET5, CHAIN)).toBe(SONNET46)
+    expect(nextFallbackModel(SONNET46, CHAIN)).toBe(HAIKU)
   })
   it('returns null at the bottom', () => {
     expect(nextFallbackModel(HAIKU, CHAIN)).toBeNull()
   })
-  it('treats an unknown current model as the primary', () => {
-    expect(nextFallbackModel('some-unknown-model', CHAIN)).toBe(SONNET)
+  it('an unknown current model lands on the fleet-default rung, not the pricey head', () => {
+    expect(nextFallbackModel('some-unknown-model', CHAIN)).toBe(SONNET5)
+    // operator chain without the default rung: falls back to chain[1]
+    expect(nextFallbackModel('some-unknown-model', [OPUS, SONNET46, HAIKU])).toBe(SONNET46)
   })
   it('returns null for a degenerate chain', () => {
-    expect(nextFallbackModel(PRIMARY, [PRIMARY])).toBeNull()
-    expect(nextFallbackModel(PRIMARY, [])).toBeNull()
+    expect(nextFallbackModel(FABLE, [FABLE])).toBeNull()
+    expect(nextFallbackModel(FABLE, [])).toBeNull()
   })
 })
 
@@ -133,9 +140,9 @@ describe('decideModelAction', () => {
   const base = { chain: CHAIN, now: 1_000_000, revertAfterMs: 60_000 }
 
   it('downgrades when a limit is detected and a lower model exists', () => {
-    expect(decideModelAction({ ...base, limitDetected: true, currentModel: PRIMARY, downgradedAt: null }))
-      .toEqual({ kind: 'downgrade', model: SONNET, sticky: false, cause: 'usage-limit' })
-    expect(decideModelAction({ ...base, limitDetected: true, currentModel: SONNET, downgradedAt: 500_000 }))
+    expect(decideModelAction({ ...base, limitDetected: true, currentModel: FABLE, downgradedAt: null }))
+      .toEqual({ kind: 'downgrade', model: OPUS, sticky: false, cause: 'usage-limit' })
+    expect(decideModelAction({ ...base, limitDetected: true, currentModel: SONNET46, downgradedAt: 500_000 }))
       .toEqual({ kind: 'downgrade', model: HAIKU, sticky: false, cause: 'usage-limit' })
   })
 
@@ -144,58 +151,58 @@ describe('decideModelAction', () => {
       .toEqual({ kind: 'none' })
   })
 
-  it('reverts to the primary after the window once limit-free', () => {
+  it('reverts to chain[0] after the window when no origin was recorded', () => {
     expect(decideModelAction({ ...base, limitDetected: false, currentModel: HAIKU, downgradedAt: 1_000_000 - 60_000 }))
-      .toEqual({ kind: 'revert', model: PRIMARY })
+      .toEqual({ kind: 'revert', model: FABLE })
   })
 
   it('does not revert before the window elapses', () => {
-    expect(decideModelAction({ ...base, limitDetected: false, currentModel: SONNET, downgradedAt: 1_000_000 - 59_999 }))
+    expect(decideModelAction({ ...base, limitDetected: false, currentModel: SONNET5, downgradedAt: 1_000_000 - 59_999 }))
       .toEqual({ kind: 'none' })
   })
 
   it('does nothing when on the primary and limit-free', () => {
-    expect(decideModelAction({ ...base, limitDetected: false, currentModel: PRIMARY, downgradedAt: null }))
+    expect(decideModelAction({ ...base, limitDetected: false, currentModel: FABLE, downgradedAt: null }))
       .toEqual({ kind: 'none' })
   })
 
   it('does not re-revert when already back on the primary', () => {
-    expect(decideModelAction({ ...base, limitDetected: false, currentModel: PRIMARY, downgradedAt: 0 }))
+    expect(decideModelAction({ ...base, limitDetected: false, currentModel: FABLE, downgradedAt: 0 }))
       .toEqual({ kind: 'none' })
   })
 
   it('access failure produces a STICKY downgrade and wins over a limit banner', () => {
     expect(decideModelAction({
       ...base, limitDetected: true, accessFailure: 'API Error: 403 ... model',
-      currentModel: PRIMARY, downgradedAt: null,
-    })).toEqual({ kind: 'downgrade', model: SONNET, sticky: true, cause: 'model-access' })
+      currentModel: FABLE, downgradedAt: null,
+    })).toEqual({ kind: 'downgrade', model: OPUS, sticky: true, cause: 'model-access' })
   })
 
-  it('access failure on an off-chain primary (e.g. fable) downgrades to chain[1]', () => {
+  it('access failure on the fable rung walks to opus (fable is IN the chain now)', () => {
     expect(decideModelAction({
       ...base, limitDetected: false, accessFailure: 'API Error: 404 model not found',
       currentModel: 'claude-fable-5', downgradedAt: null,
-    })).toEqual({ kind: 'downgrade', model: SONNET, sticky: true, cause: 'model-access' })
+    })).toEqual({ kind: 'downgrade', model: OPUS, sticky: true, cause: 'model-access' })
   })
 
   it('a sticky downgrade never auto-reverts on a TIMER, no matter how old', () => {
     expect(decideModelAction({
-      ...base, limitDetected: false, currentModel: SONNET,
-      downgradedAt: 0, downgradedFrom: 'claude-fable-5', downgradeSticky: true,
+      ...base, limitDetected: false, currentModel: SONNET5,
+      downgradedAt: 0, downgradedFrom: FABLE, downgradeSticky: true,
     })).toEqual({ kind: 'none' })
   })
 
   it('a sticky downgrade DOES revert when a probe confirms the preferred model works again', () => {
     expect(decideModelAction({
-      ...base, limitDetected: false, currentModel: SONNET,
-      downgradedAt: 999_999, downgradedFrom: 'claude-fable-5', downgradeSticky: true,
+      ...base, limitDetected: false, currentModel: SONNET5,
+      downgradedAt: 999_999, downgradedFrom: FABLE, downgradeSticky: true,
       preferredUsable: true,
-    })).toEqual({ kind: 'revert', model: 'claude-fable-5' })
+    })).toEqual({ kind: 'revert', model: FABLE })
   })
 
   it('a probe-confirmed sticky revert needs a recorded origin (no guess after restart)', () => {
     expect(decideModelAction({
-      ...base, limitDetected: false, currentModel: SONNET,
+      ...base, limitDetected: false, currentModel: SONNET5,
       downgradedAt: 0, downgradedFrom: null, downgradeSticky: true, preferredUsable: true,
     })).toEqual({ kind: 'none' })
   })
@@ -204,17 +211,17 @@ describe('decideModelAction', () => {
     // failure signal wins: downgrade path is evaluated first
     expect(decideModelAction({
       ...base, limitDetected: false, accessFailure: 'API x model y',
-      currentModel: SONNET, downgradedAt: 0, downgradedFrom: 'claude-fable-5',
+      currentModel: SONNET5, downgradedAt: 0, downgradedFrom: FABLE,
       downgradeSticky: true, preferredUsable: true,
-    })).toEqual({ kind: 'downgrade', model: HAIKU, sticky: true, cause: 'model-access' })
+    })).toEqual({ kind: 'downgrade', model: SONNET46, sticky: true, cause: 'model-access' })
   })
 
   it('a non-sticky revert returns to the agent OWN pre-downgrade model, not chain[0]', () => {
-    // mixed fleet: this agent ran claude-fable-5, chain[0] is the opus default
+    // mixed fleet: this agent's home rung is opus, chain[0] is fable
     expect(decideModelAction({
-      ...base, limitDetected: false, currentModel: SONNET,
-      downgradedAt: 1_000_000 - 60_000, downgradedFrom: 'claude-fable-5', downgradeSticky: false,
-    })).toEqual({ kind: 'revert', model: 'claude-fable-5' })
+      ...base, limitDetected: false, currentModel: SONNET5,
+      downgradedAt: 1_000_000 - 60_000, downgradedFrom: OPUS, downgradeSticky: false,
+    })).toEqual({ kind: 'revert', model: OPUS })
   })
 })
 
