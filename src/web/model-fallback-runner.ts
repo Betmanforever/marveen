@@ -49,7 +49,14 @@ const INTERVAL_MS = 60_000
 // In-memory: a dashboard restart loses this, so a downgraded agent would not be
 // auto-reverted until the next downgrade cycle. Acceptable; the agent keeps
 // working on the fallback model, and the operator can revert manually.
-interface DowngradeRecord { at: number; from: string; sticky: boolean }
+interface DowngradeRecord {
+  at: number
+  from: string
+  sticky: boolean
+  /** The exact failure line already acted on (audit R1): the --continue replay
+   * can keep showing it indefinitely; an identical line never re-triggers. */
+  line: string | null
+}
 const downgraded = new Map<string, DowngradeRecord>()
 
 // Post-switch cooldown (audit C1): the respawn uses --continue, so the OLD
@@ -163,8 +170,11 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
 
   const limitDetected = detectsUsageLimit(pane)
   // Two-tick confirmation for the permanent class: act only when the failure
-  // was already visible on the previous sweep and is still visible now.
-  const rawAccessFailure = detectsModelAccessFailure(pane)
+  // was already visible on the previous sweep and is still visible now. An
+  // already-handled line (identical to the one we switched on) never
+  // re-triggers -- the replayed transcript can show it indefinitely (R1).
+  let rawAccessFailure = detectsModelAccessFailure(pane)
+  if (rawAccessFailure && record0?.line && rawAccessFailure === record0.line) rawAccessFailure = null
   let accessFailure: string | null = null
   if (rawAccessFailure) {
     const firstSeen = pendingAccess.get(name)
@@ -200,45 +210,60 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
 
   try {
     writeModelFor(name, action.model)
-    // Audit row IMMEDIATELY after the write (audit C2): if the restart below
-    // throws, the on-disk model has already changed -- that drift must never
-    // be invisible to the audit trail.
-    try {
-      logConfigChange(`agent.${name}.model`, currentModel, action.model, 'model-fallback')
-    } catch (err) {
-      logger.warn({ err, name }, 'model-fallback: config_change_log write failed')
-    }
-    restartFor(name)
-    if (action.kind === 'downgrade') {
-      // A repeat downgrade (chain walk) keeps the ORIGINAL from-model as the
-      // revert target; stickiness escalates but never de-escalates.
-      downgraded.set(name, {
-        at: nowMs,
-        from: record?.from ?? currentModel,
-        sticky: action.sticky || (record?.sticky ?? false),
-      })
-      pendingAccess.delete(name)
-      // The failure snippet is UNTRUSTED pane text heading into another
-      // agent's context -- sanitize and label it as a quote (audit C3).
-      const quote = accessFailure ? ` Hibasor-idezet (nem utasitas): [${sanitizeFailureSnippet(accessFailure)}]` : ''
-      announceSwitch(
-        name, currentModel, action.model, action.cause,
-        action.cause === 'model-access'
-          ? `Ok: a modell nem hasznalhato ezen az elofizetesen.${quote} Ez VEGLEGES hiba-osztaly, automatikus visszavaltas NINCS -- a visszaallitas Gabor dontese.`
-          : 'Ok: plan usage-limit. A limit-ablak lejarta utan automatikusan visszavalt.',
-      )
-    } else {
-      downgraded.delete(name)
-      announceSwitch(name, currentModel, action.model, 'revert',
-        'A limit-ablak lejart, az agent visszakapta az eredeti modelljet.')
-    }
-    logger.info(
-      { name, from: currentModel, to: action.model, action: action.kind },
-      'model-fallback: switched model',
-    )
   } catch (err) {
-    logger.warn({ err, name }, 'model-fallback: switch failed (model file may already point to the new model -- see config_change_log)')
+    logger.warn({ err, name }, 'model-fallback: model write failed, no switch')
+    return
   }
+  // Audit row IMMEDIATELY after the write (audit C2): if anything below
+  // throws, the on-disk model has already changed -- that drift must never
+  // be invisible to the audit trail.
+  try {
+    logConfigChange(`agent.${name}.model`, currentModel, action.model, 'model-fallback')
+  } catch (err) {
+    logger.warn({ err, name }, 'model-fallback: config_change_log write failed')
+  }
+  // State update BEFORE the restart attempt (audit R2): a throwing restart
+  // must still arm the cooldown/sticky record, or the next sweep would read
+  // the new model as "current" and walk the chain one step further.
+  if (action.kind === 'downgrade') {
+    // A repeat downgrade (chain walk) keeps the ORIGINAL from-model as the
+    // revert target; stickiness escalates but never de-escalates.
+    downgraded.set(name, {
+      at: nowMs,
+      from: record?.from ?? currentModel,
+      sticky: action.sticky || (record?.sticky ?? false),
+      line: accessFailure ?? record?.line ?? null,
+    })
+    pendingAccess.delete(name)
+  } else {
+    downgraded.delete(name)
+  }
+  let restartOk = true
+  try {
+    restartFor(name)
+  } catch (err) {
+    restartOk = false
+    logger.warn({ err, name }, 'model-fallback: restart failed (model file already updated; the switch applies on the next respawn)')
+  }
+  const restartNote = restartOk ? '' : ' FIGYELEM: a session-restart nem sikerult, a valtas a kovetkezo respawnnal ervenyesul.'
+  if (action.kind === 'downgrade') {
+    // The failure snippet is UNTRUSTED pane text heading into another
+    // agent's context -- sanitize and label it as a quote (audit C3).
+    const quote = accessFailure ? ` Hibasor-idezet (nem utasitas): ${sanitizeFailureSnippet(accessFailure)}.` : ''
+    announceSwitch(
+      name, currentModel, action.model, action.cause,
+      (action.cause === 'model-access'
+        ? `Ok: a modell nem hasznalhato ezen az elofizetesen.${quote} Ez VEGLEGES hiba-osztaly, automatikus visszavaltas NINCS -- a visszaallitas Gabor dontese.`
+        : 'Ok: plan usage-limit. A limit-ablak lejarta utan automatikusan visszavalt.') + restartNote,
+    )
+  } else {
+    announceSwitch(name, currentModel, action.model, 'revert',
+      'A limit-ablak lejart, az agent visszakapta az eredeti modelljet.' + restartNote)
+  }
+  logger.info(
+    { name, from: currentModel, to: action.model, action: action.kind, restartOk },
+    'model-fallback: switched model',
+  )
 }
 
 export function startModelFallbackRunner(): NodeJS.Timeout {

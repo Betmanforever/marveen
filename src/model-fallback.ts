@@ -168,11 +168,16 @@ export function detectsUnrecognizedApiError(pane: string): string | null {
  * Strip a pane line for inclusion in an inter-agent message (audit C3): the
  * line is UNTRUSTED terminal content and the message lands in another agent's
  * context -- a prompt-injection channel. Keep it short, printable, quote-safe.
+ * Anchor tokens are defused (audit R3): the quote will be rendered in the
+ * RECIPIENT'S pane, and an intact "API Error ... model ..." line there could
+ * echo-trigger this very detector against the recipient.
  */
 export function sanitizeFailureSnippet(line: string): string {
   return line
     .replace(/[^\x20-\x7EáéíóöőúüűÁÉÍÓÖŐÚÜŰ]/g, ' ')
-    .replace(/["'`\\]/g, ' ')
+    .replace(/["'`\\[\]]/g, ' ')
+    .replace(/API Error/gi, 'API-Err')
+    .replace(/_error/gi, '-err')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120)
