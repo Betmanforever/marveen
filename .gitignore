@@ -65,6 +65,10 @@ DREAM.md
 .external-ops-last-run
 REBUILD_PROMPT_V3.1.md
 
+# Client project exports (Zenom/Legox intake, 2026-07-03): local-only per
+# Gábor's decision (2026-07-05) -- may contain sensitive client content.
+/projects/project_export_zenom_legox/
+
 # Weekly report pipeline output (regenerated weekly, not source -- the
 # dated archive under reports/ is already ignored above, this is its
 # always-latest sibling at the repo root).
