@@ -23,6 +23,13 @@ agent_id="$1"; content_arg="$2"
 case "$agent_id" in
   *[!a-z0-9-]*|'') echo "daily-log.sh: invalid agent_id" >&2; exit 2 ;;
 esac
+# Bind the claimed agent_id to the REAL caller (its CWD must be that agent's
+# own dir) before any @file read, so a spoofed agent_id cannot make the fence
+# resolve into another agent's directory. Proven guard from memo-search.sh.
+case "$PWD/" in
+  "$ROOT/agents/$agent_id/"*) ;;
+  *) echo "daily-log.sh: agent_id does not match calling agent dir" >&2; exit 2 ;;
+esac
 
 # Content may be given inline or as `@<path>` to read from a file. daily-log
 # entries start with `## HH:MM` headers, so an inline multi-line argument almost

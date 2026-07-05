@@ -24,6 +24,15 @@ agent_id="$1"; content_arg="$2"
 case "$agent_id" in
   *[!a-z0-9-]*|'') echo "msg-wolfe.sh: invalid agent_id" >&2; exit 2 ;;
 esac
+# Bind the claimed agent_id to the REAL caller: its CWD must be that agent's
+# own directory. Without this, a prompt-injected agent could pass a spoofed
+# agent_id and make the @file fence resolve into ANOTHER agent's dir (e.g.
+# `msg-wolfe.sh alex @.../agents/alex/.env`), reading a peer's secrets. Same
+# proven guard as memo-search.sh (2026-07-03). MUST precede the @file read.
+case "$PWD/" in
+  "$ROOT/agents/$agent_id/"*) ;;
+  *) echo "msg-wolfe.sh: agent_id does not match calling agent dir" >&2; exit 2 ;;
+esac
 
 # Content may be given inline, or as `@<path>` to read from a file. The @file
 # form exists because a multi-line inline argument that contains a newline
