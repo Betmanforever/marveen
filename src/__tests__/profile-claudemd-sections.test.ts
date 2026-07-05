@@ -35,8 +35,15 @@ describe('strict profiles ship the behavioural sections', () => {
       expect(rendered).toContain('EGY Bash-hivasban CSAK EGY egyszeru parancsot')
       expect(rendered).toContain('a SAJAT konyvtaradon')
       expect(rendered).toContain('IZOLALT konfigod')
-      // placeholders fully resolved -- no raw ${...} leaks into the CLAUDE.md
-      expect(rendered).not.toMatch(/\$\{[A-Z_]+\}/)
+      // Resolvable placeholders fully resolved -- none of the renderer's own
+      // tokens leak into the CLAUDE.md. Other ${...} literals are allowed:
+      // the watch-wrapper section INTENTIONALLY shows `${VAR}` and
+      // `${CLAUDE_SKILL_DIR}` as the exact forms the agent must never type
+      // (they hard-block as "Contains expansion"), so a blanket no-${...}
+      // assertion would forbid the instruction itself.
+      for (const token of ['${AGENT_DIR}', '${HOME}', '${INSTALL_DIR}', '${AGENT_NAME}']) {
+        expect(rendered).not.toContain(token)
+      }
       // AGENT_DIR resolved to the concrete agent path
       expect(rendered).toContain('/home/szabgabor/marveen/agents/bob/')
     })

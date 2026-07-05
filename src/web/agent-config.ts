@@ -354,6 +354,16 @@ export function listAgentNames(): string[] {
   if (!existsSync(AGENTS_BASE_DIR)) return []
   return readdirSync(AGENTS_BASE_DIR).filter((f) => {
     try {
+      // The main agent is NEVER a sub-agent: every consumer of this list
+      // (overview counts, /api/agents, team roles, auto-restart, message
+      // routing) represents it separately, and several add it back
+      // explicitly (e.g. sanitizeTeamConfig's known.add(MAIN_AGENT_ID)).
+      // An agents/<MAIN_AGENT_ID>/ dir can legitimately exist on disk
+      // (deliverables/ appeared 2026-07-05) -- without this filter it
+      // surfaces as a phantom duplicate: a second "member"-role,
+      // running-state Mr. Wolfe on the Overview/Agents/Team views, and a
+      // double-counted agents.total/running.
+      if (f === MAIN_AGENT_ID) return false
       if (!statSync(join(AGENTS_BASE_DIR, f)).isDirectory()) return false
       // Hide technical workers explicitly opted out via the sentinel
       // file. Cheap fs stat -- one extra existsSync per agent dir per
