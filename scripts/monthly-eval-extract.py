@@ -82,6 +82,30 @@ def read_assignment() -> dict:
     return assignment
 
 
+def read_effort() -> dict:
+    # M9 (Gabor, 2026-07-04, kanban #2e46fb86): reasoning-effort snapshot at
+    # extraction time. Main/dashboard agents: 'effortLevel' from their
+    # settings.json (absent key = harness default). Subagents (auditor,
+    # skill-writer, hard-coder, ...): 'effort:' frontmatter from the shared
+    # .claude/agents/*.md definitions (absent = inherits the caller's level).
+    effort: dict[str, str | None] = {}
+    try:
+        effort["mr-wolfe"] = json.load(open(f"{REPO}/.claude/settings.json")).get("effortLevel")
+    except (OSError, json.JSONDecodeError):
+        effort["mr-wolfe"] = None
+    for path in sorted(glob.glob(f"{REPO}/agents/*/.claude/settings.json")):
+        agent = path[len(f"{REPO}/agents/"):].split("/", 1)[0]
+        try:
+            effort[agent] = json.load(open(path)).get("effortLevel")
+        except (OSError, json.JSONDecodeError):
+            effort[agent] = None
+    for md in sorted(glob.glob(f"{REPO}/.claude/agents/*.md")):
+        sub = os.path.basename(md)[:-3]
+        m = re.search(r"^effort:\s*(\S+)", open(md, errors="replace").read(), re.M)
+        effort[f"subagent:{sub}"] = m.group(1) if m else None
+    return effort
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--month", help="calendar month like 2026-06 (default: previous)")
@@ -266,6 +290,17 @@ def main() -> int:
             if b is not None:
                 b["m6_inbound_corrections"].append(
                     {"from": r["from_agent"], "preview": r["content"][:150]})
+    # M9: effort-level change history from config_change_log
+    # (key='agent_effort:<agent|subagent>', written by whoever changes an
+    # effort level -- see the effort policy section in agents/neo/CLAUDE.md).
+    effort_changes = [
+        {"target": (r["key"] or "")[len("agent_effort:"):], "from": r["old_value"],
+         "to": r["new_value"], "actor": r["actor"], "at": r["created_at"]}
+        for r in conn.execute(
+            "SELECT key, old_value, new_value, actor, created_at FROM config_change_log"
+            " WHERE key LIKE 'agent_effort:%' AND created_at BETWEEN ? AND ?"
+            " ORDER BY created_at", (ep0, ep1))
+    ]
     conn.close()
 
     # M2: weekly reports of the month (already root-caused incident cards)
@@ -310,8 +345,10 @@ def main() -> int:
         "month": month_id, "from": first.isoformat(), "to": last.isoformat(),
         "extracted_at": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M %Z"),
         "assignment_now": read_assignment(),
+        "effort": {"now": read_effort(), "changes": effort_changes},
         "caveats": [
             "assignment_now = extraction-time state, NOT month-start snapshot (#A39B0BA8)",
+            "effort.now = extraction-time state; effort.changes gives the in-month history (M9, #2e46fb86)",
             "mr-wolfe model read from repo .claude/settings.json 'model' key",
             "m1_done_cards timing uses updated_at (no status-history table)",
             "m2 memory agent_id marks the documenter, not the culprit",

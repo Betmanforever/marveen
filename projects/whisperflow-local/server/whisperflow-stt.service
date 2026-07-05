@@ -1,0 +1,28 @@
+# systemd user unit for the whisperflow STT server (WSL side).
+#
+# NOT installed automatically -- installing/enabling is Gabor's decision:
+#   mkdir -p ~/.config/systemd/user
+#   cp server/whisperflow-stt.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now whisperflow-stt
+# Status / logs:
+#   systemctl --user status whisperflow-stt
+#   journalctl --user -u whisperflow-stt -f
+
+[Unit]
+Description=whisperflow local STT server (faster-whisper, 127.0.0.1 only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/szabgabor/marveen/projects/whisperflow-local
+ExecStart=/home/szabgabor/marveen/projects/whisperflow-local/.venv/bin/python server/stt_server.py
+Environment=WHISPERFLOW_MODEL=small
+Environment=WHISPERFLOW_PORT=8765
+Restart=on-failure
+RestartSec=3
+# Transcription bursts all 8 threads; keep the box responsive meanwhile.
+Nice=5
+
+[Install]
+WantedBy=default.target

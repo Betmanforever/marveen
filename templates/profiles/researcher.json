@@ -9,6 +9,7 @@
       "Write(${AGENT_DIR}/**)",
       "Edit(${AGENT_DIR}/**)",
       "Read(${HOME}/Downloads/**)",
+      "Read(${HOME}/.claude/plugins/cache/claude-watch/**)",
       "Bash(ls:*)",
       "Bash(date:*)",
       "Bash(mkdir:*)",
@@ -17,6 +18,9 @@
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/msg-wolfe.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/daily-log.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/memo-search.sh:*)",
+      "Bash(${INSTALL_DIR}/scripts/agent-wrappers/watch.sh:*)",
+      "Bash(python3 ${HOME}/.claude/plugins/cache/claude-watch/watch/0.2.0/scripts/watch.py:*)",
+      "Bash(python3 ${HOME}/.claude/plugins/cache/claude-watch/watch/0.2.0/scripts/setup.py:*)",
       "WebFetch(*)",
       "WebSearch(*)",
       "mcp__plugin_telegram_telegram__reply",
@@ -60,6 +64,8 @@
     "KRITIKUS: EGY Bash-hivasban CSAK EGY egyszeru parancsot adj ki, SOHA ne fuzz ossze tobbet `;`, `&&` vagy `$(...)` paranccsal -- meg akkor sem, ha minden egyes resz kulon-kulon engedelyezett lenne (pl. `ls` engedelyezett, de `ls ...; echo ---; ls ...` mar nem, mert a rendszer az osszefuzott parancsot statikusan nem tudja ellenorizni, es jovahagyast ker ra, amit senki nem lat meg -- a session orokre lefagy). Ha tobb lepes kell, indits kulon Bash-hivast mindegyikhez.",
     "KRITIKUS (ismetlodo eles eset): Bash `ls`/`Read` egy olyan utvonalra, ami a SAJAT konyvtaradon (`${AGENT_DIR}/`) KIVUL van -- akar egy kozos projekt-mappa, akar a sajat `/tmp` scratchpad-jeid korabbi session-jei -- jovahagyasi promptba fagyaszthat, fuggetlenul attol hogy az adott parancs egyebkent allowlistelt-e. Ez szandekos vedelem, nem hiba -- de senki nem ul ott hogy jovahagyja. Ha barmit a sajat konyvtaradon kivul kellene megnezned, NE probald Bash/Read-del -- kuldj uzenetet mr-wolfe-nak (msg-wolfe.sh), o megnezi es atadja neked.",
     "FONTOS: A Skill tool szabadon hasznalhato -- barmely skillt betolthetsz jovahagyas nelkul (pl. dataviz, artifact-design), KIVEVE az access-, permission- es utemezes-kezelo skilleket (telegram:access, telegram:configure, update-config, fewer-permission-prompts, schedule, loop): ezekre automatikus, prompt nelkuli DENY-t kapsz (nem fagyas, tiszta hibauzenet). Ha ilyen muveletre lenne szukseged, kuldj uzenetet mr-wolfe-nak (msg-wolfe.sh), o intezi.",
+    "FONTOS (video-elemzes, /watch): a claude-watch plugin hasznalatakor a skill python3-parancsai HELYETT MINDIG a fix wrappert hivd: ${INSTALL_DIR}/scripts/agent-wrappers/watch.sh <video-URL-vagy-utvonal> [opciok], preflight-hoz: watch.sh setup --check. A wrapper utvonalat SOHA ne tedd idezojelbe es ne hasznalj ${VAR}-t a parancsban -- a skill altal eloirt python3 \"${CLAUDE_SKILL_DIR}/...\" forma garantaltan jovahagyasi promptba fagyaszt. A video-URL mehet aposztrofok kozott (a ?/& karakterekkel egyutt is OK). A munkakonyvtarat a wrapper automatikusan a sajat mappad watch-work/ ala teszi, igy a frame-eket gond nelkul tudod Read-elni.",
+    "KRITIKUS (tool-results spill): ha egy Bash-parancs kimenete tul nagy, a rendszer egy `.claude-config/projects/.../tool-results/*.txt` fajlba menti es csak a fajl utvonalat adja vissza. Ezt a fajlt SOHA ne probald Read-elni -- a transcript-terulet hard-vedett, SEMMILYEN allow-szabaly nem fedheti (probe-verifikalt), a Read jovahagyasi promptba fagyaszt amit senki nem hagy jova. Helyette: futtasd ujra a parancsot ugy, hogy a kimenetet a SAJAT mappadba iranyitod fajlba (pl. `> sajat-mappa/out.log`), es AZT olvasd -- vagy ha ez nem megy, kerd mr-wolfe-ot (msg-wolfe.sh). A watch.sh wrapper ezt mar magatol jol csinalja (run.log).",
     "FONTOS: a SAJAT fajl-alapu Claude Code memoriad (a beepitett, session-perzisztens memoria-rendszer) az IZOLALT konfigod alatt van (a rendszer-prompt megadja a pontos utvonalat, `${AGENT_DIR}/.claude-config/...` alatt), a Write-scope-odon BELUL -- ez biztonsagosan hasznalhato. NE probalj a `~/.claude/projects/...` (HOME-alapu) utvonalra irni -- az egy MASIK, megosztott hely, ami minden agent kozott kozos, ezert az AGENT_DIR-eden kivul esik es jovahagyasi promptba fagyaszt."
   ]
 }

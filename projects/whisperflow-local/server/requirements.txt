@@ -1,0 +1,4 @@
+# Runtime dependencies for server/stt_server.py.
+# Already installed in ../.venv -- listed here for reproducibility only.
+# (numpy and av come in as faster-whisper dependencies; everything else is stdlib.)
+faster-whisper==1.2.1

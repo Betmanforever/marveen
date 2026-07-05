@@ -65,6 +65,15 @@ DREAM.md
 .external-ops-last-run
 REBUILD_PROMPT_V3.1.md
 
+# Weekly report pipeline output (regenerated weekly, not source -- the
+# dated archive under reports/ is already ignored above, this is its
+# always-latest sibling at the repo root).
+/WEEKLY-REPORT.md
+
+# Per-install language preference (defaults to "hu" if absent; every
+# operator may choose their own, never force one into shared history).
+/.lang
+
 # Main agent's runtime voice config (responseMode/voiceModel). Sub-agents store
 # theirs under agents/ (already ignored); the main agent's lives at the repo root
 # and is per-install runtime state, never source.
