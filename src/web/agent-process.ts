@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
 import { OLLAMA_URL } from '../config.js'
+import { channelsSessionName } from './main-agent.js'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
 import {
@@ -321,6 +322,16 @@ function resolveAgentProvider(name: string): ChannelProviderType {
 }
 
 export function agentSessionName(name: string): string {
+  // The main agent (mr-wolfe) never runs an `agent-mr-wolfe` sub-agent
+  // session -- it lives in the long-lived `${MAIN_AGENT_ID}-channels`
+  // session started by channels.sh. Without this special case, any process
+  // that resolves run state via agentSessionName() (e.g. the dashboard's
+  // GET /api/agents list) looks for a tmux session that can never exist and
+  // reports the running main agent as permanently "stopped" (audited
+  // 2026-07-05: agents/mr-wolfe/ only needs to exist on disk -- e.g. a
+  // deliverables/ subfolder -- for it to appear in listAgentNames() as a
+  // phantom, always-stopped entry).
+  if (name === MAIN_AGENT_ID) return channelsSessionName(MAIN_AGENT_ID)
   return `agent-${name}`
 }
 
