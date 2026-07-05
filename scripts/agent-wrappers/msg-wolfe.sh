@@ -19,11 +19,39 @@ if [ $# -ne 2 ]; then
   echo "usage: msg-wolfe.sh <agent_id> <content>" >&2
   exit 2
 fi
-agent_id="$1"; content="$2"
+agent_id="$1"; content_arg="$2"
 
 case "$agent_id" in
   *[!a-z0-9-]*|'') echo "msg-wolfe.sh: invalid agent_id" >&2; exit 2 ;;
 esac
+
+# Content may be given inline, or as `@<path>` to read from a file. The @file
+# form exists because a multi-line inline argument that contains a newline
+# immediately followed by `#` (common in these summaries: `\n#60 ...`, and in
+# daily-log `\n## HH:MM`) trips Claude Code's argument-safety guard and freezes
+# the strict agent on an unattended permission prompt (root-caused 2026-07-05).
+# SECURITY: the @file is restricted to the calling agent's OWN directory
+# (agents/<agent_id>/). Without that fence, `cat`-ing an arbitrary path here
+# would hand a strict agent a read-anything primitive (the wrapper runs as the
+# OS user and bypasses the agent's tool-layer Read denies) -- e.g. it could
+# exfiltrate store/.dashboard-token into a message. The realpath prefix check
+# below is the security boundary; do not relax it.
+if [ "${content_arg#@}" != "$content_arg" ]; then
+  content="$(python3 - "$ROOT/agents/$agent_id" "${content_arg#@}" <<'PYEOF'
+import os, sys
+agent_root = os.path.realpath(sys.argv[1])
+p = os.path.realpath(sys.argv[2])
+if p != agent_root and not p.startswith(agent_root + os.sep):
+    sys.stderr.write("content @file must be under the agent's own dir\n")
+    sys.exit(9)
+with open(p, encoding="utf-8") as f:
+    sys.stdout.write(f.read())
+PYEOF
+)" || { echo "msg-wolfe.sh: content @file rejected or unreadable" >&2; exit 2; }
+else
+  content="$content_arg"
+fi
+
 [ -n "$content" ] || { echo "msg-wolfe.sh: empty content" >&2; exit 2; }
 [ -r "$TOKEN_FILE" ] || { echo "msg-wolfe.sh: token file not readable" >&2; exit 3; }
 

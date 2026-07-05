@@ -16,7 +16,29 @@ if [ $# -lt 3 ] || [ $# -gt 4 ]; then
   echo "usage: memo.sh <agent_id> <category> <content> [keywords]" >&2
   exit 2
 fi
-agent_id="$1"; category="$2"; content="$3"; keywords="${4:-}"
+agent_id="$1"; category="$2"; content_arg="$3"; keywords="${4:-}"
+
+# Content may be given inline or as `@<path>` to read from a file, so multi-line
+# memories whose text contains a newline-then-`#` don't trip Claude Code's
+# argument-safety guard and freeze a strict agent (root-caused 2026-07-05).
+# SECURITY: @file is restricted to the calling agent's OWN dir
+# (agents/<agent_id>/) -- an unfenced cat would be a read-anything primitive
+# bypassing the agent's tool-layer Read denies. Do not relax the check.
+if [ "${content_arg#@}" != "$content_arg" ]; then
+  content="$(python3 - "$ROOT/agents/$agent_id" "${content_arg#@}" <<'PYEOF'
+import os, sys
+agent_root = os.path.realpath(sys.argv[1])
+p = os.path.realpath(sys.argv[2])
+if p != agent_root and not p.startswith(agent_root + os.sep):
+    sys.stderr.write("content @file must be under the agent's own dir\n")
+    sys.exit(9)
+with open(p, encoding="utf-8") as f:
+    sys.stdout.write(f.read())
+PYEOF
+)" || { echo "memo.sh: content @file rejected or unreadable" >&2; exit 2; }
+else
+  content="$content_arg"
+fi
 
 case "$agent_id" in
   *[!a-z0-9-]*|'') echo "memo.sh: invalid agent_id" >&2; exit 2 ;;
