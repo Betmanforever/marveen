@@ -54,3 +54,42 @@ describe('Skill rules survive the settings.json render pipeline', () => {
     expect(absolutizeFsPermissionRule('Skill(telegram:access *)')).toBe('Skill(telegram:access *)')
   })
 })
+
+// A strict profile that can reply on Telegram must allowlist the WHOLE
+// telegram-plugin MCP toolset it is instructed to use, or the first react /
+// edit_message / download_attachment call freezes the session on a permission
+// prompt nobody sees (observed 2026-07-06: ive froze on `react` -- reply was
+// allowed, react was not). The plugin's own MCP instructions tell the model to
+// use react for acknowledgements, edit_message for progress updates and
+// download_attachment for inbound attachments, so a partial allowlist is a
+// standing freeze hazard, not a hardening win: react/edit_message are guarded
+// by assertAllowedChat in the plugin (same outward surface class as reply) and
+// download_attachment only writes sanitized filenames into the agent's own
+// channel inbox under AGENT_DIR.
+const TELEGRAM_MCP_TOOLSET = [
+  'mcp__plugin_telegram_telegram__reply',
+  'mcp__plugin_telegram_telegram__react',
+  'mcp__plugin_telegram_telegram__edit_message',
+  'mcp__plugin_telegram_telegram__download_attachment',
+]
+
+describe('strict profiles with telegram reply allow the full plugin toolset', () => {
+  const telegramProfiles = listProfileTemplates().filter(
+    p => p.permissionMode === 'strict' &&
+      p.filesystem.allow.includes('mcp__plugin_telegram_telegram__reply'),
+  )
+
+  it('there are telegram-enabled strict profiles to check (guards the test itself)', () => {
+    expect(telegramProfiles.map(p => p.id)).toEqual(
+      expect.arrayContaining(['marketer', 'researcher']),
+    )
+  })
+
+  for (const p of telegramProfiles) {
+    it(`${p.id}: no telegram MCP tool is missing from the allowlist`, () => {
+      for (const tool of TELEGRAM_MCP_TOOLSET) {
+        expect(p.filesystem.allow).toContain(tool)
+      }
+    })
+  }
+})
