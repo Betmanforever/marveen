@@ -1308,7 +1308,15 @@ export function sendPromptToSession(
       if (chunk.startsWith('-')) chunk = ' ' + chunk
       runTmux(host, ['send-keys', '-t', session, '-l', chunk], { timeout: 5000 })
       i = end
-      if (i < oneLine.length) execFileSync('/bin/sleep', ['0.03'], { timeout: 1000 })
+      // Best-effort pacing gap: under fork-storm load the /bin/sleep spawn
+      // itself can hit ETIMEDOUT, and an uncaught throw here aborts the chunk
+      // stream mid-message, leaving half-typed text parked in the target pane
+      // (2026-07-06 incident). Losing one 30ms gap at worst risks the paste-
+      // detector placeholder, which the post-send retry loop below already
+      // recovers via 'clear-and-resend'.
+      if (i < oneLine.length) {
+        try { execFileSync('/bin/sleep', ['0.03'], { timeout: 1000 }) } catch { /* best effort */ }
+      }
     }
     runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
   }

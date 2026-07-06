@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   detectsUsageLimit,
+  extractLimitReset,
   detectsModelAccessFailure,
   detectsUnrecognizedApiError,
   sanitizeFailureSnippet,
@@ -28,9 +29,34 @@ describe('detectsUsageLimit', () => {
     expect(detectsUsageLimit('/upgrade to increase your usage limit')).toBe(true)
   })
 
+  it('matches the plan session-limit wordings (2026-07-05 incident)', () => {
+    // Observed live pane line. The API-error anchor is concatenated so this
+    // file rendered in an agent's pane cannot echo-trigger the access-failure
+    // detectors (same self-trigger guard as the anchored fixtures below).
+    const observed = 'ended early due to an API ' + "error: You've hit your session limit · resets 3:10am"
+    expect(detectsUsageLimit(observed)).toBe(true)
+    expect(detectsUsageLimit('You have hit the session limit.')).toBe(true)
+    expect(detectsUsageLimit('Session limit reached · resets 3:10am')).toBe(true)
+    expect(detectsUsageLimit('session limit ∙ resets 5pm')).toBe(true)
+  })
+
+  it('matches the observed session-limit line only inside the bottom banner region', () => {
+    const observed = "You've hit your session limit · resets 3:10am"
+    const atBottom = [...Array(40).fill('normal output line'), observed].join('\n')
+    expect(detectsUsageLimit(atBottom)).toBe(true)
+    // A quoted occurrence up in scrollback (outside the bottom region) must
+    // NOT trip a downgrade.
+    const inScrollback = [observed, ...Array(40).fill('normal output line')].join('\n')
+    expect(detectsUsageLimit(inScrollback)).toBe(false)
+  })
+
   it('does NOT match a transient API 429 / generic rate limit', () => {
     expect(detectsUsageLimit('  ⎿  API Error: 429 rate_limit_error: too many requests')).toBe(false)
     expect(detectsUsageLimit('  ⎿  API Error: 429 overloaded_error: server busy, retrying')).toBe(false)
+    // "session" near a rate limit is still transient territory, not plan budget.
+    expect(detectsUsageLimit('  ⎿  API Error: 429 rate_limit_error: this session sent too many requests')).toBe(false)
+    // Bare "session limit" prose without the hit/reached/resets framing stays quiet.
+    expect(detectsUsageLimit('we should document the session limit behaviour')).toBe(false)
   })
 
   it('ignores the phrase when it is only up in scrollback, not the live region', () => {
@@ -41,6 +67,24 @@ describe('detectsUsageLimit', () => {
   it('returns false for empty / whitespace panes', () => {
     expect(detectsUsageLimit('')).toBe(false)
     expect(detectsUsageLimit('   \n  ')).toBe(false)
+  })
+})
+
+describe('extractLimitReset', () => {
+  it('extracts the reset time from the live banner', () => {
+    expect(extractLimitReset("You've hit your session limit · resets 3:10am")).toBe('3:10am')
+    expect(extractLimitReset('5-hour limit reached ∙ resets 3pm')).toBe('3pm')
+    expect(extractLimitReset('Your limit will reset at 18:00')).toBe('18:00')
+  })
+  it('returns null when no reset time is present or it sits up in scrollback', () => {
+    expect(extractLimitReset('usage limit reached')).toBeNull()
+    expect(extractLimitReset('')).toBeNull()
+    const scrollback = ['resets 3:10am', ...Array(40).fill('normal output line')].join('\n')
+    expect(extractLimitReset(scrollback)).toBeNull()
+  })
+  it('never captures free text (the value lands in an operator alert)', () => {
+    expect(extractLimitReset('resets when the ops team says so')).toBeNull()
+    expect(extractLimitReset('resets 3')).toBeNull()
   })
 })
 
@@ -121,6 +165,10 @@ describe('detectsUnrecognizedApiError', () => {
     expect(detectsUnrecognizedApiError(`  ⎿  ${ERR}: 429 rate_limit_error: slow down`)).toBeNull()
     expect(detectsUnrecognizedApiError(`  ⎿  ${ERR}: 500 request timed out, retrying`)).toBeNull()
     expect(detectsUnrecognizedApiError('plain conversation line')).toBeNull()
+    // 2026-07-05 incident line: pre-fix this surfaced as "unrecognized API
+    // error wording"; the session-limit wording now belongs to USAGE_LIMIT_RX,
+    // so the telemetry must stay quiet on it.
+    expect(detectsUnrecognizedApiError(`ended early due to an ${ERR}: You've hit your session limit · resets 3:10am`)).toBeNull()
   })
 })
 
@@ -133,6 +181,12 @@ describe('sanitizeFailureSnippet', () => {
   })
   it('keeps ordinary error text readable', () => {
     expect(sanitizeFailureSnippet(`${ERR}: 403 model access denied`)).toContain('403 model access denied')
+  })
+  it('defuses the usage/session-limit anchors so a quoted snippet cannot echo-trigger', () => {
+    expect(sanitizeFailureSnippet('you hit your usage limit today')).toContain('usage-lim')
+    const out = sanitizeFailureSnippet('hit your session limit · resets 3:10am')
+    expect(out).toContain('session-lim')
+    expect(out).not.toMatch(/session limit/i)
   })
 })
 

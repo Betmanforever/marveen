@@ -11,6 +11,7 @@ import {
   agentSessionName,
   channelColdStartHoldActive,
   isSessionReadyForPrompt,
+  clearInputBuffer,
   clearStaleParkedInput,
   sendPromptToSession,
   sessionExistsOnHost,
@@ -206,6 +207,18 @@ export function startMessageRouter(): NodeJS.Timeout {
         logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, category: isChannelInbound ? 'channel-inbound' : trusted ? 'trusted-peer' : 'untrusted' }, 'Agent message delivered')
       } catch (err) {
         logger.warn({ err, id: msg.id }, 'Failed to deliver agent message')
+        // A failed delivery can abort sendPromptToSession mid-chunk-stream,
+        // leaving half-typed text parked in the target input box -- which the
+        // stuck-input watcher later SUBMITS as a phantom turn (observed
+        // 2026-07-06: fork-storm ETIMEDOUT mid-typing). Best-effort clear so
+        // marking the message failed never leaves the pane dirty; wrapped
+        // because the pane itself may be gone by now (clearInputBuffer also
+        // logs its own warn when the tmux call fails).
+        try {
+          clearInputBuffer(session, host)
+        } catch (clearErr) {
+          logger.warn({ err: clearErr, id: msg.id, session }, 'Post-failure input-buffer clear failed')
+        }
         if (!markMessageFailed(msg.id, 'Failed to inject into tmux session')) {
           logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
         }

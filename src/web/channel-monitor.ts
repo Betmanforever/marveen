@@ -31,6 +31,10 @@ import {
   type StuckInputState, type StuckInputThresholds, type StuckInputAction,
   type StuckInputActionFacts,
 } from '../pane-state.js'
+// The plan limit modal wears the same navigable-modal footer as a genuine
+// menu; the limit-banner detector tells the two apart so the menu-recovery
+// alert can name the real cause (see the blocking-menu pass below).
+import { detectsUsageLimit, extractLimitReset } from '../model-fallback.js'
 import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { notifyChannel } from '../notify.js'
 import { getProvider, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
@@ -403,6 +407,19 @@ const MENU_RECOVER_CLEAR_MS = 2 * 60 * 1000
 // on its own longer timer (the Escape-suppression itself is unconditional).
 const paneDialogAlertAt: Map<string, number> = new Map()
 const DIALOG_ESCALATE_DEDUP_MS = 30 * 60 * 1000
+
+// The plan usage-limit dialog is a recurring special case: model-fallback
+// respawns the limited session, the respawn re-hits the same plan-wide limit
+// and re-parks the pane, so the 5-min menu dedup re-alerted on every cycle
+// (observed 2026-07-05: 5 alerts in one 35-min limit window). One alert per
+// limit window is enough -- the alert itself says model-fallback handles it.
+// The per-cycle recovery Escape is NOT throttled by this, only the operator
+// alert + the resume nudge. Unlike paneDialogAlertAt this timestamp must
+// SURVIVE the paneMenuState clear (every respawn cycle fully clears the menu
+// spell); it resets only once the menu is gone AND the pane no longer shows
+// the limit banner, i.e. the window is actually over.
+const paneLimitDialogAlertAt: Map<string, number> = new Map()
+const LIMIT_DIALOG_ALERT_DEDUP_MS = 60 * 60 * 1000
 
 // Nudge injected (via the tested inter-agent message router, NOT a raw
 // send-keys) after a recovery Escape pops a real menu on a sub-agent. The
@@ -1258,6 +1275,17 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
         // dialog on this session alerts promptly rather than inheriting a stale
         // timestamp.
         paneDialogAlertAt.delete(t.session)
+        // The limit-dialog throttle is stickier: a model-fallback respawn
+        // clears the menu spell mid-window (fresh pane, no modal yet) while
+        // the limit itself still holds, so clearing here unconditionally would
+        // re-arm the alert on every respawn cycle -- the very noise the
+        // throttle exists to stop. Reset only once the pane also stopped
+        // showing the limit banner (the window is genuinely over). A failed
+        // capture cannot prove that, so it keeps the throttle; a stale entry
+        // ages out via LIMIT_DIALOG_ALERT_DEDUP_MS anyway.
+        if (pane != null && !detectsUsageLimit(pane)) {
+          paneLimitDialogAlertAt.delete(t.session)
+        }
       } else {
         paneMenuState.set(t.session, decision.next)
       }
@@ -1280,22 +1308,55 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           }
         } else {
           paneDialogAlertAt.delete(t.session)
-          logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
+          // The Claude plan limit modal ("You've hit your session limit ·
+          // resets 3:10am") wears the same navigable-modal footer as a genuine
+          // menu, so the canned "(pl. /mcp)" alert misdiagnosed it (observed
+          // 2026-07-05 23:00). When the pane also shows the limit banner, name
+          // the real cause + the reset time; the Escape recovery itself is
+          // identical in both cases and stays unconditional.
+          const limitDialog = pane != null && detectsUsageLimit(pane)
+          logger.warn({ session: t.session, agent: label }, limitDialog
+            ? 'Session parked in the plan usage-limit dialog -- sending Escape to recover'
+            : 'Session parked in a blocking interactive menu -- sending Escape to recover')
           try {
             execFileSync(TMUX, ['send-keys', '-t', t.session, 'Escape'], { timeout: 5000 })
           } catch (err) {
             logger.warn({ err, session: t.session }, 'Menu-recovery Escape failed')
           }
-          sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
-          // D2: for a sub-agent, nudge the session so a turn the Escape may have
-          // interrupted actually resumes -- otherwise it can sit idle silently.
-          // Routed as a main-agent inter-agent message (trusted-peer), so it
-          // reuses the session-ready / cold-start-hold delivery guards.
-          if (!t.isMarveen && t.agentName) {
-            try {
-              createAgentMessage(MAIN_AGENT_ID, t.agentName, MENU_RECOVER_NUDGE)
-            } catch (err) {
-              logger.warn({ err, session: t.session }, 'Menu-recovery nudge enqueue failed')
+          // At most ONE operator alert + resume nudge per session per limit
+          // window: each model-fallback respawn re-hits the plan-wide limit
+          // and re-parks the pane, and the 5-min menu dedup restarts with the
+          // spell, so it re-alerted every cycle (5 alerts in the 35-min window
+          // on 2026-07-05). The Escape above is the recovery and stays
+          // per-cycle; only the messaging is throttled. Genuine menus keep
+          // today's cadence (notify stays true).
+          let notify = true
+          if (limitDialog) {
+            const lastLimitAlert = paneLimitDialogAlertAt.get(t.session) ?? 0
+            notify = Date.now() - lastLimitAlert >= LIMIT_DIALOG_ALERT_DEDUP_MS
+            if (notify) paneLimitDialogAlertAt.set(t.session, Date.now())
+          }
+          if (notify) {
+            if (limitDialog) {
+              // extractLimitReset only ever yields a tight clock-time shape, so
+              // interpolating this pane-derived value into the alert is safe.
+              const reset = pane == null ? null : extractLimitReset(pane)
+              sendAlert(`⏳ A(z) ${label} session a plan usage-limit dialogusaban all (nem menu-beragadas). Escape kikuldve. A limit varhato visszaallasa: ${reset ?? 'ismeretlen'}. A model-fallback kezeli, kulon teendo nincs.`)
+            } else {
+              sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
+            }
+            // D2: for a sub-agent, nudge the session so a turn the Escape may have
+            // interrupted actually resumes -- otherwise it can sit idle silently.
+            // Routed as a main-agent inter-agent message (trusted-peer), so it
+            // reuses the session-ready / cold-start-hold delivery guards. Within
+            // a limit window the nudge shares the alert throttle: a limited agent
+            // cannot act on it, so five per window were pure queue noise.
+            if (!t.isMarveen && t.agentName) {
+              try {
+                createAgentMessage(MAIN_AGENT_ID, t.agentName, MENU_RECOVER_NUDGE)
+              } catch (err) {
+                logger.warn({ err, session: t.session }, 'Menu-recovery nudge enqueue failed')
+              }
             }
           }
         }

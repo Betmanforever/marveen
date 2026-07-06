@@ -74,9 +74,14 @@ const USAGE_LIMIT_BANNER_REGION_LINES = 15
 // Distinctive plan-limit phrasings. Deliberately NARROW: a generic "rate limit"
 // / "API Error: 429" (transient overload, handled elsewhere) must NOT match --
 // that is a momentary blip, not a plan-budget exhaustion that warrants a model
-// switch.
+// switch. The "session limit" wordings are the same plan-budget class under
+// another name (observed live 2026-07-05: "You've hit your session limit ·
+// resets 3:10am" -- pre-fix it fell through to the unrecognized-error
+// telemetry and no downgrade happened). Bare "session limit" prose stays a
+// non-match; each session alternative needs the hit/reached/resets framing,
+// and both the · and ∙ separator glyphs are accepted before "resets".
 const USAGE_LIMIT_RX =
-  /(usage limit reached|reached your usage limit|hit (?:your|the) usage limit|approaching (?:your )?usage limit|usage limit (?:will )?reset|limit will reset at|\d+-hour limit reached|upgrade to increase your usage limit)/i
+  /(usage limit reached|reached your usage limit|hit (?:your|the) (?:usage|session) limit|approaching (?:your )?usage limit|usage limit (?:will )?reset|limit will reset at|\d+-hour limit reached|upgrade to increase your usage limit|session limit reached|session limit\s*[·∙]\s*resets)/i
 
 /**
  * True when the live pane shows a Claude *plan usage-limit* banner (not a
@@ -88,6 +93,27 @@ export function detectsUsageLimit(pane: string): boolean {
   const lines = pane.split('\n')
   const region = lines.slice(-USAGE_LIMIT_BANNER_REGION_LINES).join('\n')
   return USAGE_LIMIT_RX.test(region)
+}
+
+// Reset-time capture next to the limit banner: "resets 3:10am",
+// "resets 5pm", "limit will reset at 18:00". Deliberately a TIGHT time shape
+// (clock time with optional am/pm, or hour+am/pm) rather than free text: the
+// pane is untrusted terminal content and callers interpolate the captured
+// value into operator alerts, so anything that does not look like a clock
+// time simply reports as unknown.
+const LIMIT_RESET_RX = /reset(?:s)?(?:\s+at)?\s+(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))/i
+
+/**
+ * The reset time shown next to the live usage/session-limit banner (e.g.
+ * "3:10am" from "resets 3:10am"), or null when absent. Same live-region
+ * scoping as detectsUsageLimit so a quoted line in scrollback cannot feed it.
+ */
+export function extractLimitReset(pane: string): string | null {
+  if (!pane || !pane.trim()) return null
+  const lines = pane.split('\n')
+  const region = lines.slice(-USAGE_LIMIT_BANNER_REGION_LINES).join('\n')
+  const m = region.match(LIMIT_RESET_RX)
+  return m ? m[1].trim() : null
 }
 
 // --- Permanent model-access failures ("auto model drop", 2026-07-04) ---
@@ -186,6 +212,7 @@ export function sanitizeFailureSnippet(line: string): string {
     .replace(/_error/gi, '-err')
     .replace(/credit balance/gi, 'credit-bal')
     .replace(/usage limit/gi, 'usage-lim')
+    .replace(/session limit/gi, 'session-lim')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120)
