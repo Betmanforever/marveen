@@ -11,6 +11,7 @@
       "Write(${AGENT_DIR}/.claude/skills/**)",
       "Edit(${AGENT_DIR}/.claude/skills/**)",
       "Read(${HOME}/Downloads/**)",
+      "Read(${HOME}/.claude/skills/**)",
       "Bash(ls:*)",
       "Bash(date:*)",
       "Bash(mkdir:*)",

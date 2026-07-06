@@ -10,6 +10,7 @@
       "Edit(${AGENT_DIR}/**)",
       "Read(/tmp/**)",
       "Write(/tmp/**)",
+      "Read(${HOME}/.claude/skills/**)",
       "Bash(git:*)",
       "Bash(npm:*)",
       "Bash(node:*)",
