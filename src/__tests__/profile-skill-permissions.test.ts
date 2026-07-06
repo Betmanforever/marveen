@@ -55,6 +55,30 @@ describe('Skill rules survive the settings.json render pipeline', () => {
   })
 })
 
+// A strict profile that allowlists the Skill tool must also be able to READ
+// the global skills directory: the skill system routinely reads it (index
+// check, level-1 SKILL.md loads by path, skill-writer overlap check), and a
+// missing rule froze ive's skill-writer for 35 minutes on the dot-named
+// ~/.claude/skills/.skill-index.md (2026-07-06). Probe-verified in ive's real
+// environment: the ** glob DOES cover the dot-named index file once the
+// render pipeline anchors the rule to // (absolutizeFsPermissionRule), so a
+// single rule suffices. Write stays scoped to the agent's OWN .claude/skills.
+describe('strict profiles with the Skill tool can read the global skills dir', () => {
+  for (const p of listProfileTemplates().filter(
+    t => t.permissionMode === 'strict' && t.filesystem.allow.includes('Skill'),
+  )) {
+    it(`${p.id}: allows reading \${HOME}/.claude/skills/**`, () => {
+      expect(p.filesystem.allow).toContain('Read(${HOME}/.claude/skills/**)')
+    })
+
+    it(`${p.id}: does NOT allow writing the global skills dir`, () => {
+      for (const rule of p.filesystem.allow) {
+        expect(rule).not.toMatch(/^(Write|Edit)\(\$\{HOME\}\/\.claude\/skills/)
+      }
+    })
+  }
+})
+
 // A strict profile that can reply on Telegram must allowlist the WHOLE
 // telegram-plugin MCP toolset it is instructed to use, or the first react /
 // edit_message / download_attachment call freezes the session on a permission
