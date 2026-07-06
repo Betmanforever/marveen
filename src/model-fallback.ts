@@ -95,6 +95,27 @@ export function detectsUsageLimit(pane: string): boolean {
   return USAGE_LIMIT_RX.test(region)
 }
 
+// Reset-time capture next to the limit banner: "resets 3:10am",
+// "resets 5pm", "limit will reset at 18:00". Deliberately a TIGHT time shape
+// (clock time with optional am/pm, or hour+am/pm) rather than free text: the
+// pane is untrusted terminal content and callers interpolate the captured
+// value into operator alerts, so anything that does not look like a clock
+// time simply reports as unknown.
+const LIMIT_RESET_RX = /reset(?:s)?(?:\s+at)?\s+(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))/i
+
+/**
+ * The reset time shown next to the live usage/session-limit banner (e.g.
+ * "3:10am" from "resets 3:10am"), or null when absent. Same live-region
+ * scoping as detectsUsageLimit so a quoted line in scrollback cannot feed it.
+ */
+export function extractLimitReset(pane: string): string | null {
+  if (!pane || !pane.trim()) return null
+  const lines = pane.split('\n')
+  const region = lines.slice(-USAGE_LIMIT_BANNER_REGION_LINES).join('\n')
+  const m = region.match(LIMIT_RESET_RX)
+  return m ? m[1].trim() : null
+}
+
 // --- Permanent model-access failures ("auto model drop", 2026-07-04) ---
 //
 // A separate failure class from the usage-limit banner: the configured model is

@@ -31,6 +31,10 @@ import {
   type StuckInputState, type StuckInputThresholds, type StuckInputAction,
   type StuckInputActionFacts,
 } from '../pane-state.js'
+// The plan limit modal wears the same navigable-modal footer as a genuine
+// menu; the limit-banner detector tells the two apart so the menu-recovery
+// alert can name the real cause (see the blocking-menu pass below).
+import { detectsUsageLimit, extractLimitReset } from '../model-fallback.js'
 import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { notifyChannel } from '../notify.js'
 import { getProvider, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
@@ -1280,13 +1284,29 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           }
         } else {
           paneDialogAlertAt.delete(t.session)
-          logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
+          // The Claude plan limit modal ("You've hit your session limit ·
+          // resets 3:10am") wears the same navigable-modal footer as a genuine
+          // menu, so the canned "(pl. /mcp)" alert misdiagnosed it (observed
+          // 2026-07-05 23:00). When the pane also shows the limit banner, name
+          // the real cause + the reset time; the Escape recovery itself is
+          // identical in both cases and stays unconditional.
+          const limitDialog = pane != null && detectsUsageLimit(pane)
+          logger.warn({ session: t.session, agent: label }, limitDialog
+            ? 'Session parked in the plan usage-limit dialog -- sending Escape to recover'
+            : 'Session parked in a blocking interactive menu -- sending Escape to recover')
           try {
             execFileSync(TMUX, ['send-keys', '-t', t.session, 'Escape'], { timeout: 5000 })
           } catch (err) {
             logger.warn({ err, session: t.session }, 'Menu-recovery Escape failed')
           }
-          sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
+          if (limitDialog) {
+            // extractLimitReset only ever yields a tight clock-time shape, so
+            // interpolating this pane-derived value into the alert is safe.
+            const reset = pane == null ? null : extractLimitReset(pane)
+            sendAlert(`⏳ A(z) ${label} session a plan usage-limit dialogusaban all (nem menu-beragadas). Escape kikuldve. A limit varhato visszaallasa: ${reset ?? 'ismeretlen'}. A model-fallback kezeli, kulon teendo nincs.`)
+          } else {
+            sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
+          }
           // D2: for a sub-agent, nudge the session so a turn the Escape may have
           // interrupted actually resumes -- otherwise it can sit idle silently.
           // Routed as a main-agent inter-agent message (trusted-peer), so it

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   detectsUsageLimit,
+  extractLimitReset,
   detectsModelAccessFailure,
   detectsUnrecognizedApiError,
   sanitizeFailureSnippet,
@@ -66,6 +67,24 @@ describe('detectsUsageLimit', () => {
   it('returns false for empty / whitespace panes', () => {
     expect(detectsUsageLimit('')).toBe(false)
     expect(detectsUsageLimit('   \n  ')).toBe(false)
+  })
+})
+
+describe('extractLimitReset', () => {
+  it('extracts the reset time from the live banner', () => {
+    expect(extractLimitReset("You've hit your session limit · resets 3:10am")).toBe('3:10am')
+    expect(extractLimitReset('5-hour limit reached ∙ resets 3pm')).toBe('3pm')
+    expect(extractLimitReset('Your limit will reset at 18:00')).toBe('18:00')
+  })
+  it('returns null when no reset time is present or it sits up in scrollback', () => {
+    expect(extractLimitReset('usage limit reached')).toBeNull()
+    expect(extractLimitReset('')).toBeNull()
+    const scrollback = ['resets 3:10am', ...Array(40).fill('normal output line')].join('\n')
+    expect(extractLimitReset(scrollback)).toBeNull()
+  })
+  it('never captures free text (the value lands in an operator alert)', () => {
+    expect(extractLimitReset('resets when the ops team says so')).toBeNull()
+    expect(extractLimitReset('resets 3')).toBeNull()
   })
 })
 
