@@ -73,3 +73,42 @@ describe('channel-monitor: limit-aware menu-recovery alert', () => {
     expect(region).toContain('engedely-dialogusban all es dontesre var')
   })
 })
+
+// The limit-dialog alert dedup: the 5-min menu dedup restarts with every menu
+// spell, and each model-fallback respawn re-hit the plan-wide limit and
+// started a fresh spell, so one 35-min limit window produced 5 identical
+// alerts + 5 resume nudges. The fix throttles the messaging (NOT the Escape
+// recovery) to one per session per limit window on a dedicated timestamp map
+// that survives the menu-state clear until the limit banner is gone too.
+describe('channel-monitor: one limit-dialog alert per limit window', () => {
+  it('declares a dedicated 60-min throttle for the limit-dialog alert', () => {
+    expect(src).toMatch(/const LIMIT_DIALOG_ALERT_DEDUP_MS = 60 \* 60 \* 1000/)
+    expect(src).toMatch(/const paneLimitDialogAlertAt: Map<string, number> = new Map\(\)/)
+  })
+
+  it('gates BOTH the alert and the resume nudge on the throttle in the limit case', () => {
+    const region = menuRecoveryRegion()
+    // notify defaults true (genuine menus keep today's cadence) and is only
+    // narrowed for the limit dialog.
+    expect(region).toContain('let notify = true')
+    expect(region).toMatch(/notify = Date\.now\(\) - lastLimitAlert >= LIMIT_DIALOG_ALERT_DEDUP_MS/)
+    // The nudge enqueue sits INSIDE the notify gate...
+    const notifyIdx = region.indexOf('if (notify) {')
+    const nudgeIdx = region.indexOf('MENU_RECOVER_NUDGE)')
+    expect(notifyIdx).toBeGreaterThan(0)
+    expect(nudgeIdx).toBeGreaterThan(notifyIdx)
+    // ...while the recovery Escape stays before (outside) it, per-cycle.
+    expect(region.indexOf("'Escape'")).toBeLessThan(notifyIdx)
+  })
+
+  it('the throttle survives the menu-state clear while the limit banner persists', () => {
+    const region = menuRecoveryRegion()
+    // The state-clear branch may only reset the limit throttle when the pane
+    // ALSO shows no limit banner (a respawn clears the menu spell mid-window
+    // while the plan window still holds).
+    expect(region).toMatch(/if \(pane != null && !detectsUsageLimit\(pane\)\) \{\s*\n\s*paneLimitDialogAlertAt\.delete\(t\.session\)/)
+    // No unconditional delete of the limit throttle anywhere in the pass.
+    const deletes = region.match(/paneLimitDialogAlertAt\.delete\(/g) ?? []
+    expect(deletes.length).toBe(1)
+  })
+})
