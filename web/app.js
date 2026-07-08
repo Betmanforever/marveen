@@ -80,11 +80,18 @@ function mainAgentId() {
   const TOKEN_KEY = 'marveen-dashboard-token'
   const urlParams = new URLSearchParams(window.location.search)
   const urlToken = urlParams.get('token')
+  // Keep the token in memory for the whole session in addition to localStorage.
+  // Some iOS/Safari privacy modes purge or block localStorage (especially over
+  // plain http / non-primary origins); an in-memory copy keeps the session
+  // authenticated even when the persisted copy is unavailable.
+  let sessionToken = urlToken || ''
   if (urlToken) {
-    localStorage.setItem(TOKEN_KEY, urlToken)
+    try { localStorage.setItem(TOKEN_KEY, urlToken) } catch { /* storage blocked */ }
     urlParams.delete('token')
     const clean = window.location.pathname + (urlParams.toString() ? '?' + urlParams : '') + window.location.hash
     window.history.replaceState({}, '', clean)
+  } else {
+    try { sessionToken = localStorage.getItem(TOKEN_KEY) || '' } catch { /* storage blocked */ }
   }
 
   const originalFetch = window.fetch.bind(window)
@@ -96,7 +103,8 @@ function mainAgentId() {
       url.startsWith('/api/') ||
       (url.startsWith(window.location.origin + '/api/'))
     if (isSameOriginApi) {
-      const token = localStorage.getItem(TOKEN_KEY)
+      let token = sessionToken
+      if (!token) { try { token = localStorage.getItem(TOKEN_KEY) } catch { token = '' } }
       if (token) {
         init = init || {}
         const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined))
@@ -107,7 +115,10 @@ function mainAgentId() {
     const res = await originalFetch(input, init)
     if (res.status === 401 && isSameOriginApi) {
       // Token missing, wrong, or revoked. Wipe and prompt once per page load.
-      localStorage.removeItem(TOKEN_KEY)
+      // Keep a URL-provided session token so a transient 401 does not lock out
+      // a session whose localStorage copy was purged.
+      try { localStorage.removeItem(TOKEN_KEY) } catch { /* storage blocked */ }
+      if (!urlToken) sessionToken = ''
       if (!window.__marveenAuthPrompted) {
         window.__marveenAuthPrompted = true
         // An installed (home-screen) PWA has its own localStorage, separate from
@@ -257,7 +268,7 @@ function switchPage(pageId) {
   // Kanban auto-refresh: start on enter, stop on leave.
   if (pageId !== 'kanban') stopKanbanRefresh()
   if (pageId === 'overview') loadOverview()
-  if (pageId === 'kanban') { loadKanban(); startKanbanRefresh() }
+  if (pageId === 'kanban') { if (typeof _initGanttViewSwitcher === 'function') _initGanttViewSwitcher(); loadKanban(); startKanbanRefresh() }
   if (pageId === 'tasks') loadSchedules()
   if (pageId === 'agents') loadAgents()
   if (pageId === 'memories') { loadMemAgents(); loadMemStats(); loadMemories() }
@@ -2438,6 +2449,8 @@ function applyMarveenReadonlyMode(readOnly) {
   }
   const authModeGroup = document.getElementById('authModeGroup')
   if (authModeGroup) authModeGroup.hidden = readOnly
+  const memoryIsolationGroup = document.getElementById('memoryIsolationGroup')
+  if (memoryIsolationGroup) memoryIsolationGroup.hidden = readOnly
   const note = document.getElementById('marveenReadonlyNote')
   if (note) note.hidden = !readOnly
 }
@@ -2662,6 +2675,8 @@ async function openAgentDetail(agentName) {
   )
   renderTeamEditor(currentAgent, agents)
   updateAuthModeUI(currentAgent.authMode || 'shared', currentAgent.hasApiKey || false)
+  const memIsoToggle = document.getElementById('memoryIsolationToggle')
+  if (memIsoToggle) memIsoToggle.checked = currentAgent.memoryIsolation === true
   loadVoiceConfig(currentAgent.name)
   document.getElementById('editClaudeMd').value = currentAgent.claudeMd || currentAgent.content || ''
   document.getElementById('editSoulMd').value = currentAgent.soulMd || ''
@@ -3558,6 +3573,24 @@ document.getElementById('authFlowInitBtn').addEventListener('click', async () =>
 document.getElementById('authFlowCopyBtn').addEventListener('click', () => {
   const url = document.getElementById('authFlowUrl').textContent
   navigator.clipboard.writeText(url).then(() => showToast('URL masolva'))
+})
+
+document.getElementById('memoryIsolationToggle').addEventListener('change', async (e) => {
+  if (!currentAgent || currentAgent.role === 'main') return
+  const enabled = e.target.checked
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memoryIsolation: enabled }),
+    })
+    if (!res.ok) throw new Error()
+    currentAgent.memoryIsolation = enabled
+    showToast(t(enabled ? 'agents.toast.memory_isolation_on' : 'agents.toast.memory_isolation_off'))
+  } catch {
+    e.target.checked = !enabled
+    showToast(t('common.error_save'))
+  }
 })
 
 document.getElementById('saveAuthModeBtn').addEventListener('click', async () => {
@@ -7227,6 +7260,580 @@ function showEnvVarModal(envVars) {
   })
 })()
 
+// --- SSH Vault ---
+let _sshServers = []
+let _sshKeys = []
+let _sshView = 'table'
+let _sshEditingId = null
+
+async function loadSshServers() {
+  try {
+    const res = await fetch('/api/vault/ssh-servers')
+    const data = await res.json()
+    _sshServers = data.servers || []
+    renderSshServers()
+  } catch { /* ignore */ }
+}
+
+async function loadSshKeys() {
+  try {
+    const res = await fetch('/api/vault/ssh-keys')
+    if (!res.ok) return
+    const data = await res.json()
+    _sshKeys = data.keys || []
+    renderSshKeys()
+    _refreshKeySelects()
+  } catch { /* ignore */ }
+}
+
+function renderSshKeys() {
+  const tbody = document.getElementById('sshKeysTableBody')
+  const keysView = document.getElementById('sshKeysView')
+  const emptyEl = document.getElementById('sshKeysEmpty')
+  if (!tbody) return
+  if (_sshKeys.length === 0) {
+    keysView.hidden = true
+    emptyEl.hidden = false
+    return
+  }
+  keysView.hidden = false
+  emptyEl.hidden = true
+  tbody.innerHTML = _sshKeys.map(k => `
+    <tr>
+      <td class="ssh-table-name">${escapeHtml(k.label || k.id)}</td>
+      <td class="ssh-table-mono">${escapeHtml(k.username || '')}</td>
+      <td class="ssh-table-mono">${escapeHtml(k.keyType || 'ed25519')}</td>
+      <td class="ssh-table-mono" style="font-size:11px">${k.fingerprint ? escapeHtml(k.fingerprint.slice(0,28)) + '…' : ''}</td>
+      <td class="ssh-table-mono">${k.createdAt ? new Date(k.createdAt).toLocaleDateString('hu-HU') : ''}</td>
+      <td><div class="ssh-table-actions">
+        <button class="btn-secondary btn-compact ssh-key-copy-btn" data-id="${escapeHtml(k.id)}" title="Publikus kulcs másolása">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+        <button class="btn-secondary btn-compact ssh-key-delete-btn" data-id="${escapeHtml(k.id)}" title="Törlés">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+        </button>
+      </div></td>
+    </tr>
+  `).join('')
+  tbody.querySelectorAll('.ssh-key-copy-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = _sshKeys.find(k => k.id === btn.dataset.id)
+      if (!key) return
+      try {
+        const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}/public-key`)
+        if (res.ok) {
+          const data = await res.json()
+          await navigator.clipboard.writeText(data.publicKey || '')
+          btn.textContent = '✓'
+          setTimeout(() => { btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' }, 1500)
+        }
+      } catch { /* ignore */ }
+    })
+  })
+  tbody.querySelectorAll('.ssh-key-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('Biztosan törlöd ezt a kulcsot?')) return
+      await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
+      await loadSshKeys()
+    })
+  })
+}
+
+function _refreshKeySelects() {
+  const opts = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+  ].join('')
+  document.querySelectorAll('.ssh-key-select').forEach(sel => {
+    const prev = sel.value
+    sel.innerHTML = opts
+    sel.value = prev
+  })
+}
+
+function _sshKeyBadge(status) {
+  const labels = { ok: 'OK', missing: 'Hiányzó', expired: 'Lejárt' }
+  const icons = {
+    ok: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>',
+    missing: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+    expired: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  }
+  return `<span class="ssh-key-badge ${status}">${icons[status] || ''} ${labels[status] || status}</span>`
+}
+
+function _sshKeyAssignSelect(s) {
+  const currentKeyId = s.sshKeyId || s.assignedKeyId || s.vaultKeyId || ''
+  const opts = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => {
+      const sel = (currentKeyId && currentKeyId === k.id) ? ' selected' : ''
+      return `<option value="${escapeHtml(k.id)}"${sel}>${escapeHtml(k.label || k.id)}</option>`
+    })
+  ].join('')
+  return `<select class="ssh-key-assign ssh-key-select" data-id="${escapeHtml(s.id)}" title="Kulcs hozzárendelése">${opts}</select>`
+}
+
+function _sshInfoBtn(s) {
+  return `<button class="ssh-info-btn" data-id="${escapeHtml(s.id)}" data-user="${escapeHtml(s.user)}" title="Telepítési útmutató">i</button>`
+}
+
+function renderSshServers() {
+  const cardsEl = document.getElementById('sshCardsView')
+  const tableView = document.getElementById('sshTableView')
+  const tableBody = document.getElementById('sshTableBody')
+  const emptyEl = document.getElementById('sshEmpty')
+  if (!cardsEl || !tableBody || !emptyEl) return
+
+  // Sync view state with _sshView
+  const isTable = _sshView === 'table'
+  cardsEl.hidden = isTable
+  if (tableView) tableView.hidden = !isTable
+  document.getElementById('sshViewCards')?.classList.toggle('active', !isTable)
+  document.getElementById('sshViewTable')?.classList.toggle('active', isTable)
+
+  if (_sshServers.length === 0) {
+    cardsEl.innerHTML = ''
+    tableBody.innerHTML = ''
+    emptyEl.hidden = false
+    return
+  }
+  emptyEl.hidden = true
+
+  // Cards
+  cardsEl.innerHTML = _sshServers.map(s => `
+    <div class="ssh-card" data-id="${escapeHtml(s.id)}">
+      <div class="ssh-card-head">
+        <div class="ssh-card-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        </div>
+        <div class="ssh-card-title">
+          <div class="ssh-card-name">${escapeHtml(s.name)}</div>
+          ${s.desc ? `<div class="ssh-card-desc">${escapeHtml(s.desc)}</div>` : ''}
+        </div>
+      </div>
+      <div class="ssh-card-meta">
+        <div class="ssh-card-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          <span>${escapeHtml(s.host)}</span>
+        </div>
+        <div class="ssh-card-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <span>${escapeHtml(s.user)}${s.port !== 22 ? ` :${s.port}` : ''}</span>
+        </div>
+        ${s.fingerprint ? `<div class="ssh-card-row"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span>${escapeHtml(s.keyType || '')} ${escapeHtml(s.fingerprint.slice(0,24))}…</span></div>` : ''}
+      </div>
+      <div class="ssh-card-footer">
+        <div style="display:flex;align-items:center;gap:4px;width:100%">
+          ${_sshKeyAssignSelect(s)}
+          <div class="ssh-card-actions">
+            <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="Szerkesztés">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+            </button>
+            <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="Törlés">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `).join('')
+
+  // Table
+  tableBody.innerHTML = _sshServers.map(s => `
+    <tr data-id="${escapeHtml(s.id)}">
+      <td class="ssh-table-name">${escapeHtml(s.name)}</td>
+      <td class="ssh-table-mono">${escapeHtml(s.host)}</td>
+      <td class="ssh-table-mono">${escapeHtml(s.user)}</td>
+      <td class="ssh-table-mono">${s.port}</td>
+      <td>${_sshKeyAssignSelect(s)}</td>
+      <td style="color:var(--text-muted)">${escapeHtml(s.desc || '')}</td>
+      <td><div class="ssh-table-actions">
+        <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="Szerkesztés">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        </button>
+        <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="Törlés">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+        </button>
+      </div></td>
+    </tr>
+  `).join('')
+
+  // Delete handlers
+  document.querySelectorAll('.ssh-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.getAttribute('data-id')
+      if (!confirm(`Törlöd: ${id}?`)) return
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        await loadSshServers()
+      } catch { showToast('Törlés sikertelen') }
+    })
+  })
+
+  // Edit handlers -- open the add-server panel pre-filled, switch it to edit mode
+  document.querySelectorAll('.ssh-edit-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-id')
+      const server = _sshServers.find(s => s.id === id)
+      if (!server) return
+      _sshEditingId = id
+
+      document.getElementById('sshNameInput').value = server.name || ''
+      document.getElementById('sshHostInput').value = server.host || ''
+      document.getElementById('sshUserInput').value = server.user || ''
+      document.getElementById('sshPortInput').value = server.port || 22
+      document.getElementById('sshDescInput').value = server.desc || ''
+      const keySel = document.getElementById('sshKeySelectInput')
+      if (keySel) keySel.value = server.sshKeyId || server.assignedKeyId || server.vaultKeyId || ''
+
+      const titleEl = document.getElementById('sshAddPanelTitle')
+      if (titleEl) titleEl.textContent = `Szerver szerkesztése – ${server.name}`
+
+      const panel = document.getElementById('sshAddPanel')
+      panel.hidden = false
+      document.getElementById('sshNameInput').focus()
+    })
+  })
+
+  // Key assign select handlers
+  document.querySelectorAll('.ssh-key-assign').forEach(sel => {
+    sel.addEventListener('change', async () => {
+      const id = sel.getAttribute('data-id')
+      const sshKeyId = sel.value || null
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sshKeyId }),
+        })
+        await loadSshServers()
+      } catch { /* ignore */ }
+    })
+  })
+
+}
+
+// --- SSH Keygen modal (standalone key creation for Kulcstároló) ---
+let _sshKeygenCallback = null  // called with new key after successful generation
+
+function openSshKeygenModal(callback) {
+  const overlay = document.getElementById('sshKeygenOverlay')
+  document.getElementById('sshKeygenLabelInput').value = ''
+  document.getElementById('sshKeygenUserInput').value = ''
+  document.getElementById('sshKeygenSpinner').hidden = true
+  document.getElementById('sshKeygenResult').hidden = true
+  document.getElementById('sshKeygenFooter').hidden = false
+  document.getElementById('sshKeygenForm').hidden = false
+  document.getElementById('sshKeygenPubkeyBox').value = ''
+  _sshKeygenCallback = callback || null
+  openModal(overlay)
+  document.getElementById('sshKeygenLabelInput').focus()
+}
+
+;(function wireSshKeygenModal() {
+  const overlay = document.getElementById('sshKeygenOverlay')
+  const closeBtn = document.getElementById('sshKeygenClose')
+  const submitBtn = document.getElementById('sshKeygenSubmitBtn')
+  const copyBtn = document.getElementById('sshKeygenCopyBtn')
+  if (!overlay) return
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(overlay) })
+  closeBtn.addEventListener('click', () => closeModal(overlay))
+
+  submitBtn.addEventListener('click', async () => {
+    const label = document.getElementById('sshKeygenLabelInput').value.trim()
+    const username = document.getElementById('sshKeygenUserInput').value.trim()
+    if (!label || !username) { showToast('Cimke és felhasználónév megadása kötelező'); return }
+
+    document.getElementById('sshKeygenForm').hidden = true
+    document.getElementById('sshKeygenSpinner').hidden = false
+    document.getElementById('sshKeygenResult').hidden = true
+    document.getElementById('sshKeygenFooter').hidden = true
+
+    try {
+      const res = await fetch('/api/vault/ssh-keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, username }),
+      })
+      const data = await res.json()
+      if (!res.ok) { showToast(data.error || 'Generálás sikertelen'); resetKeygenForm(); return }
+
+      const pubkey = data.publicKey || (data.key && data.key.publicKey) || ''
+      document.getElementById('sshKeygenPubkeyBox').value = pubkey
+      document.getElementById('sshKeygenSpinner').hidden = true
+      document.getElementById('sshKeygenResult').hidden = false
+
+      await loadSshKeys()
+      if (_sshKeygenCallback) _sshKeygenCallback(data.key || data)
+    } catch { showToast('Hálózati hiba'); resetKeygenForm() }
+  })
+
+  copyBtn?.addEventListener('click', () => {
+    const val = document.getElementById('sshKeygenPubkeyBox').value
+    navigator.clipboard.writeText(val).then(() => {
+      copyBtn.textContent = 'Másolva!'
+      setTimeout(() => { copyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Másolás' }, 2000)
+    }).catch(() => {})
+  })
+
+  function resetKeygenForm() {
+    document.getElementById('sshKeygenForm').hidden = false
+    document.getElementById('sshKeygenSpinner').hidden = true
+    document.getElementById('sshKeygenResult').hidden = true
+    document.getElementById('sshKeygenFooter').hidden = false
+  }
+})()
+
+// --- SSH Info modal ---
+let _sshInfoServerId = null
+
+async function _sshInfoLoadKey(keyId, serverUser) {
+  const installSection = document.getElementById('sshInfoInstallSection')
+  const noKeyEl = document.getElementById('sshInfoNoKey')
+  if (!keyId) {
+    installSection.hidden = true
+    noKeyEl.hidden = false
+    return
+  }
+  installSection.hidden = false
+  noKeyEl.hidden = true
+
+  let pubkey = ''
+  try {
+    const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(keyId)}/public-key`)
+    if (res.ok) { const d = await res.json(); pubkey = d.publicKey || '' }
+  } catch {}
+
+  const targetUser = serverUser || 'root'
+  document.getElementById('sshInfoUser').textContent = targetUser
+
+  // root always exists -- only show the "create user" step for a real,
+  // non-root target user (e.g. a fresh server that needs the account first).
+  const step0 = document.getElementById('sshInfoStep0')
+  if (targetUser === 'root') {
+    step0.hidden = true
+  } else {
+    step0.hidden = false
+    document.getElementById('sshInfoCmd0').textContent = `useradd -m -s /bin/bash ${targetUser}`
+  }
+
+  const cmd2text = pubkey
+    ? `echo "${pubkey}" >> ~/.ssh/authorized_keys`
+    : `echo "<publikus kulcs ide>" >> ~/.ssh/authorized_keys`
+  document.getElementById('sshInfoCmd2').textContent = cmd2text
+  document.getElementById('sshInfoPubkey').textContent = pubkey || '(kulcs nem elérhető)'
+
+  const overlay = document.getElementById('sshInfoOverlay')
+  overlay.querySelectorAll('.ssh-code-copy').forEach(btn => {
+    const clone = btn.cloneNode(true)
+    btn.parentNode.replaceChild(clone, btn)
+    clone.addEventListener('click', () => {
+      const text = document.getElementById(clone.getAttribute('data-target'))?.textContent || ''
+      navigator.clipboard.writeText(text).then(() => {
+        clone.classList.add('copied')
+        setTimeout(() => clone.classList.remove('copied'), 2000)
+      }).catch(() => {})
+    })
+  })
+}
+
+function _sshInfoLoadServer(serverId) {
+  _sshInfoServerId = serverId
+  const server = _sshServers.find(s => s.id === serverId)
+
+  document.getElementById('sshInfoServerName').textContent = server ? server.name : (serverId || '')
+
+  const keySel = document.getElementById('sshInfoKeySelect')
+  keySel.innerHTML = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+  ].join('')
+  const assignedKeyId = (server && (server.sshKeyId || server.assignedKeyId || server.vaultKeyId)) || ''
+  keySel.value = assignedKeyId
+  return { server, assignedKeyId }
+}
+
+function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
+  const overlay = document.getElementById('sshInfoOverlay')
+  const serverSection = overlay.querySelector('.ssh-info-server-section')
+
+  if (keyOnly) {
+    // Key-only mode: hide server selector, reset server context
+    serverSection.hidden = true
+    _sshInfoServerId = null
+    document.getElementById('sshInfoServerName').textContent = 'Új szerver'
+
+    // Populate key selector without a pre-selected key
+    const keySel = document.getElementById('sshInfoKeySelect')
+    keySel.innerHTML = ['<option value="">-- Válassz kulcsot --</option>',
+      ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+    ].join('')
+    // Pre-select whatever is chosen in the form's key dropdown
+    const formKeyId = document.getElementById('sshKeySelectInput')?.value || ''
+    keySel.value = formKeyId
+
+    // Use the username typed into the new-server form, not a hardcoded root
+    const formUser = document.getElementById('sshUserInput')?.value.trim() || 'root'
+
+    openModal(overlay)
+    _sshInfoLoadKey(formKeyId, formUser)
+  } else {
+    // Normal mode: show server selector, pick first server by default
+    serverSection.hidden = false
+    const serverSel = document.getElementById('sshInfoServerSelect')
+    serverSel.innerHTML = ['<option value="">-- Válassz szervert --</option>',
+      ..._sshServers.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`)
+    ].join('')
+
+    const firstId = preselectedServerId || (_sshServers[0] && _sshServers[0].id) || ''
+    serverSel.value = firstId
+
+    const { server, assignedKeyId } = _sshInfoLoadServer(firstId)
+    const targetUser = (server && server.user) || 'root'
+
+    openModal(overlay)
+    _sshInfoLoadKey(assignedKeyId, targetUser)
+  }
+}
+
+;(function wireSshInfoModal() {
+  const overlay = document.getElementById('sshInfoOverlay')
+  const closeBtn = document.getElementById('sshInfoClose')
+  const serverSel = document.getElementById('sshInfoServerSelect')
+  const keySel = document.getElementById('sshInfoKeySelect')
+  if (!overlay) return
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(overlay) })
+  closeBtn.addEventListener('click', () => closeModal(overlay))
+
+  serverSel?.addEventListener('change', () => {
+    const { server, assignedKeyId } = _sshInfoLoadServer(serverSel.value)
+    _sshInfoLoadKey(assignedKeyId, (server && server.user) || 'root')
+  })
+
+  keySel?.addEventListener('change', async () => {
+    const keyId = keySel.value || null
+    // Key-only mode (new-server flow) has no _sshInfoServerId -- read the
+    // username from the new-server form instead of falling back to root.
+    const targetUser = _sshInfoServerId
+      ? ((_sshServers.find(s => s.id === _sshInfoServerId) || {}).user || 'root')
+      : (document.getElementById('sshUserInput')?.value.trim() || 'root')
+
+    if (_sshInfoServerId) {
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(_sshInfoServerId)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sshKeyId: keyId }),
+        })
+        await loadSshServers()
+      } catch { /* ignore */ }
+    }
+    await _sshInfoLoadKey(keyId, targetUser)
+  })
+})()
+
+;(function wireSshSection() {
+  const newBtn = document.getElementById('sshNewBtn')
+  const panel = document.getElementById('sshAddPanel')
+  const closeBtn = document.getElementById('sshAddPanelClose')
+  const addBtn = document.getElementById('sshAddBtn')
+  const cardViewBtn = document.getElementById('sshViewCards')
+  const tableViewBtn = document.getElementById('sshViewTable')
+  const cardsView = document.getElementById('sshCardsView')
+  const tableView = document.getElementById('sshTableView')
+
+  if (!newBtn) return
+
+  function resetSshAddForm() {
+    _sshEditingId = null
+    const titleEl = document.getElementById('sshAddPanelTitle')
+    if (titleEl) titleEl.textContent = 'Szerver hozzáadása'
+    document.getElementById('sshNameInput').value = ''
+    document.getElementById('sshHostInput').value = ''
+    document.getElementById('sshUserInput').value = ''
+    document.getElementById('sshPortInput').value = '22'
+    document.getElementById('sshDescInput').value = ''
+    if (document.getElementById('sshKeySelectInput')) document.getElementById('sshKeySelectInput').value = ''
+  }
+
+  newBtn.addEventListener('click', () => {
+    if (panel.hidden) resetSshAddForm()
+    panel.hidden = !panel.hidden
+    if (!panel.hidden) document.getElementById('sshNameInput').focus()
+  })
+  closeBtn?.addEventListener('click', () => { panel.hidden = true; resetSshAddForm() })
+
+  // (i) install guide button inside the "new server" form -- key-only mode
+  document.getElementById('sshKeyInstallFromFormBtn')?.addEventListener('click', () => {
+    openSshInfoModal(null, { keyOnly: true })
+  })
+
+  // "+ Új kulcs" button inside the "new server" form
+  document.getElementById('sshKeyNewFromFormBtn')?.addEventListener('click', () => {
+    openSshKeygenModal(newKey => {
+      // After key created, select it in the form dropdown
+      if (newKey && newKey.id) {
+        const sel = document.getElementById('sshKeySelectInput')
+        if (sel) sel.value = newKey.id
+      }
+    })
+  })
+
+  addBtn?.addEventListener('click', async () => {
+    const name = document.getElementById('sshNameInput').value.trim()
+    const host = document.getElementById('sshHostInput').value.trim()
+    const user = document.getElementById('sshUserInput').value.trim()
+    const port = parseInt(document.getElementById('sshPortInput').value, 10) || 22
+    const desc = document.getElementById('sshDescInput').value.trim()
+    const sshKeyId = document.getElementById('sshKeySelectInput')?.value || null
+    if (!name || !host || !user) { showToast('Név, IP és felhasználó megadása kötelező'); return }
+    const isEdit = !!_sshEditingId
+    try {
+      const res = await fetch(
+        isEdit ? `/api/vault/ssh-servers/${encodeURIComponent(_sshEditingId)}` : '/api/vault/ssh-servers',
+        {
+          method: isEdit ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, host, user, port, desc, sshKeyId: sshKeyId || undefined }),
+        }
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        showToast(err.error || 'Hiba a mentéskor'); return
+      }
+      resetSshAddForm()
+      panel.hidden = true
+      await loadSshServers()
+      showToast(isEdit ? 'Szerver frissítve' : 'Szerver hozzáadva')
+    } catch { showToast('Hálózati hiba') }
+  })
+
+  cardViewBtn?.addEventListener('click', () => {
+    _sshView = 'cards'
+    cardViewBtn.classList.add('active')
+    tableViewBtn.classList.remove('active')
+    cardsView.hidden = false
+    tableView.hidden = true
+  })
+
+  tableViewBtn?.addEventListener('click', () => {
+    _sshView = 'table'
+    tableViewBtn.classList.add('active')
+    cardViewBtn.classList.remove('active')
+    cardsView.hidden = true
+    tableView.hidden = false
+  })
+
+  // Kulcstároló "Új kulcs generálása" button
+  document.getElementById('sshKeyNewBtn')?.addEventListener('click', () => {
+    openSshKeygenModal()
+  })
+
+  // Global (i) info button in section header
+  document.getElementById('sshInfoGlobalBtn')?.addEventListener('click', () => {
+    openSshInfoModal()
+  })
+})()
+
 // --- Vault Page ---
 let _vaultSecrets = []
 
@@ -7245,6 +7852,7 @@ async function loadVaultPage() {
     document.getElementById('vaultStatTotal').textContent = String(_vaultSecrets.length)
     document.getElementById('vaultStatBindings').textContent = String(_vaultBindings.length)
     renderVaultGrid(_vaultSecrets)
+    await Promise.all([loadSshKeys(), loadSshServers()])
   } catch { /* ignore */ }
 }
 
@@ -9148,12 +9756,12 @@ async function initSidebarBrand() {
       if (typeof renderStaticI18n === 'function') renderStaticI18n()
       if (brand) {
         document.title = brand
+        const appleTitle = document.querySelector('meta[name="apple-mobile-web-app-title"]')
+        if (appleTitle) appleTitle.setAttribute('content', brand)
         const topbar = document.getElementById('mobileTopbarTitle')
         if (topbar) topbar.textContent = brand
         const name = document.getElementById('sidebarBrandName')
         if (name) name.textContent = brand
-        const appleTitle = document.querySelector('meta[name="apple-mobile-web-app-title"]')
-        if (appleTitle) appleTitle.setAttribute('content', brand)
         const subtitle = document.getElementById('updatesSubtitle')
         if (subtitle) subtitle.textContent = `${brand} ` + t('overview.updates_subtitle')
       }
@@ -9161,6 +9769,15 @@ async function initSidebarBrand() {
   } catch {}
 }
 initSidebarBrand()
+
+// In an installed (standalone) PWA, lock the zoom: iOS otherwise auto-zooms when
+// a small-text input is focused and allows stray pinch-zoom, neither of which
+// suits an app-like control panel. Left untouched in a normal browser tab so
+// page zoom / accessibility still work there.
+if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone) {
+  const vp = document.querySelector('meta[name="viewport"]')
+  if (vp) vp.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover')
+}
 
 // === Updates page ===
 function escapeHtmlUpdates(s) {
@@ -11218,6 +11835,21 @@ async function handleAgentLogin(agentName, btn) {
 let terminalInstance = null
 let terminalSSE = null
 let terminalFit = null
+// Master input gate (mirrors the server-side terminal-input toggle). Keystrokes
+// are dropped locally when OFF so we never spam the audit log with 403s; the
+// server enforces the same gate independently (fail-closed). Owner flips it via
+// the checkbox in the modal header (POST /api/terminal-input).
+let terminalInputEnabled = false
+
+function syncTerminalInputToggleUI() {
+  const cb = document.getElementById('terminalInputToggle')
+  const label = document.getElementById('terminalInputToggleLabel')
+  if (cb) cb.checked = terminalInputEnabled
+  if (label) {
+    label.textContent = terminalInputEnabled ? 'Input on' : 'Input off'
+    label.style.color = terminalInputEnabled ? '#8fbf6f' : '#b8b2a6'
+  }
+}
 
 function openTerminalModal(agentName) {
   const overlay = document.getElementById('terminalOverlay')
@@ -11226,6 +11858,12 @@ function openTerminalModal(agentName) {
   if (!overlay || !container) return
 
   title.textContent = agentName + ' - Terminal'
+
+  // Read the current server-side gate so the modal reflects reality on open.
+  fetch('/api/terminal-input')
+    .then(r => r.ok ? r.json() : { enabled: false })
+    .then(d => { terminalInputEnabled = d.enabled === true; syncTerminalInputToggleUI() })
+    .catch(() => { terminalInputEnabled = false; syncTerminalInputToggleUI() })
 
   // Cleanup previous
   if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
@@ -11302,6 +11940,12 @@ function openTerminalModal(agentName) {
   term.onData(data => {
     if (data === '\x1b[5~') { term.scrollPages(-1); return } // PageUp -> scroll history up
     if (data === '\x1b[6~') { term.scrollPages(1); return }  // PageDown -> scroll history down
+    if (!terminalInputEnabled) {
+      // Read-only mode: input gate is OFF. Drop the keystroke locally (server
+      // would 403 it anyway) and nudge the user to the toggle.
+      showToast('Terminal input is off. Enable it with the header toggle first.')
+      return
+    }
     const special = ESC_TO_SPECIAL[data]
     const body = special ? { special } : { keys: data }
     fetch(`/api/agents/${encodeURIComponent(agentName)}/keys`, {
@@ -11326,6 +11970,27 @@ document.getElementById('terminalClose')?.addEventListener('click', () => {
   if (overlay) closeModal(overlay)
   if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
   if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null }
+})
+
+// Owner flips the master terminal-input gate. Optimistically reflect the desired
+// state, POST it, then reconcile with the server's authoritative response.
+document.getElementById('terminalInputToggle')?.addEventListener('change', (e) => {
+  const desired = e.target.checked === true
+  fetch('/api/terminal-input', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: desired }),
+  })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+    .then(d => {
+      terminalInputEnabled = d.enabled === true
+      syncTerminalInputToggleUI()
+      showToast(terminalInputEnabled ? 'Terminal input enabled (audit-logged)' : 'Terminal input disabled')
+    })
+    .catch(() => {
+      terminalInputEnabled = false
+      syncTerminalInputToggleUI()
+      showToast('Could not change terminal input state')
+    })
 })
 
 // === Agent conversation (readable transcript) modal ===
@@ -12015,4 +12680,343 @@ function downloadMarkdown(name, content) {
   }
 
   window.loadNaplo = loadNaplo
+})()
+
+// === Kanban Gantt / timeline view ===
+;(function () {
+  // --- State ---
+  let ganttPeriod = 'week'  // 'week' | 'month' | 'quarter'
+  let ganttPeriodOffset = 0  // periods stepped from the current one (0 = current, -1 = prev, +1 = next)
+  let ganttOverdueOnly = false
+  let _initialized = false
+
+  // --- Color map by status (vars from theme) ---
+  const STATUS_COLOR = {
+    planned:     { bg: 'var(--accent)',  border: 'var(--accent)' },
+    in_progress: { bg: '#4f8ef7',        border: '#3a7be0' },
+    waiting:     { bg: '#e8a838',        border: '#c88c20' },
+    done:        { bg: '#3dbf79',        border: '#28a560' },
+  }
+
+  // Period window: returns { rangeStart: Date, rangeEnd: Date } (midnight boundaries)
+  function periodWindow() {
+    const now = new Date()
+    const start = new Date(now)
+    start.setHours(0, 0, 0, 0)
+    const end = new Date(start)
+    if (ganttPeriod === 'week') {
+      // Mon..Sun of current week, shifted by ganttPeriodOffset weeks
+      const dow = (start.getDay() + 6) % 7  // Mon=0
+      start.setDate(start.getDate() - dow + ganttPeriodOffset * 7)
+      end.setTime(start.getTime())
+      end.setDate(start.getDate() + 7)
+    } else if (ganttPeriod === 'month') {
+      start.setDate(1)
+      start.setMonth(start.getMonth() + ganttPeriodOffset)
+      end.setFullYear(start.getFullYear(), start.getMonth() + 1, 1)
+    } else {  // quarter
+      const qStart = Math.floor(start.getMonth() / 3) * 3 + ganttPeriodOffset * 3
+      start.setMonth(qStart, 1)
+      end.setFullYear(start.getFullYear(), start.getMonth() + 3, 1)
+    }
+    return { rangeStart: start, rangeEnd: end }
+  }
+
+  // Format date as short label (e.g. "jún 15" / "Jun 15")
+  function fmtDateShort(d) {
+    return d.toLocaleDateString(typeof _lang !== 'undefined' && _lang === 'en' ? 'en-US' : 'hu-HU', { month: 'short', day: 'numeric' })
+  }
+
+  // Return header tick labels for the visible range
+  function buildHeaderTicks(rangeStart, rangeEnd) {
+    const ticks = []
+    const totalMs = rangeEnd - rangeStart
+    // Aim for ~5-8 ticks; snap to day boundaries
+    let stepDays = 1
+    if (ganttPeriod === 'month') stepDays = 7
+    else if (ganttPeriod === 'quarter') stepDays = 14
+    const cur = new Date(rangeStart)
+    while (cur < rangeEnd) {
+      ticks.push({
+        date: new Date(cur),
+        pct: (cur - rangeStart) / totalMs * 100,
+      })
+      cur.setDate(cur.getDate() + stepDays)
+    }
+    return ticks
+  }
+
+  // Group visible cards by project (or 'Nincs projekt' for null)
+  function groupCardsByProject(cards) {
+    const map = new Map()
+    for (const c of cards) {
+      const key = c.project || t('kanban.gantt.no_project')
+      if (!map.has(key)) map.set(key, [])
+      map.get(key).push(c)
+    }
+    return map
+  }
+
+  // Build and inject the Gantt DOM into #kanbanGanttView
+  function renderGantt() {
+    const container = document.getElementById('kanbanGanttView')
+    if (!container) return
+    container.innerHTML = ''
+
+    const { rangeStart, rangeEnd } = periodWindow()
+    const totalMs = rangeEnd - rangeStart
+    const nowMs = Date.now()
+    const todayPct = Math.max(0, Math.min(100, (nowMs - rangeStart) / totalMs * 100))
+
+    // Filter: cards that have a due_date
+    let cards = (Array.isArray(kanbanCards) ? kanbanCards : []).filter(c => c.due_date)
+
+    if (ganttOverdueOnly) {
+      // Keep cards that are overdue OR due within 7 days
+      const cutoff = (nowMs + 7 * 86400000) / 1000
+      cards = cards.filter(c => c.due_date <= cutoff / 1 && c.status !== 'done')
+    }
+
+    // Exclude cards whose entire bar lies outside the window
+    cards = cards.filter(c => {
+      const barStart = c.created_at ? c.created_at * 1000 : rangeStart.getTime()
+      const barEnd   = c.due_date * 1000
+      return barEnd >= rangeStart && barStart <= rangeEnd
+    })
+
+    if (cards.length === 0) {
+      container.innerHTML = `<p style="color:var(--muted);padding:24px 0;text-align:center;">${t('kanban.gantt.no_cards')}</p>`
+      return
+    }
+
+    const grouped = groupCardsByProject(cards)
+
+    // --- Outer layout ---
+    const wrap = document.createElement('div')
+    wrap.className = 'gantt-wrap'
+    wrap.style.cssText = 'display:flex;flex-direction:column;overflow:hidden;'
+
+    // --- Header row: left label + tick strip ---
+    const headerRow = document.createElement('div')
+    headerRow.style.cssText = 'display:flex;border-bottom:1px solid var(--border);margin-bottom:4px;'
+
+    const headerLabel = document.createElement('div')
+    headerLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;color:var(--muted);padding:4px 8px;border-right:1px solid var(--border);'
+    headerLabel.textContent = t('kanban.gantt.col_label')
+    headerRow.appendChild(headerLabel)
+
+    const headerTrack = document.createElement('div')
+    headerTrack.style.cssText = 'flex:1;position:relative;height:28px;overflow:hidden;'
+    const ticks = buildHeaderTicks(rangeStart, rangeEnd)
+    for (const tick of ticks) {
+      const el = document.createElement('div')
+      el.style.cssText = `position:absolute;left:${tick.pct.toFixed(2)}%;transform:translateX(-50%);font-size:11px;color:var(--muted);top:6px;white-space:nowrap;`
+      el.textContent = fmtDateShort(tick.date)
+      headerTrack.appendChild(el)
+    }
+    // Today marker in header
+    if (todayPct >= 0 && todayPct <= 100) {
+      const todayHead = document.createElement('div')
+      todayHead.style.cssText = `position:absolute;left:${todayPct.toFixed(2)}%;top:0;bottom:0;width:2px;background:var(--danger,#e05252);opacity:0.6;`
+      headerTrack.appendChild(todayHead)
+    }
+    headerRow.appendChild(headerTrack)
+    wrap.appendChild(headerRow)
+
+    // --- Body rows ---
+    const body = document.createElement('div')
+    body.style.cssText = 'overflow-y:auto;max-height:70vh;'
+
+    for (const [project, projCards] of grouped) {
+      // Group header
+      const groupHeader = document.createElement('div')
+      groupHeader.style.cssText = 'display:flex;align-items:center;background:var(--bg2,var(--sidebar-bg));border-bottom:1px solid var(--border);'
+      const ghLabel = document.createElement('div')
+      ghLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;font-weight:600;color:var(--fg);padding:5px 8px;border-right:1px solid var(--border);'
+      ghLabel.textContent = `${project} (${projCards.length})`
+      groupHeader.appendChild(ghLabel)
+      const ghStripe = document.createElement('div')
+      ghStripe.style.cssText = 'flex:1;height:26px;background:var(--bg2,var(--sidebar-bg));'
+      groupHeader.appendChild(ghStripe)
+      body.appendChild(groupHeader)
+
+      // Card rows
+      for (const card of projCards) {
+        const barStartMs = card.created_at ? card.created_at * 1000 : rangeStart.getTime()
+        const barEndMs   = card.due_date * 1000
+        const isOverdue  = card.status !== 'done' && barEndMs < nowMs
+
+        // Clamp to window
+        const clampedStart = Math.max(barStartMs, rangeStart.getTime())
+        const clampedEnd   = Math.min(barEndMs,   rangeEnd.getTime())
+        const leftPct  = (clampedStart - rangeStart) / totalMs * 100
+        const widthPct = Math.max(0.5, (clampedEnd - clampedStart) / totalMs * 100)
+
+        const col = isOverdue ? { bg: 'var(--danger,#e05252)', border: '#b83030' }
+                              : (STATUS_COLOR[card.status] || STATUS_COLOR.planned)
+
+        const row = document.createElement('div')
+        row.style.cssText = 'display:flex;align-items:center;border-bottom:1px solid var(--border);min-height:32px;'
+
+        const rowLabel = document.createElement('div')
+        rowLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;color:var(--fg);padding:4px 8px;border-right:1px solid var(--border);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;cursor:pointer;'
+        rowLabel.title = card.title
+        // Show the running display number (#N, card.seq) like the board, not the hex id.
+        const seqLabel = card.seq != null ? `#${card.seq}` : `#${card.id}`
+        rowLabel.textContent = `${seqLabel} ${card.title}`
+        rowLabel.addEventListener('click', () => { if (typeof openCardDetail === 'function') openCardDetail(card.id) })
+
+        const rowTrack = document.createElement('div')
+        rowTrack.style.cssText = 'flex:1;position:relative;height:32px;overflow:hidden;'
+
+        // Today line (in each row)
+        if (todayPct >= 0 && todayPct <= 100) {
+          const tl = document.createElement('div')
+          tl.style.cssText = `position:absolute;left:${todayPct.toFixed(2)}%;top:0;bottom:0;width:2px;background:var(--danger,#e05252);z-index:1;pointer-events:none;`
+          rowTrack.appendChild(tl)
+        }
+
+        const bar = document.createElement('div')
+        bar.style.cssText = [
+          `position:absolute`,
+          `left:${leftPct.toFixed(2)}%`,
+          `width:${widthPct.toFixed(2)}%`,
+          `top:5px`,
+          `bottom:5px`,
+          `background:${col.bg}`,
+          `border:1px solid ${col.border}`,
+          `border-radius:4px`,
+          `overflow:hidden`,
+          `white-space:nowrap`,
+          `font-size:11px`,
+          `color:#fff`,
+          `display:flex`,
+          `align-items:center`,
+          `padding:0 6px`,
+          `box-sizing:border-box`,
+          `cursor:pointer`,
+          `z-index:2`,
+          isOverdue ? 'background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.12) 0px,rgba(0,0,0,.12) 4px,transparent 4px,transparent 8px)' : '',
+        ].filter(Boolean).join(';')
+        bar.title = `${seqLabel} ${card.title}\n${fmtDateShort(new Date(barStartMs))} - ${fmtDateShort(new Date(barEndMs))}`
+        bar.textContent = `${seqLabel} ${card.title}`
+        bar.addEventListener('click', () => { if (typeof openCardDetail === 'function') openCardDetail(card.id) })
+        rowTrack.appendChild(bar)
+        row.appendChild(rowLabel)
+        row.appendChild(rowTrack)
+        body.appendChild(row)
+      }
+    }
+
+    wrap.appendChild(body)
+
+    // --- Legend ---
+    const legend = document.createElement('div')
+    legend.style.cssText = 'display:flex;align-items:center;gap:16px;margin-top:10px;font-size:12px;flex-wrap:wrap;'
+    const legendItems = [
+      { key: 'planned',     color: STATUS_COLOR.planned.bg },
+      { key: 'in_progress', color: STATUS_COLOR.in_progress.bg },
+      { key: 'waiting',     color: STATUS_COLOR.waiting.bg },
+      { key: 'done',        color: STATUS_COLOR.done.bg },
+      { key: 'overdue',     color: 'var(--danger,#e05252)' },
+    ]
+    for (const item of legendItems) {
+      const dot = document.createElement('span')
+      dot.innerHTML = `<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${item.color};vertical-align:middle;margin-right:4px;"></span>${t('kanban.gantt.legend.' + item.key)}`
+      legend.appendChild(dot)
+    }
+    const todayLegend = document.createElement('span')
+    todayLegend.style.cssText = 'margin-left:auto;color:var(--muted);'
+    todayLegend.innerHTML = `<span style="display:inline-block;width:12px;height:2px;background:var(--danger,#e05252);vertical-align:middle;margin-right:4px;"></span>${t('kanban.gantt.legend.today')}`
+    legend.appendChild(todayLegend)
+    wrap.appendChild(legend)
+
+    container.appendChild(wrap)
+
+    // --- Period stepper (below the timeline): step back/forward by one period unit ---
+    const nav = document.createElement('div')
+    nav.style.cssText = 'display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px;'
+    const prevBtn = document.createElement('button')
+    prevBtn.className = 'view-btn'
+    prevBtn.style.cssText = 'width:auto;padding:0 14px;'
+    prevBtn.textContent = '‹ ' + t('kanban.gantt.nav_prev')
+    prevBtn.addEventListener('click', () => { ganttPeriodOffset--; renderGantt() })
+    const rangeLbl = document.createElement('span')
+    rangeLbl.style.cssText = 'font-size:12px;color:var(--muted);min-width:130px;text-align:center;'
+    rangeLbl.textContent = `${fmtDateShort(rangeStart)} - ${fmtDateShort(new Date(rangeEnd.getTime() - 1))}`
+    const nextBtn = document.createElement('button')
+    nextBtn.className = 'view-btn'
+    nextBtn.style.cssText = 'width:auto;padding:0 14px;'
+    nextBtn.textContent = t('kanban.gantt.nav_next') + ' ›'
+    nextBtn.addEventListener('click', () => { ganttPeriodOffset++; renderGantt() })
+    nav.append(prevBtn, rangeLbl, nextBtn)
+    container.appendChild(nav)
+  }
+
+  // --- View switcher init (called once after DOM ready) ---
+  function initGanttViewSwitcher() {
+    if (_initialized) return
+    _initialized = true
+
+    const boardBtn  = document.getElementById('kanbanViewBoard')
+    const ganttBtn  = document.getElementById('kanbanViewGantt')
+    const boardFilters = document.getElementById('kanbanBoardFilters')
+    const ganttFilters = document.getElementById('kanbanGanttFilters')
+    const boardEls  = [document.getElementById('kanbanBoard'), document.getElementById('kanbanSwimlaneBoard')]
+    const ganttEl   = document.getElementById('kanbanGanttView')
+
+    function activateBoard() {
+      boardBtn.classList.add('active')
+      ganttBtn.classList.remove('active')
+      boardFilters.style.display = 'flex'
+      ganttFilters.style.display = 'none'
+      boardEls.forEach(el => { if (el) el.style.removeProperty('display') })
+      ganttEl.style.display = 'none'
+    }
+
+    function activateGantt() {
+      ganttBtn.classList.add('active')
+      boardBtn.classList.remove('active')
+      ganttFilters.style.display = 'flex'
+      boardFilters.style.display = 'none'
+      boardEls.forEach(el => { if (el) el.style.display = 'none' })
+      ganttEl.style.display = 'block'
+      renderGantt()
+    }
+
+    boardBtn.addEventListener('click', activateBoard)
+    ganttBtn.addEventListener('click', activateGantt)
+
+    // Period buttons
+    document.querySelectorAll('#kanbanGanttFilters [data-period]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        ganttPeriod = btn.dataset.period
+        ganttPeriodOffset = 0  // recenter on the current period when switching granularity
+        document.querySelectorAll('#kanbanGanttFilters [data-period]').forEach(b => b.classList.remove('active'))
+        btn.classList.add('active')
+        renderGantt()
+      })
+    })
+
+    // Overdue toggle
+    const overdueChk = document.getElementById('ganttOverdueOnly')
+    if (overdueChk) {
+      overdueChk.addEventListener('change', () => {
+        ganttOverdueOnly = overdueChk.checked
+        renderGantt()
+      })
+    }
+
+    // Re-render on data refresh (hook into global loadKanban completion)
+    const _origRenderKanban = window.renderKanban
+    if (typeof _origRenderKanban === 'function') {
+      window.renderKanban = function () {
+        _origRenderKanban.apply(this, arguments)
+        if (ganttEl.style.display !== 'none') renderGantt()
+      }
+    }
+  }
+
+  window._initGanttViewSwitcher = initGanttViewSwitcher
+  window.renderGantt = renderGantt
 })()

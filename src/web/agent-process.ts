@@ -14,8 +14,11 @@ import {
   detectPaneState,
   parkedInputText,
   stripGhostSuggestion,
+  paneShowsContextSaturation,
+  idleConsideringDimGhost,
 } from '../pane-state.js'
-import { agentDir, readAgentModel, readAgentClaudeConfigDir, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost } from './agent-config.js'
+import { agentDir, listAgentNames, readAgentModel, readAgentClaudeConfigDir, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost, readAgentMemoryIsolation } from './agent-config.js'
+import { provisionMemoryBoundaryDir } from './memory-boundary.js'
 import {
   buildTmuxInvocation,
   buildSshExec,
@@ -117,6 +120,61 @@ export function hasFleetOauthToken(): boolean {
   } catch {
     return false
   }
+}
+
+// H1 silent-degradation hardening (2026-06-30).
+//
+// When the fleet OAuth token is absent, channel sub-agents skip isolation and
+// fall back to the SHARED ~/.claude (the pre-isolation behaviour, gated in
+// startAgentProcess). ONE channel sub-agent on the shared dir is harmless -- it
+// owns the single plugin-install slot and poller. TWO OR MORE collide on that
+// slot, which is exactly the fleet outage isolation was built to end (only one
+// agent registers its plugin, the rest go deaf -- see
+// ensureIsolatedChannelConfigDir). Today that collision is logged at WARN only,
+// so it stays invisible until a bot silently stops answering.
+//
+// The decision is pure (token-absent AND more-than-one channel sub-agent) so it
+// is unit-tested without I/O, mirroring shouldSendDeferAlert. Token PRESENT ->
+// isolation works -> never alerts, regardless of agent count.
+export function shouldAlertSharedConfigCollision(
+  hasToken: boolean,
+  channelSubAgentCount: number,
+): boolean {
+  return !hasToken && channelSubAgentCount > 1
+}
+
+// Count of channel-HAVING sub-agents in the fleet (main agent excluded -- it
+// comes up via channels.sh and keeps the shared root by design). Uses the same
+// own-token signal as the launch path, so the count reflects which agents will
+// actually contend for the shared ~/.claude plugin slot.
+export function countChannelSubAgents(): number {
+  return listAgentNames().filter((n) => n !== MAIN_AGENT_ID && agentHasChannel(n)).length
+}
+
+// One operator alert per degradation episode: spamming on every spawn would
+// bury the signal. Cleared the moment the token reappears (isolation restored),
+// so a later token-loss re-alerts. Process-local, like defer-alert's dedup set.
+let sharedConfigCollisionAlerted = false
+
+export function resetSharedConfigCollisionAlert(): void {
+  sharedConfigCollisionAlerted = false
+}
+
+// Loud, owner-facing alert routed via notifyChannel (direct Bot API POST from
+// the dashboard process) -- NOT an inter-agent relay, which would itself need a
+// healthy channel agent to deliver. No-op unless the token is absent AND >1
+// channel sub-agent would share ~/.claude.
+function maybeAlertSharedConfigCollision(name: string): void {
+  const count = countChannelSubAgents()
+  if (!shouldAlertSharedConfigCollision(false, count) || sharedConfigCollisionAlerted) return
+  sharedConfigCollisionAlerted = true
+  logger.error(
+    { name, channelSubAgentCount: count },
+    'isolated-config: fleet OAuth token missing with multiple channel sub-agents -- shared ~/.claude plugin-slot collision, bots will go deaf',
+  )
+  void notifyChannel(
+    `⚠️ Flotta-figyelmeztetes: hianyzik a fleet OAuth token (store/.claude-oauth-token), de ${count} csatornas sub-agent fut. Izolacio nelkul mind a kozos ~/.claude-ot hasznalja, igy a plugin-slot utkozik es csak egy bot marad eleresheto (a tobbi elnemul). Javitas: futtasd a \`claude setup-token\`-t, mentsd a store/.claude-oauth-token fajlba, majd inditsd ujra az agenseket.`,
+  ).catch(() => { /* notifyChannel logs internally */ })
 }
 
 // Per-agent isolated CLAUDE_CONFIG_DIR provisioning (2026-06-26 fleet outage).
@@ -359,13 +417,20 @@ function runTmux(host: string | null, tmuxArgs: string[], opts: { timeout?: numb
   // marveen restart would lose connection multiplexing and re-handshake each tick.
   if (host) ensureControlDir()
   const inv = buildTmuxInvocation(host, TMUX, tmuxArgs)
-  execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000) })
+  // stdio: capture the child's stderr into the thrown error instead of letting
+  // execFileSync's default inherit it to the parent stderr. A restarting agent
+  // makes tmux emit `can't find session: agent-X` / `no server running`; without
+  // this those leaked as ~450 bare (non-pino) lines into store/dashboard.log.
+  // Callers that care read err.stderr via logger.warn({ err }).
+  execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000), stdio: ['ignore', 'ignore', 'pipe'] })
 }
 
 function captureTmux(host: string | null, tmuxArgs: string[], opts: { timeout?: number } = {}): string {
   if (host) ensureControlDir()
   const inv = buildTmuxInvocation(host, TMUX, tmuxArgs)
-  return execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000), encoding: 'utf-8' })
+  // stdout piped (we return it); stderr piped too so tmux's `can't find session`
+  // noise lands in err.stderr on failure rather than the parent stderr / dashboard.log.
+  return execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000), encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] })
 }
 
 // Tri-state run state. For a remote agent a failed list-sessions query is
@@ -504,6 +569,13 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
   if (remote.host && remote.workdir) {
     return startRemoteAgentProcess(name, remote.host, remote.workdir, opts)
   }
+
+  // Opt-in per-agent auto-memory isolation (local agents only; a remote
+  // workdir cannot be provisioned from here). Default OFF: without the
+  // memoryIsolation flag this is a no-op and the shared-memory behavior of
+  // existing installs is byte-identical.
+  if (readAgentMemoryIsolation(name)) provisionMemoryBoundaryDir(dir)
+
 
   if (isAgentRunning(name)) return { ok: false, error: 'Agent is already running' }
 
@@ -667,6 +739,9 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     let oauthTokenEnv = ''
     if (!claudeConfigDir && hasChannel && name !== MAIN_AGENT_ID) {
       if (hasFleetOauthToken()) {
+        // Token present -> isolation works; any earlier degradation is resolved,
+        // so re-arm the one-shot alert for a future token loss.
+        resetSharedConfigCollisionAlert()
         const isolated = ensureIsolatedChannelConfigDir(name, agentProvider)
         if (isolated) {
           claudeConfigDir = isolated
@@ -677,6 +752,9 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
         }
       } else {
         logger.warn({ name }, 'isolated-config: no fleet OAuth token (store/.claude-oauth-token); keeping shared ~/.claude. Run `claude setup-token` and store it to enable per-agent isolation.')
+        // H1: the WARN above is silent. With >1 channel sub-agent sharing
+        // ~/.claude this is an active plugin-slot collision -> raise a loud alert.
+        maybeAlertSharedConfigCollision(name)
       }
     }
     const claudeConfigEnv = claudeConfigDir ? `export CLAUDE_CONFIG_DIR="${claudeConfigDir}" && ` : ''
@@ -1456,16 +1534,37 @@ export function captureParkedInputView(session: string, host: string | null = nu
 //      returns true. Cost on the ready path: ~250ms sleep plus a second
 //      tmux capture-pane round-trip (typically tens of ms). Busy pass
 //      through layer 1 and return immediately without the delay.
+//
+// A saturated pane ("100% context used") is refused up front: it can present
+// as perfectly idle, so without this a new prompt would be dispatched into a
+// session that cannot act on it. We only log/audit the refusal here; how (or
+// whether) to recover the session is left to the caller / operator tooling, so
+// this predicate stays a pure, dependency-free readiness check.
 export function isSessionReadyForPrompt(session: string, host: string | null = null): boolean {
+  // Dim-ghost tolerant idle read: CC >=2.1.202 paints a dim placeholder into
+  // the empty input box, which a plain capture reads as parked text. Only when
+  // the plain view says 'typing' do we pay for the second (-e, dim-stripped)
+  // capture to decide whether anything REAL is parked (see
+  // idleConsideringDimGhost / captureParkedInputView).
+  const idleOrGhost = (plain: string): boolean =>
+    idleConsideringDimGhost(plain, detectPaneState(plain) === 'typing' ? captureParkedInputView(session, host) : null)
   const first = capturePane(session, host)
   if (first == null) return false
-  if (!paneLooksIdle(first)) return false
+  if (paneShowsContextSaturation(first)) {
+    logger.warn({ session }, 'dispatch: refusing prompt — session shows context saturation (100% context)')
+    return false
+  }
+  if (!idleOrGhost(first)) return false
 
   try { execFileSync('/bin/sleep', [PANE_READY_CONFIRM_DELAY_S], { timeout: 2000 }) } catch { /* best effort */ }
 
   const second = capturePane(session, host)
   if (second == null) return false
-  return paneLooksIdle(second)
+  if (paneShowsContextSaturation(second)) {
+    logger.warn({ session }, 'dispatch: refusing prompt — session shows context saturation (100% context)')
+    return false
+  }
+  return idleOrGhost(second)
 }
 
 // How long to wait between the two parked-input captures when deciding whether

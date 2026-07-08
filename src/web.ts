@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { execSync, execFileSync } from 'node:child_process'
 import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID } from './config.js'
 import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-auth.js'
-import { isBlockedCrossOriginWrite } from './web/csrf-origin.js'
+import { isBlockedCrossOriginWrite, originMatchesServedHost } from './web/csrf-origin.js'
 import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
@@ -54,6 +54,8 @@ import { tryHandleSettings } from './web/routes/settings.js'
 import { tryHandleAuditLog } from './web/routes/audit-log.js'
 import { tryHandleStatic } from './web/routes/static.js'
 import { tryHandleVoice } from './web/routes/voice.js'
+import { tryHandleVaultSsh } from './web/routes/vault-ssh.js'
+import { tryHandleVaultSshKeys } from './web/routes/vault-ssh-keys.js'
 import type { RouteContext } from './web/routes/types.js'
 
 const WEB_DIR = join(PROJECT_ROOT, 'web')
@@ -83,11 +85,19 @@ export function startWebServer(port = 3420): http.Server {
     const method = req.method || 'GET'
 
     const origin = req.headers.origin
-    if (origin && allowedOrigins.has(origin)) {
+    // Emit CORS headers for allowlisted origins AND for genuinely same-origin
+    // requests reached via a reverse proxy (e.g. Tailscale Serve's ts.net host,
+    // where the Origin host matches Host / X-Forwarded-Host). Without this, an
+    // iOS Safari preflight for an Authorization-bearing /api/ fetch over the
+    // proxy gets a 204 with no Access-Control-* headers and the browser blocks
+    // the request -- the page shell loads but no data does. Authorization must be
+    // in Allow-Headers or the preflight rejects the Bearer header.
+    if (origin && (allowedOrigins.has(origin) ||
+        originMatchesServedHost(origin, req.headers.host, req.headers['x-forwarded-host'] as string | undefined))) {
       res.setHeader('Access-Control-Allow-Origin', origin)
       res.setHeader('Vary', 'Origin')
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
     }
     if (method === 'OPTIONS') { res.writeHead(204); res.end(); return }
 
@@ -171,6 +181,8 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleToolLog(routeCtx)) return
       if (await tryHandleSettings(routeCtx)) return
       if (await tryHandleVoice(routeCtx)) return
+      if (await tryHandleVaultSshKeys(routeCtx)) return
+      if (await tryHandleVaultSsh(routeCtx)) return
       if (await tryHandleAuditLog(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
