@@ -195,7 +195,20 @@ export function ensureIsolatedChannelConfigDir(
       // process actually reads. (Found 2026-07-03: Ive's pairing worked around
       // this only because the executing agent substituted the correct path from
       // context, not because the skill's literal path was right.)
-      const symlinkTarget = entry === 'channels' ? join(cwd, '.claude', 'channels') : join(realClaude, entry)
+      // "projects" is special for the SAME reason (found 2026-07-08, Gábor-approved
+      // fix): it holds Claude Code's per-session transcripts and the file-based
+      // auto-memory (projects/<cwd>/memory/MEMORY.md). Symlinking it to the shared
+      // ~/.claude/projects pointed every scoped agent's "own" memory at the MAIN
+      // agent's shared memory index -- a cross-agent memory-poisoning surface if a
+      // scoped agent processes injected untrusted content. Isolate it per-agent too.
+      const agentLocalEntry = entry === 'channels' || entry === 'projects'
+      const symlinkTarget = agentLocalEntry ? join(cwd, '.claude', entry) : join(realClaude, entry)
+      if (entry === 'projects') {
+        // Ensure the per-agent target exists so the symlink isn't dangling (Claude
+        // Code writes memory through it); best-effort -- a failure degrades to no
+        // memory, never a spawn failure.
+        try { mkdirSync(symlinkTarget, { recursive: true }) } catch { /* best-effort */ }
+      }
       const link = join(cfg, entry)
       let needsLink = true
       try {
