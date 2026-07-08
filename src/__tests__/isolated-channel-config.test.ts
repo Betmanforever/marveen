@@ -27,8 +27,9 @@ const DI = CHANNEL_PLUGIN_IDS.discord
 function seedSharedClaude(home: string) {
   const claude = join(home, '.claude')
   mkdirSync(claude, { recursive: true })
-  // shared top-level entries; projects/ must end up symlinked (transcripts),
-  // .credentials.json must NOT (auth comes from CLAUDE_CODE_OAUTH_TOKEN env).
+  // shared top-level entries; projects/ must end up symlinked to a PER-AGENT
+  // target (memory-poisoning containment, fix 3789ee5), .credentials.json must
+  // NOT be present (auth comes from CLAUDE_CODE_OAUTH_TOKEN env).
   writeFileSync(join(claude, '.credentials.json'), '{"claudeAiOauth":{}}')
   mkdirSync(join(claude, 'projects'), { recursive: true })
   // settings.json must be OWNED (copied), not symlinked
@@ -67,10 +68,15 @@ describe('ensureIsolatedChannelConfigDir', () => {
     expect(cfg).toBe(join(SANDBOX, 'agents', 'testagent', '.claude-config'))
   })
 
-  it('symlinks shared transcripts so --continue stays shared', () => {
+  it('isolates projects per-agent so a scoped agent cannot poison shared memory', () => {
+    // fix 3789ee5 (Gábor-approved): projects holds Claude Code's file-based
+    // auto-memory; symlinking it to the shared ~/.claude/projects let a scoped
+    // agent processing injected untrusted content write to the coordinator's
+    // memory. It must resolve to the agent's OWN dir instead. Trade-off accepted:
+    // --continue no longer shares transcripts across the isolation boundary.
     const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
     expect(lstatSync(join(cfg, 'projects')).isSymbolicLink()).toBe(true)
-    expect(readlinkSync(join(cfg, 'projects'))).toBe(join(SANDBOX, 'home', '.claude', 'projects'))
+    expect(readlinkSync(join(cfg, 'projects'))).toBe(join(SANDBOX, 'agents', 'testagent', '.claude', 'projects'))
   })
 
   it('does NOT symlink or copy .credentials.json (auth via CLAUDE_CODE_OAUTH_TOKEN env)', () => {
