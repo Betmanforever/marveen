@@ -635,7 +635,10 @@ if command -v systemd-run >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     # Do NOT fall back to a direct in-cgroup stop/start -- that is the self-kill
     # path. Tell the operator to restart by hand instead.
     echo -e "${RED}HIBA:${NC} a detached ujraindito unit inditasa nem sikerult."
-    echo -e "      Inditsd ujra kezzel: systemctl --user restart marveen-dashboard marveen-channels"
+    # Units are named after the install's slug (MAIN_AGENT_ID, read above), not a
+    # hardcoded "marveen-" -- so the hint is correct on renamed installs too.
+    RESTART_SLUG="${MAIN_AGENT_ID:-marveen}"
+    echo -e "      Inditsd ujra kezzel: systemctl --user restart ${RESTART_SLUG}-dashboard ${RESTART_SLUG}-channels"
   fi
 else
   # macOS/launchd, or no user-systemd: no cgroup self-kill, restart directly.
