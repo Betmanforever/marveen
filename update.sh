@@ -598,30 +598,48 @@ fi
 
 # Restart services.
 #
-# BUG FIX (update.sh self-kill): when the update is triggered from the dashboard,
-# update.sh runs INSIDE the marveen-*-dashboard systemd service's cgroup. stop.sh
-# tears that cgroup down, which reaps THIS script before start.sh runs -> both
-# services stay `inactive (dead)` after every update (update.log ends at the
-# "inditas..." line, no "elinditva"). Run the stop+start in a transient systemd
-# scope OUTSIDE our cgroup so the restart completes even though our own process
-# is killed mid-way. The scope is registered with (and survives under) the user
-# systemd manager, independent of the dashboard cgroup.
+# BUG FIX (update.sh self-kill): when the update is triggered from the dashboard
+# or the channels agent, update.sh runs INSIDE the marveen-channels / -dashboard
+# systemd service's cgroup, attached to the channels tmux pty. stop.sh tears that
+# cgroup down (`systemctl --user stop`) and kills that tmux session, so THIS
+# script is SIGKILL'd before start.sh runs -> both services stay `inactive (dead)`
+# after every update (update.log ends at the "inditas..." line, no "elinditva").
 #
-# NOTE: setsid is NOT a valid escape here -- a new session/process-group is still
-# in the same cgroup, so stop.sh would still kill it. Only a separate cgroup
-# (systemd-run --scope) survives. On macOS/launchd there is no cgroup self-kill,
-# so the direct call (else branch) is correct there and is a no-op change.
-echo -e "  Szolgaltatasok ujrainditasa..."
+# A transient systemd --scope was tried first and was NOT enough: --scope is
+# synchronous and stays tied to the CLIENT process (this script), which lives in
+# the doomed cgroup / on the killed tmux pty -- so the scope was reaped together
+# with marveen-channels and the restart still died. We now run stop+start as a
+# fire-and-forget transient systemd USER SERVICE. A service is forked by the user
+# manager into its OWN cgroup under the manager (not under marveen-channels), with
+# no controlling tty, so `systemctl stop marveen-channels` and `tmux kill-session`
+# cannot reach it; it finishes the restart even though this script is killed.
+#
+# Deliberately NO --wait (waiting would re-pin us to the restart's lifetime and
+# reintroduce the coupling) and NO direct-call fallback on the systemd path -- a
+# direct stop/start IS the in-cgroup self-kill this fix removes, so firing it
+# after a failed detach would just reintroduce the bug. Because the service is
+# detached its output no longer flows through our tee into update.log, so the
+# inner command appends stop+start to store/restart.log to preserve the evidence.
+#
+# macOS/launchd (or no user-systemd): no cgroup self-kill, so the direct call
+# (else branch) is correct there and is unchanged.
 if command -v systemd-run >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-  # --scope: run synchronously in a fresh transient scope (its own cgroup).
-  # --collect: garbage-collect the scope unit once it exits.
-  # $INSTALL_DIR is passed as the positional arg so the inner shell sees it even
-  # if the environment is trimmed.
-  systemd-run --user --scope --collect --quiet \
-    bash -c '"$1/scripts/stop.sh"; "$1/scripts/start.sh"' _ "$INSTALL_DIR" \
-    || { "$INSTALL_DIR/scripts/stop.sh"; "$INSTALL_DIR/scripts/start.sh"; }
+  # Unique unit per run (pid + epoch) so a stale/failed unit never blocks us;
+  # --collect garbage-collects it on exit. $INSTALL_DIR is passed as the
+  # positional arg so the inner shell resolves it even with a trimmed env.
+  RESTART_UNIT="marveen-restart-$$-$(date +%s)"
+  echo -e "  Szolgaltatasok ujrainditasa (detached: ${RESTART_UNIT}, log: store/restart.log)..."
+  if ! systemd-run --user --collect --quiet --unit="$RESTART_UNIT" \
+      bash -c '{ echo "=== restart $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; "$1/scripts/stop.sh"; "$1/scripts/start.sh"; } >> "$1/store/restart.log" 2>&1' _ "$INSTALL_DIR"; then
+    # systemd-run could not even START the transient unit (user manager broken?).
+    # Do NOT fall back to a direct in-cgroup stop/start -- that is the self-kill
+    # path. Tell the operator to restart by hand instead.
+    echo -e "${RED}HIBA:${NC} a detached ujraindito unit inditasa nem sikerult."
+    echo -e "      Inditsd ujra kezzel: systemctl --user restart marveen-dashboard marveen-channels"
+  fi
 else
   # macOS/launchd, or no user-systemd: no cgroup self-kill, restart directly.
+  echo -e "  Szolgaltatasok ujrainditasa..."
   "$INSTALL_DIR/scripts/stop.sh"
   "$INSTALL_DIR/scripts/start.sh"
 fi
