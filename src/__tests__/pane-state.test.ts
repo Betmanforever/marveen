@@ -10,6 +10,7 @@ import {
   shouldClearTruncatedPreamble,
   decideSubmitFollowup,
   decidePaneErrorAlert,
+  decideDialogEscalation,
   stuckInputSignature,
   decideStuckInputRecovery,
   parkedChannelInput,
@@ -1335,6 +1336,85 @@ describe('decidePaneErrorAlert', () => {
     expect(skewed.alert).toBe(false)
     expect(skewed.next.firstSeenAt).toBe(500_000)
     expect(skewed.next.lastAlertAt).toBe(null)
+  })
+})
+
+describe('decideDialogEscalation', () => {
+  // Production thresholds: 6-min coordinator grace, 30-min phase-1 dedup.
+  const TH = { graceMs: 360_000, dedupMs: 1_800_000 }
+  const FRESH = { wolfeFlaggedAt: null, gaborNotifiedAt: null }
+
+  it('flags the coordinator on the first sustained detection', () => {
+    const d = decideDialogEscalation(FRESH, 10_000, TH)
+    expect(d.action).toBe('notify-wolfe')
+    expect(d.next.wolfeFlaggedAt).toBe(10_000)
+    expect(d.next.gaborNotifiedAt).toBe(null)
+  })
+
+  it('stays quiet while inside the coordinator grace window', () => {
+    // Flagged at 0, now 5 min (< 6-min grace, < 30-min dedup).
+    const d = decideDialogEscalation({ wolfeFlaggedAt: 0, gaborNotifiedAt: null }, 300_000, TH)
+    expect(d.action).toBe('none')
+    expect(d.next).toEqual({ wolfeFlaggedAt: 0, gaborNotifiedAt: null })
+  })
+
+  it('falls back to the owner once the grace window elapses', () => {
+    // Flagged at 0, now 10 min (> 6-min grace, < 30-min dedup), owner not told.
+    const d = decideDialogEscalation({ wolfeFlaggedAt: 0, gaborNotifiedAt: null }, 600_000, TH)
+    expect(d.action).toBe('fallback-gabor')
+    expect(d.next.wolfeFlaggedAt).toBe(0) // grace origin unchanged
+    expect(d.next.gaborNotifiedAt).toBe(600_000)
+  })
+
+  it('fires the owner fallback at exactly graceMs (inclusive boundary)', () => {
+    const d = decideDialogEscalation({ wolfeFlaggedAt: 0, gaborNotifiedAt: null }, 360_000, TH)
+    expect(d.action).toBe('fallback-gabor')
+  })
+
+  it('alerts the owner at most once per spell', () => {
+    // Owner already told at 10 min; now 25 min (grace long passed, dedup not).
+    const d = decideDialogEscalation({ wolfeFlaggedAt: 0, gaborNotifiedAt: 600_000 }, 1_500_000, TH)
+    expect(d.action).toBe('none')
+    expect(d.next.gaborNotifiedAt).toBe(600_000)
+  })
+
+  it('re-flags the coordinator after the dedup window, without re-alerting the owner', () => {
+    // Persisting dialog, owner told at 10 min, now 30 min (dedup elapsed).
+    const d = decideDialogEscalation({ wolfeFlaggedAt: 0, gaborNotifiedAt: 600_000 }, 1_800_000, TH)
+    expect(d.action).toBe('notify-wolfe')
+    expect(d.next.wolfeFlaggedAt).toBe(1_800_000) // grace timer restarts
+    expect(d.next.gaborNotifiedAt).toBe(600_000) // owner NOT re-alerted this spell
+    // After the re-flag the owner gate still holds: grace passes again but the
+    // owner stays silent for the rest of the spell.
+    const after = decideDialogEscalation(d.next, 1_800_000 + 600_000, TH)
+    expect(after.action).toBe('none')
+  })
+
+  it('re-flags the coordinator (phase 1) in preference to the owner when both are due', () => {
+    // Owner never told, now exactly 30 min: dedup elapsed AND grace long past.
+    // Phase 1 must win -- re-engage the coordinator before re-bothering Gabor.
+    const d = decideDialogEscalation({ wolfeFlaggedAt: 0, gaborNotifiedAt: null }, 1_800_000, TH)
+    expect(d.action).toBe('notify-wolfe')
+    expect(d.next.wolfeFlaggedAt).toBe(1_800_000)
+  })
+
+  it('treats a reset (dialog disappeared) state as a fresh spell', () => {
+    // The caller deletes the map entry when the dialog clears, so the next
+    // dialog on that session sees FRESH and phase 1 fires immediately rather
+    // than inheriting the old spell's throttle.
+    const d = decideDialogEscalation(FRESH, 5_000_000, TH)
+    expect(d.action).toBe('notify-wolfe')
+    expect(d.next.wolfeFlaggedAt).toBe(5_000_000)
+  })
+
+  it('does not stall on backwards clock skew (future flag timestamp)', () => {
+    // now jumps backwards (NTP correction): a stored wolfeFlaggedAt in the
+    // future would drive the deltas negative and stall. Restart the spell from
+    // now and drop the stale owner-fallback time.
+    const d = decideDialogEscalation({ wolfeFlaggedAt: 1_000_000, gaborNotifiedAt: 1_000_000 }, 500_000, TH)
+    expect(d.action).toBe('notify-wolfe')
+    expect(d.next.wolfeFlaggedAt).toBe(500_000)
+    expect(d.next.gaborNotifiedAt).toBe(null)
   })
 })
 

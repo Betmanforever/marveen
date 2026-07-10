@@ -15,6 +15,7 @@ import {
   clearStaleParkedInput,
   sendPromptToSession,
   sessionExistsOnHost,
+  type SendResult,
 } from './agent-process.js'
 import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
@@ -51,6 +52,40 @@ const routerLoggedMisses: Set<number> = new Set()
  */
 export function shouldAbandon(sessionExists: boolean, ageMs: number, windowMs: number): boolean {
   return !sessionExists && ageMs > windowMs
+}
+
+/**
+ * Pure decision: given the outcome of a sendPromptToSession call, should the
+ * router mark the message delivered, or leave it pending for a later retry?
+ *
+ *   - 'landed'  -> 'delivered': the text was submitted (or accepted by a busy
+ *                               pane). Mark the message delivered, as before.
+ *   - 'gave-up' -> 'retry':     the submit-retry budget was spent with the text
+ *                               STILL parked in the input box. Marking it
+ *                               delivered here is the exact "delivered != landed"
+ *                               bug (2026-07-08: a parked-unsubmitted message
+ *                               read delivered=true). Leave it pending instead.
+ *
+ * Kept pure so the router's tmux/db-bound loop stays trivially testable: feed a
+ * SendResult in, assert the outcome out.
+ */
+export function decideDeliveryOutcome(sendResult: SendResult): 'delivered' | 'retry' {
+  return sendResult === 'landed' ? 'delivered' : 'retry'
+}
+
+/**
+ * Pure decision: should a message whose send GAVE UP be hard-abandoned now?
+ *
+ * shouldAbandon() abandons only an ABSENT session, so a PRESENT-but-persistently
+ * -stuck session would keep a gave-up message pending forever -- a fresh send
+ * every 5s tick with no exit. This bounds that: once a gave-up message has
+ * out-waited the full retry window it is abandoned regardless of session
+ * presence, so the delivered!=landed fix cannot trade a false-delivered for an
+ * eternal-retry regression. Strict greater-than mirrors shouldAbandon's
+ * boundary (ageMs === windowMs is NOT yet abandoned).
+ */
+export function shouldAbandonGaveUp(ageMs: number, windowMs: number): boolean {
+  return ageMs > windowMs
 }
 
 // Checks for pending messages every 5 seconds and injects them into target
@@ -211,12 +246,81 @@ export async function runMessageRouterTick(): Promise<void> {
         const { prefix, wrapped } = wrapAgentMessageForDelivery(category, safeFromAgent, msg.from_agent, content)
         // Inline preamble so a fresh session (post hard-restart) doesn't miss
         // the context that explains the tag semantics.
-        sendPromptToSession(session, prefix + wrapped, host)
-        if (!markMessageDelivered(msg.id)) {
-          logger.warn({ id: msg.id }, 'markMessageDelivered affected 0 rows (deleted concurrently?)')
+        //
+        // sendPromptToSession reports whether the text actually LANDED
+        // (submitted / accepted by a busy pane) or the submit-retry budget was
+        // exhausted with the text STILL parked in the input box ('gave-up').
+        // Marking a 'gave-up' send delivered is the exact "delivered != landed"
+        // gap (2026-07-08: a message sat parked-unsubmitted in the pane yet read
+        // delivered=true). Only a 'landed' send is a real delivery.
+        const sendResult = sendPromptToSession(session, prefix + wrapped, host)
+        if (decideDeliveryOutcome(sendResult) === 'delivered') {
+          if (!markMessageDelivered(msg.id)) {
+            logger.warn({ id: msg.id }, 'markMessageDelivered affected 0 rows (deleted concurrently?)')
+          }
+          routerLoggedMisses.delete(msg.id)
+          logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, category: isChannelInbound ? 'channel-inbound' : trusted ? 'trusted-peer' : 'untrusted' }, 'Agent message delivered')
+        } else {
+          // 'gave-up': the submit-retry budget was spent with the text STILL
+          // parked in the target input box (a [Pasted text #N] placeholder or a
+          // multi-row verbatim buffer). Do NOT mark delivered -- leave the
+          // message PENDING so a later tick re-delivers (the delivered!=landed
+          // fix, 2026-07-08 incident).
+          //
+          // DELIBERATELY no same-tick clearInputBuffer + re-send on the retry
+          // path. A bare Ctrl-U is PROVEN not to clear a paste placeholder, and
+          // on a multi-row verbatim buffer clears only the cursor's row (see
+          // discardPlaceholderBuffer in agent-process.ts). An imperfect clear
+          // followed by a re-send would INTERLEAVE the parked remainder with the
+          // resend -- the exact garbage-turn seen in the 2026-07-10 live repro
+          // (charlie msg 745/746: repeated manual Ctrl-U + resend interleaved,
+          // then a junk turn fired on its own). Instead lean on the SAME gate
+          // every FIRST delivery already passes: a parked box reads not-ready to
+          // isSessionReadyForPrompt (a placeholder reads 'busy', parked verbatim
+          // reads 'typing' -- both block a send), so the next tick will NOT
+          // re-send onto it. The retry is therefore gated identically to an
+          // initial send and can never interleave more than a first delivery
+          // can. A parked-'typing' box is additionally recovered by the existing
+          // stale-parked-input janitor (clearStaleParkedInput, ~line 150 above),
+          // the PROVEN, VERIFYING clear (Ctrl-U + C-a/C-k, confirm-empty gate,
+          // operator escalation). Invariant: never accumulate onto the parked
+          // remainder; no re-send until the box is verifiably clean.
+          if (shouldAbandonGaveUp(ageMs, MESSAGE_ABANDON_WINDOW_MS)) {
+            // Past the retry window: abandon so a present-but-stuck session
+            // cannot pin this message pending forever. shouldAbandon() only
+            // bounds an ABSENT session; this bounds the oscillating
+            // clear->resend->gave-up loop against a PRESENT one. The row is
+            // leaving the pending queue, so -- exactly like the catch branch
+            // below -- best-effort clear the fresh parked residue first, so the
+            // stuck-input watcher cannot later submit it as a phantom turn. No
+            // re-send follows this clear, so it carries no interleave risk.
+            try {
+              clearInputBuffer(session, host)
+            } catch (clearErr) {
+              logger.warn({ err: clearErr, id: msg.id, session }, 'Post-give-up input-buffer clear failed')
+            }
+            logger.warn({ id: msg.id, from: msg.from_agent, to: msg.to_agent, ageMs }, 'Agent message abandoned: send gave up (text stayed parked) for full retry window')
+            if (!markMessageFailed(msg.id, 'Abandoned: submit-retry budget exhausted, text stayed parked for full retry window')) {
+              logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
+            }
+            routerLoggedMisses.delete(msg.id)
+          } else {
+            // DOUBLE-DELIVERY note: 'gave-up' requires the text to be STILL
+            // parked (decideSubmitFollowup -> shouldRetrySubmit true), so the
+            // box is not clean and the readiness gate blocks the re-send -- no
+            // interleave. The only residual duplicate is the narrow race where
+            // the parked text auto-submits (phantom turn) between this decision
+            // and the next tick, after which a clean box lets the retry
+            // re-deliver. That race is inherent without an exactly-once ledger,
+            // which is deliberately OUT of scope (the fix targets the
+            // delivered!=landed gap, not a global delivery ledger). Dedupe only
+            // the log so a stuck message does not warn on every 5s tick.
+            if (!routerLoggedMisses.has(msg.id)) {
+              logger.warn({ id: msg.id, to: msg.to_agent, session }, 'Agent message send gave up (text parked); left pending for gate+janitor recovery, will retry')
+              routerLoggedMisses.add(msg.id)
+            }
+          }
         }
-        routerLoggedMisses.delete(msg.id)
-        logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, category: isChannelInbound ? 'channel-inbound' : trusted ? 'trusted-peer' : 'untrusted' }, 'Agent message delivered')
       } catch (err) {
         logger.warn({ err, id: msg.id }, 'Failed to deliver agent message')
         // A failed delivery can abort sendPromptToSession mid-chunk-stream,

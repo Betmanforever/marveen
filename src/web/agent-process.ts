@@ -560,7 +560,45 @@ function startRemoteAgentProcess(
   }
 }
 
-export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}): { ok: boolean; pid?: number; error?: string } {
+// --- Explicit-session resume (kanban agent-restart-resume-flag, 2026-07-10) ---
+// `--continue` picks the LATEST session file by mtime, which made intentional
+// resumes unreliable after file migrations (touch/mtime games failed twice on
+// 2026-07-08). When the caller knows WHICH session to continue, it passes an
+// explicit resumeSessionId and we launch with `--resume <id>` instead. Pure
+// resolver so the precedence/validation is unit-testable; errors are LOUD by
+// design -- a silent fallback to --continue would recreate the original bug.
+const SESSION_ID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function resolveResumeFlag(p: {
+  resumeSessionId?: string
+  fresh: boolean
+  hasChannel: boolean
+  hasPriorSession: boolean
+  sessionFileExists: boolean
+}): { flag: string; error?: string } {
+  if (p.resumeSessionId !== undefined) {
+    // The regex also guarantees the id is shell-safe inside the single-quoted
+    // launch command (hex + dashes only) -- keep validation and interpolation
+    // coupled: never widen the charset without revisiting the quoting.
+    if (!SESSION_ID_RX.test(p.resumeSessionId)) {
+      return { flag: '', error: `Invalid resumeSessionId (expected UUID): ${p.resumeSessionId.slice(0, 64)}` }
+    }
+    if (p.fresh) return { flag: '', error: 'resumeSessionId and fresh are mutually exclusive' }
+    if (p.hasChannel) {
+      // Channel agents must launch fresh (CC 2.1.193: a resumed session never
+      // re-registers the --channels plugin -> deaf bot). Refuse loudly instead
+      // of silently ignoring the explicit resume request.
+      return { flag: '', error: 'resumeSessionId is not supported for channel-having agents (channel plugin only registers on a fresh launch)' }
+    }
+    if (!p.sessionFileExists) {
+      return { flag: '', error: `Session file not found for resumeSessionId ${p.resumeSessionId}` }
+    }
+    return { flag: `--resume '${p.resumeSessionId}' ` }
+  }
+  return { flag: p.hasPriorSession && !p.fresh && !p.hasChannel ? '--continue ' : '' }
+}
+
+export function startAgentProcess(name: string, opts: { fresh?: boolean; resumeSessionId?: string } = {}): { ok: boolean; pid?: number; error?: string } {
   const dir = agentDir(name)
   if (!existsSync(dir)) return { ok: false, error: 'Agent not found' }
 
@@ -568,6 +606,11 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
   // start guard), before any local already-running check / scaffolding.
   const remote = readAgentRemoteConfig(name)
   if (remote.host && remote.workdir) {
+    // Explicit-session resume is local-only (the remote launcher probes with
+    // buildContinueProbeCommand and knows nothing about individual session ids).
+    if (opts.resumeSessionId !== undefined) {
+      return { ok: false, error: 'resumeSessionId is not supported for remote agents' }
+    }
     return startRemoteAgentProcess(name, remote.host, remote.workdir, opts)
   }
 
@@ -796,7 +839,16 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // agents are ALWAYS launched fresh: the lost conversation context is the
     // price of a reachable bot (file/db memory persists either way). Channel-
     // less agents keep --continue to preserve their accumulated context.
-    const continueFlag = (hasPriorSession && !opts.fresh && !hasChannel) ? '--continue ' : ''
+    const resumed = resolveResumeFlag({
+      resumeSessionId: opts.resumeSessionId,
+      fresh: opts.fresh === true,
+      hasChannel,
+      hasPriorSession,
+      sessionFileExists: opts.resumeSessionId !== undefined
+        && existsSync(join(projectsRoot, encodedProject, `${opts.resumeSessionId}.jsonl`)),
+    })
+    if (resumed.error) return { ok: false, error: resumed.error }
+    const continueFlag = resumed.flag
     const stateEnvVar = agentProvider === 'slack' ? 'SLACK_STATE_DIR' : agentProvider === 'discord' ? 'DISCORD_STATE_DIR' : agentProvider === 'googlechat' ? 'GOOGLECHAT_STATE_DIR' : agentProvider === 'teams' ? 'TEAMS_STATE_DIR' : 'TELEGRAM_STATE_DIR'
     const unsetTokens = 'unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN DISCORD_BOT_TOKEN'
     // Slack plugin is third-party; its "not on approved allowlist" check is
@@ -866,7 +918,7 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
       // "your context was lost" prompt would be false there. continueFlag === ''
       // means the launch was fresh (channel agents always are; see line ~675).
       (() => {
-        const fresh = continueFlag === ''
+        const fresh = continueFlag === '' // --resume and --continue both keep context; '' means fresh
         const injectId = shouldInjectRestartContext(fresh, name, MAIN_AGENT_ID) ? name : undefined
         return hasChannel
           ? { waitForChannelPluginMs: CHANNEL_INIT_PENDING_MAX_MS, agentId: injectId }
@@ -935,7 +987,7 @@ export function getAgentProcessInfo(name: string): { running: boolean; session?:
   }
 }
 
-export function restartAgentProcess(name: string, opts: { fresh?: boolean } = {}): { ok: boolean; pid?: number; error?: string } {
+export function restartAgentProcess(name: string, opts: { fresh?: boolean; resumeSessionId?: string } = {}): { ok: boolean; pid?: number; error?: string } {
   if (isAgentRunning(name)) {
     const stopResult = stopAgentProcess(name)
     if (!stopResult.ok) return { ok: false, error: stopResult.error || 'Failed to stop running agent before restart' }
@@ -1326,6 +1378,19 @@ function discardPlaceholderBuffer(session: string, host: string | null = null): 
   return finalPane != null && !detectsPastePlaceholder(finalPane)
 }
 
+// Outcome of a sendPromptToSession call, so a caller can tell a real delivery
+// from a give-up:
+//   - 'landed'  -- the post-send retry loop saw the pane clean OR busy-
+//                  processing (decideSubmitFollowup 'done'), i.e. the text was
+//                  conservatively submitted/accepted.
+//   - 'gave-up' -- the submit-retry budget was spent (or a recovery send-keys
+//                  itself failed) with the text STILL parked in the input box;
+//                  the caller must NOT treat this as delivered.
+// Every existing caller invokes sendPromptToSession in statement (void)
+// position and simply ignores the return -- only the message router reads it,
+// to gate markMessageDelivered (the delivered!=landed fix, 2026-07-08 incident).
+export type SendResult = 'landed' | 'gave-up'
+
 // Send text to a tmux session as if typed at the prompt.
 // Uses execFileSync so callers can pass raw text -- tmux send-keys -l treats
 // the argument as literal characters, bypassing shell quoting entirely.
@@ -1350,7 +1415,7 @@ export function sendPromptToSession(
   text: string,
   host: string | null = null,
   opts: { waitForIdle?: boolean } = {},
-): void {
+): SendResult {
   dismissSurveyModalIfPresent(session, host)
   dismissResumeSummaryModalIfPresent(session, host)
 
@@ -1452,10 +1517,15 @@ export function sendPromptToSession(
     try { execFileSync('/bin/sleep', [SUBMIT_RETRY_POLL_MS], { timeout: 2000 }) } catch { /* best effort */ }
     const pane = capturePane(session, host)
     const action = decideSubmitFollowup(pane, payloadHint, attempt, SUBMIT_RETRY_MAX_ATTEMPTS)
-    if (action === 'done') break
+    // 'done' = pane clean OR busy-processing -> the text was conservatively
+    // submitted/accepted. Report landed.
+    if (action === 'done') return 'landed'
     if (action === 'give-up') {
+      // Retry budget spent with the text STILL parked in the box. Report
+      // gave-up so the router leaves the message pending (retry next tick)
+      // instead of marking it delivered -- the delivered!=landed gap.
       logger.warn({ session, attempt }, 'sendPromptToSession: prompt still parked after retries')
-      break
+      return 'gave-up'
     }
     if (action === 'clear-and-resend') {
       // Placeholder confirmed in the pane (box non-empty, not busy), so the
@@ -1469,8 +1539,10 @@ export function sendPromptToSession(
       try {
         sendChunks()
       } catch (err) {
+        // The recovery resend itself failed -- landing is unproven, so report
+        // gave-up conservatively (a router re-send beats a silently lost turn).
         logger.warn({ err, session, attempt }, 'Clear-and-resend chunk replay failed')
-        break
+        return 'gave-up'
       }
       continue
     }
@@ -1478,8 +1550,9 @@ export function sendPromptToSession(
     try {
       runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
     } catch (err) {
+      // The retry-Enter send-keys failed -- landing unproven, report gave-up.
       logger.warn({ err, session, attempt }, 'Retry-Enter send failed')
-      break
+      return 'gave-up'
     }
   }
 }

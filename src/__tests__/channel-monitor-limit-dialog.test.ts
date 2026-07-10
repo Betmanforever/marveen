@@ -68,9 +68,42 @@ describe('channel-monitor: limit-aware menu-recovery alert', () => {
     expect(limitAlertIdx).toBeGreaterThan(escapeIdx)
   })
 
-  it('the D1 permission-dialog escalation path is untouched', () => {
+  it('the D1 permission-dialog path escalates to the coordinator first (two-phase)', () => {
     const region = menuRecoveryRegion()
-    expect(region).toContain('engedely-dialogusban all es dontesre var')
+    // The pure two-phase decision drives the branch...
+    expect(region).toContain('decideDialogEscalation(prevEsc, Date.now()')
+    // ...phase 1 flags the coordinator (mr-wolfe) as an inter-agent message
+    // FROM the stuck sub-agent (decision-flag.py convention)...
+    expect(region).toContain('createAgentMessage(t.agentName, MAIN_AGENT_ID, buildDialogCoordinatorFlag(label))')
+    expect(region).toContain("esc.action === 'notify-wolfe'")
+    // ...and only phase 2 (grace expired) falls back to a direct owner alert.
+    expect(region).toContain("esc.action === 'fallback-gabor'")
+    expect(region).toContain('sendAlert(buildDialogOwnerFallback(label))')
+    // Escalation is sub-agent-scoped (the main session runs skip-permissions).
+    expect(region).toContain('if (!t.isMarveen && t.agentName) {')
+    // The old raw "attach to the terminal and decide" alert is gone from the
+    // permission-dialog path (the fleet-rule violation Gabor complained about).
+    expect(region).not.toContain('engedely-dialogusban all es dontesre var')
+  })
+
+  it('the coordinator flag uses the [AUTOMATIKUS DECISION-FLAG] shape, no tmux/marker leak', () => {
+    // Mirrors scripts/hooks/decision-flag.py so mr-wolfe's triage skill
+    // recognises it; must never direct anyone to a terminal, and must not
+    // carry a literal [DONTESRE-VAR:...] marker (the Stop hook false-detects it).
+    const s = src.indexOf('function buildDialogCoordinatorFlag')
+    const flag = src.slice(s, src.indexOf('\n}\n', s))
+    expect(flag).toContain('[AUTOMATIKUS DECISION-FLAG]')
+    expect(flag).toContain('permission_prompt csatorna')
+    expect(flag).not.toContain('tmux attach')
+    expect(flag).not.toContain('[DONTESRE-VAR:')
+  })
+
+  it('the owner fallback is human-friendly (no tmux attach, no raw session-id)', () => {
+    const s = src.indexOf('function buildDialogOwnerFallback')
+    const fallback = src.slice(s, src.indexOf('\n}\n', s))
+    expect(fallback).toContain('egy engedelyt igenylo lepesnel megallt')
+    expect(fallback).not.toContain('tmux attach')
+    expect(fallback).not.toContain('t.session')
   })
 })
 

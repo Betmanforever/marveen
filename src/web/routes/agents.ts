@@ -1503,9 +1503,16 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     }
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     // Optional { "fresh": true } body -> no `--continue` (see /start note).
+    // Optional { "resumeSessionId": "<uuid>" } -> `--resume <id>` instead of
+    // `--continue` (explicit-session resume; validated in agent-process).
     let restartFresh = false
-    try { restartFresh = JSON.parse((await readBody(req)).toString() || '{}').fresh === true } catch {}
-    const result = restartAgentProcess(name, { fresh: restartFresh })
+    let resumeSessionId: string | undefined
+    try {
+      const body = JSON.parse((await readBody(req)).toString() || '{}')
+      restartFresh = body.fresh === true
+      if (typeof body.resumeSessionId === 'string') resumeSessionId = body.resumeSessionId
+    } catch {}
+    const result = restartAgentProcess(name, { fresh: restartFresh, resumeSessionId })
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
     return true

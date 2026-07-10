@@ -25,6 +25,7 @@ import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent, channelPluginInitPending } from './channel-plugin-unlock.js'
 import {
   detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, detectsPermissionDialog, type PaneErrorAlertState, type PaneState,
+  decideDialogEscalation, type DialogEscalationState,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
   parkedInputText, shouldClearTruncatedPreamble,
   parkedInputRowCount, submitLanded, decideStuckInputAction,
@@ -402,11 +403,92 @@ const MENU_RECOVER_DEDUP_MS = 5 * 60 * 1000
 const MENU_RECOVER_CLEAR_MS = 2 * 60 * 1000
 
 // A permission dialog is NOT auto-recovered (Escape would reject the tool call),
-// so it can legitimately sit for a human-decision timescale. The 5-min menu
-// dedup would then emit ~12 operator alerts/hour. Throttle the escalation alert
-// on its own longer timer (the Escape-suppression itself is unconditional).
-const paneDialogAlertAt: Map<string, number> = new Map()
+// so it can legitimately sit for a human-decision timescale. Escalation is
+// two-phase per session: the coordinator (mr-wolfe) is flagged FIRST via an
+// inter-agent message so it can resolve the dialog or humanise the decision,
+// and only if the coordinator has not cleared it within DIALOG_WOLFE_GRACE_MS
+// does a DIRECT owner alert fire as the safety net. A raw technical alert
+// straight to the owner (the old behaviour) violated the "never send Gabor to a
+// sub-agent terminal" fleet rule and Gabor complained about it. The decision
+// itself lives in the pure decideDialogEscalation so it is tmux/db-free
+// testable; this map only persists the state. The Escape-suppression stays
+// unconditional. Cleared when the dialog disappears (see the menu-clear path).
+const paneDialogEscalation: Map<string, DialogEscalationState> = new Map()
+// Phase-1 dedup: re-flag the coordinator for the SAME persisting dialog at most
+// this often (the 5-min menu dedup would otherwise emit ~12 flags/hour).
 const DIALOG_ESCALATE_DEDUP_MS = 30 * 60 * 1000
+// Grace after the coordinator is flagged before the direct owner fallback fires.
+const DIALOG_WOLFE_GRACE_MS = 6 * 60 * 1000
+
+// Second call-site for the SAME two-phase escalation: the thinking-block wedge
+// (see the pane-level error pass). Kept in its OWN map so it can never cross-
+// throttle the permission-dialog escalation above -- a session could in
+// principle hit one then the other, and a shared map would let one spell's
+// timestamps suppress the other's flag. Reuses decideDialogEscalation + the
+// DIALOG_* timing unchanged; only the trigger differs (a confirmed error spell,
+// not a permission dialog) and the wording (manual reset, not approve/deny).
+const paneErrorEscalation: Map<string, DialogEscalationState> = new Map()
+
+// The [AUTOMATIKUS DECISION-FLAG] inter-agent message sent to the coordinator
+// (mr-wolfe) when a sub-agent is parked in a permission dialog. Shape mirrors
+// scripts/hooks/decision-flag.py so the marveen-auto-decision-flag-triage skill
+// triages it identically: it names the agent, states the permission_prompt
+// stall, carries the escalation-governance rule, and warns against sending raw
+// keys back to a dialog. Deliberately NO `tmux attach` / raw session-id, and no
+// literal [DONTESRE-VAR:...] marker (which the Stop hook would false-detect).
+function buildDialogCoordinatorFlag(label: string): string {
+  return (
+    `[AUTOMATIKUS DECISION-FLAG] A(z) ${label} sub-agent kore dontesre/inputra varva ragadt egy ` +
+    'engedely-dialogusban (permission_prompt csatorna) -- a watchdog a pane-scan alapjan eszlelte, ' +
+    'NEM kuldott Escape-et (az elutasitana a folyamatban levo muveletet es megszakitana a kort). ' +
+    'Dontsd el: oldd fel kozvetlenul, ha egy mar jovahagyott feladat artalmatlan, egyertelmu-default ' +
+    'lepese, VAGY forditsd emberi nyelvre es told tovabb Telegramon, ha Gabor-szintu dontes. ' +
+    'Permission-dialogusra varo agentnek NE uzenj vissza nyers billentyut a message-routeren keresztul ' +
+    '(a tmux-kezbesites gombot nyomhat a dialoguson) -- celzott send-keys vagy Telegram-eszkalacio a helyes ut.'
+  )
+}
+
+// The direct owner (Gabor) fallback, fired only after the coordinator grace
+// expires. Human-friendly by design: no tmux command, no raw session-id -- the
+// exact complaint that motivated this change.
+function buildDialogOwnerFallback(label: string): string {
+  return (
+    `⚠️ A(z) ${label} egy engedelyt igenylo lepesnel megallt es tobb perce dontesre var, ` +
+    'a koordinator pedig nem oldotta fel. Ha raersz, nezd meg.'
+  )
+}
+
+// The [AUTOMATIKUS DECISION-FLAG] inter-agent message sent to the coordinator
+// (mr-wolfe) when a sub-agent is wedged on the thinking-block API error. Same
+// shape / triage contract as buildDialogCoordinatorFlag (see
+// marveen-auto-decision-flag-triage), but the resolution differs: the session
+// history is corrupt so every prompt returns the same 400, the watchdog
+// deliberately never auto-resets (a false positive must not nuke a healthy
+// agent), and the ONLY fix is a manual stop+start for a fresh session -- which
+// mr-wolfe can do directly. Deliberately NO `tmux attach` / raw session-id, and
+// no literal [DONTESRE-VAR:...] marker (the Stop hook would false-detect it).
+function buildThinkingBlockCoordinatorFlag(label: string): string {
+  return (
+    `[AUTOMATIKUS DECISION-FLAG] A(z) ${label} sub-agent egy thinking-block API hibaban ragadt ` +
+    '(a session-history korrupt, minden uj prompt ugyanazt a 400-at adja) -- a watchdog a pane-scan ' +
+    'alapjan eszlelte, es SZANDEKOSAN nem inditott auto-resetet (egy false-positive nem nukealhat egy ' +
+    'egeszseges agentet). A megoldas KEZI RESET: allitsd le es inditsd ujra az agentet (stop+start), ' +
+    'friss session indul -- ez a te hataskoreben van, futtasd le. A korrupt session-t prompttal NEM ' +
+    'lehet feloldani, ezert NE uzenj neki nyers billentyut vagy promptot a message-routeren keresztul. ' +
+    'Ha a reset utan is visszater vagy nem tudod vegrehajtani, forditsd emberi nyelvre es told tovabb Gabornak Telegramon.'
+  )
+}
+
+// The direct owner (Gabor) fallback for the thinking-block wedge, fired only
+// after the coordinator grace expires. Human-friendly by design: no tmux
+// command, no raw session-id, and no 400/thinking-block jargon -- just that the
+// agent is stuck and likely needs a restart.
+function buildThinkingBlockOwnerFallback(label: string): string {
+  return (
+    `⚠️ A(z) ${label} egy ismetlodo API-hibaba ragadt es tobb perce nem tud dolgozni, ` +
+    'a koordinator pedig nem allitotta helyre. Valoszinuleg ujrainditas kell hozza. Ha raersz, nezd meg.'
+  )
+}
 
 // The plan usage-limit dialog is a recurring special case: model-fallback
 // respawns the limited session, the respawn re-hits the same plan-wide limit
@@ -414,7 +496,7 @@ const DIALOG_ESCALATE_DEDUP_MS = 30 * 60 * 1000
 // (observed 2026-07-05: 5 alerts in one 35-min limit window). One alert per
 // limit window is enough -- the alert itself says model-fallback handles it.
 // The per-cycle recovery Escape is NOT throttled by this, only the operator
-// alert + the resume nudge. Unlike paneDialogAlertAt this timestamp must
+// alert + the resume nudge. Unlike paneDialogEscalation this timestamp must
 // SURVIVE the paneMenuState clear (every respawn cycle fully clears the menu
 // spell); it resets only once the menu is gone AND the pane no longer shows
 // the limit banner, i.e. the window is actually over.
@@ -1227,27 +1309,98 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     }
 
     // Pane-level thinking-block error detection. Independent of channel
-    // plugin liveness: a session can keep a live plugin yet be wedged on
-    // the API error, every injected prompt yielding another 400. Detect
-    // it via the pane state and alert (never auto-reset).
+    // plugin liveness: a session can keep a live plugin yet be wedged on the
+    // API error, every injected prompt yielding another 400. Detect it via the
+    // pane state and escalate (never auto-reset -- a false positive must not
+    // nuke a healthy agent). Escalation mirrors the permission-dialog path:
+    // flag the coordinator (mr-wolfe) FIRST so it can restart the corrupt
+    // session, and fall back to a direct owner alert only after the grace.
     for (const t of targets) {
+      const now = Date.now()
       const pane = capturePane(t.session)
       const isError = pane != null && detectPaneState(pane) === 'error'
       const prev = paneErrorState.get(t.session) ?? { firstSeenAt: null, lastAlertAt: null, lastErrorAt: null }
-      const decision = decidePaneErrorAlert(isError, prev, Date.now(), {
+      const decision = decidePaneErrorAlert(isError, prev, now, {
         confirmMs: PANE_ERROR_CONFIRM_MS,
         dedupMs: PANE_ERROR_DEDUP_MS,
         clearMs: PANE_ERROR_CLEAR_MS,
       })
       if (decision.next.firstSeenAt === null) {
         paneErrorState.delete(t.session)
+        // Spell fully cleared: drop the two-phase escalation state too, so a
+        // future wedge on this session starts fresh (flags the coordinator
+        // promptly instead of inheriting a stale dedup/grace timestamp).
+        paneErrorEscalation.delete(t.session)
       } else {
         paneErrorState.set(t.session, decision.next)
       }
-      if (decision.alert) {
+      // Drive the escalation off the CONFIRMED error spell on THIS tick, NOT
+      // decision.alert. decision.alert is throttled to once per
+      // PANE_ERROR_DEDUP_MS (30 min); binding the two-phase escalation to it
+      // would make the 6-min owner-fallback grace unmeasurable -- the next
+      // escalation check would be a full 30 min away. That is the dedup
+      // conflict between decidePaneErrorAlert's 30-min alert-dedup and
+      // decideDialogEscalation's 6-min grace. Resolution: decidePaneErrorAlert
+      // stays PURELY the confirm+clear-hysteresis gate (flapping protection),
+      // and decideDialogEscalation drives dedup+grace on its own map, re-run
+      // every ~60s tick while the spell is confirmed (unlike the permission
+      // dialog, whose menu-recovery machine re-confirms every ~5 min). Gating
+      // on isError -- not just next.firstSeenAt !== null -- keeps the old "alert
+      // only while actually wedged" semantics: a clearMs hysteresis tick
+      // (error-free but spell still held) must NOT escalate, while the
+      // escalation state still survives a one-tick capture flap.
+      const spellConfirmed = isError
+        && decision.next.firstSeenAt !== null
+        && now - decision.next.firstSeenAt >= PANE_ERROR_CONFIRM_MS
+      if (spellConfirmed) {
         const label = t.isMarveen ? BOT_NAME : (t.agentName ?? t.session)
-        logger.error({ session: t.session, agent: label }, 'Agent wedged on thinking-block API error -- manual reset needed')
-        sendAlert(`🚨 A(z) ${label} agens elakadt egy thinking-block API hibaban (a session-history korrupt, minden uj prompt ugyanazt a 400-at adja). Kezi reset kell: allitsd le es inditsd ujra, friss session indul. Reszletek: tmux attach -t ${t.session}`)
+        const prevEsc = paneErrorEscalation.get(t.session) ?? { wolfeFlaggedAt: null, gaborNotifiedAt: null }
+        if (!t.isMarveen && t.agentName) {
+          // Two-phase, sub-agent-scoped: flag the coordinator (mr-wolfe) FIRST
+          // via an inter-agent message so it can restart the corrupt session
+          // (stop+start -> fresh session); fall back to a DIRECT owner alert
+          // only if the coordinator has not resolved it within the grace
+          // window. The pure decideDialogEscalation owns the dedup+grace
+          // timing; this branch is just the I/O, reusing the permission
+          // dialog's shared DIALOG_* constants.
+          const esc = decideDialogEscalation(prevEsc, now, {
+            graceMs: DIALOG_WOLFE_GRACE_MS,
+            dedupMs: DIALOG_ESCALATE_DEDUP_MS,
+          })
+          paneErrorEscalation.set(t.session, esc.next)
+          if (esc.action === 'notify-wolfe') {
+            logger.error({ session: t.session, agent: label }, 'Agent wedged on thinking-block API error -- flagging coordinator (mr-wolfe) for manual reset')
+            try {
+              // from = the wedged sub-agent, to = coordinator: matches the
+              // decision-flag.py hook convention so mr-wolfe receives it as a
+              // trusted-peer "[Uzenet @<agent>-tol]" flag. t.agentName is a
+              // listAgentNames() entry, so it survives sanitizeAgentIdent.
+              createAgentMessage(t.agentName, MAIN_AGENT_ID, buildThinkingBlockCoordinatorFlag(label))
+            } catch (err) {
+              // Router enqueue failed -- do not lose the escalation; fall
+              // straight to the direct owner alert.
+              logger.warn({ err, session: t.session }, 'Thinking-block coordinator flag enqueue failed -- direct owner fallback')
+              sendAlert(buildThinkingBlockOwnerFallback(label))
+            }
+          } else if (esc.action === 'fallback-gabor') {
+            logger.error({ session: t.session, agent: label }, 'Thinking-block wedge unresolved after coordinator grace -- direct owner fallback')
+            sendAlert(buildThinkingBlockOwnerFallback(label))
+          }
+        } else {
+          // The main channels session IS the coordinator: it cannot flag itself
+          // to restart its own wedge, and a thinking-block-wedged main agent
+          // could not act on an inter-agent message anyway. Unlike the
+          // permission-dialog case (skip-permissions means main never parks in a
+          // dialog), main CAN genuinely hit this error, so keep a single
+          // 30-min-throttled DIRECT owner alert as the safety net. Reuses the
+          // same map (wolfeFlaggedAt as the throttle stamp) so the cleanup path
+          // clears one map, not two.
+          if (prevEsc.wolfeFlaggedAt === null || now - prevEsc.wolfeFlaggedAt >= DIALOG_ESCALATE_DEDUP_MS) {
+            paneErrorEscalation.set(t.session, { wolfeFlaggedAt: now, gaborNotifiedAt: prevEsc.gaborNotifiedAt })
+            logger.error({ session: t.session, agent: label }, 'Main channels session wedged on thinking-block API error -- direct owner alert (no coordinator to delegate to)')
+            sendAlert(buildThinkingBlockOwnerFallback(label))
+          }
+        }
       }
     }
 
@@ -1271,10 +1424,12 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       })
       if (decision.next.firstSeenAt === null) {
         paneMenuState.delete(t.session)
-        // Modal fully cleared: reset the dialog-escalation throttle so a future
-        // dialog on this session alerts promptly rather than inheriting a stale
-        // timestamp.
-        paneDialogAlertAt.delete(t.session)
+        // Modal fully cleared: reset the two-phase dialog-escalation state
+        // (coordinator-flag + owner-fallback timestamps) so a future dialog on
+        // this session starts as a fresh spell rather than inheriting a stale
+        // one -- phase 1 flags the coordinator promptly instead of being
+        // throttled by a previous spell's timestamp.
+        paneDialogEscalation.delete(t.session)
         // The limit-dialog throttle is stickier: a model-fallback respawn
         // clears the menu spell mid-window (fresh pane, no modal yet) while
         // the limit itself still holds, so clearing here unconditionally would
@@ -1297,17 +1452,54 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
         // untouched" that the menu recovery assumes. Never auto-Escape it;
         // escalate to a human, who can approve/deny deliberately.
         if (pane != null && detectsPermissionDialog(pane)) {
-          // Escape-suppression is unconditional; the operator alert is throttled
-          // on its own 30-min timer so a dialog held for a human decision does
-          // not spam (the 5-min menu dedup would emit ~12 alerts/hour).
-          const lastDialogAlert = paneDialogAlertAt.get(t.session) ?? 0
-          if (Date.now() - lastDialogAlert >= DIALOG_ESCALATE_DEDUP_MS) {
-            paneDialogAlertAt.set(t.session, Date.now())
-            logger.warn({ session: t.session, agent: label }, 'Session parked in a permission dialog -- NOT sending Escape, escalating to operator')
-            sendAlert(`⚠️ A(z) ${label} session engedely-dialogusban all es dontesre var. NEM kuldtem Escape-et (az elutasitana a folyamatban levo muveletet es megszakitana a kort). Nezd meg es dontsd el: tmux attach -t ${t.session}`)
+          // Escape-suppression is unconditional. Escalation is two-phase and
+          // sub-agent-scoped: flag the coordinator (mr-wolfe) FIRST via an
+          // inter-agent message, and only fall back to a direct owner alert if
+          // the coordinator has not cleared the dialog within the grace window.
+          // The pure decideDialogEscalation owns the timing (dedup + grace);
+          // this branch is just the I/O.
+          const prevEsc = paneDialogEscalation.get(t.session) ?? { wolfeFlaggedAt: null, gaborNotifiedAt: null }
+          if (!t.isMarveen && t.agentName) {
+            const esc = decideDialogEscalation(prevEsc, Date.now(), {
+              graceMs: DIALOG_WOLFE_GRACE_MS,
+              dedupMs: DIALOG_ESCALATE_DEDUP_MS,
+            })
+            paneDialogEscalation.set(t.session, esc.next)
+            if (esc.action === 'notify-wolfe') {
+              logger.warn({ session: t.session, agent: label }, 'Session parked in a permission dialog -- NOT sending Escape, flagging coordinator (mr-wolfe)')
+              try {
+                // from = the stuck sub-agent, to = coordinator: matches the
+                // decision-flag.py hook convention, so mr-wolfe receives it as a
+                // trusted-peer "[Uzenet @<agent>-tol]" flag. t.agentName is a
+                // listAgentNames() entry (already used as an agent id by the
+                // menu-recovery nudge below), so it survives sanitizeAgentIdent.
+                createAgentMessage(t.agentName, MAIN_AGENT_ID, buildDialogCoordinatorFlag(label))
+              } catch (err) {
+                // Router enqueue failed -- do not lose the escalation; fall
+                // straight to the direct owner alert so a stuck dialog is never
+                // silently dropped.
+                logger.warn({ err, session: t.session }, 'Permission-dialog coordinator flag enqueue failed -- direct owner fallback')
+                sendAlert(buildDialogOwnerFallback(label))
+              }
+            } else if (esc.action === 'fallback-gabor') {
+              logger.warn({ session: t.session, agent: label }, 'Permission dialog unresolved after coordinator grace -- direct owner fallback')
+              sendAlert(buildDialogOwnerFallback(label))
+            }
+          } else {
+            // Main channels session runs --dangerously-skip-permissions and so
+            // never actually reaches here; if it ever did, the coordinator
+            // cannot delegate its own dialog to itself. Keep a single
+            // 30-min-throttled DIRECT owner alert as a defensive net, reusing
+            // the same map (wolfeFlaggedAt as the throttle stamp) so the
+            // cleanup path clears one map, not two.
+            if (prevEsc.wolfeFlaggedAt === null || Date.now() - prevEsc.wolfeFlaggedAt >= DIALOG_ESCALATE_DEDUP_MS) {
+              paneDialogEscalation.set(t.session, { wolfeFlaggedAt: Date.now(), gaborNotifiedAt: prevEsc.gaborNotifiedAt })
+              logger.warn({ session: t.session, agent: label }, 'Main channels session parked in a permission dialog -- direct owner alert (no coordinator to delegate to)')
+              sendAlert(buildDialogOwnerFallback(label))
+            }
           }
         } else {
-          paneDialogAlertAt.delete(t.session)
+          paneDialogEscalation.delete(t.session)
           // The Claude plan limit modal ("You've hit your session limit ·
           // resets 3:10am") wears the same navigable-modal footer as a genuine
           // menu, so the canned "(pl. /mcp)" alert misdiagnosed it (observed

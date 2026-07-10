@@ -967,6 +967,85 @@ export function decidePaneErrorAlert(
   return { alert: false, next: { firstSeenAt: prev.firstSeenAt, lastAlertAt: prev.lastAlertAt, lastErrorAt: now } }
 }
 
+export type DialogEscalationAction = 'notify-wolfe' | 'fallback-gabor' | 'none'
+
+export interface DialogEscalationState {
+  /** When the coordinator (mr-wolfe) was last flagged for the CURRENT dialog
+   * spell, or null when no spell is active / not yet flagged. Doubles as the
+   * phase-1 dedup anchor AND the grace-timer origin. The caller deletes the
+   * whole entry when the dialog disappears, so a future dialog starts as a
+   * fresh spell. */
+  wolfeFlaggedAt: number | null
+  /** When the direct owner (Gabor) fallback was sent during the CURRENT spell,
+   * or null if not yet. Gates the fallback to at most once per spell -- a
+   * phase-1 re-flag deliberately does NOT reset it. */
+  gaborNotifiedAt: number | null
+}
+
+export interface DialogEscalationThresholds {
+  /** How long after the coordinator was flagged, with the dialog still up,
+   * before the direct owner fallback fires (the last-resort safety net). */
+  graceMs: number
+  /** Minimum gap before the coordinator is re-flagged for the SAME persisting
+   * dialog, so a long-stuck dialog is periodically resurfaced to the
+   * coordinator without flooding its inbox. */
+  dedupMs: number
+}
+
+export interface DialogEscalationDecision {
+  action: DialogEscalationAction
+  next: DialogEscalationState
+}
+
+/**
+ * Pure two-phase escalation decision for a session parked in a permission
+ * dialog. Phase 1 flags the coordinator (mr-wolfe) via an inter-agent message
+ * so it can resolve the dialog or humanise the decision for the owner; phase 2
+ * falls back to a DIRECT owner alert only if the coordinator has not cleared
+ * the dialog within the grace window. Dependency-free so it is unit-testable
+ * without tmux / db: feed the persisted per-session state + a clock, get back
+ * the action to take + the next state to persist.
+ *
+ * The caller invokes this each time the menu-recovery machine re-confirms the
+ * dialog (~every MENU_RECOVER_DEDUP_MS while it persists), so the cadence is:
+ *   - first sustained sighting            -> 'notify-wolfe'   (flag coordinator)
+ *   - within graceMs of the flag          -> 'none'
+ *   - graceMs elapsed, still up, owner not yet told -> 'fallback-gabor'
+ *   - owner already told this spell        -> 'none'
+ *   - dedupMs elapsed since the flag, still up -> 'notify-wolfe' again
+ *     (re-engage the coordinator; the owner-fallback gate is NOT reset, so the
+ *     owner is still alerted at most once per spell).
+ *
+ * A future-dated stored timestamp (wall-clock skew / NTP correction) counts as
+ * "flag now" rather than stalling the deltas negative, mirroring
+ * decidePaneErrorAlert's skew guard.
+ */
+export function decideDialogEscalation(
+  state: DialogEscalationState,
+  now: number,
+  thresholds: DialogEscalationThresholds,
+): DialogEscalationDecision {
+  const { wolfeFlaggedAt, gaborNotifiedAt } = state
+  // Clock skew: a stored flag time in the future would drive the deltas
+  // negative and stall the machine. Restart the spell from now and drop the
+  // stale owner-fallback time.
+  if (wolfeFlaggedAt !== null && now < wolfeFlaggedAt) {
+    return { action: 'notify-wolfe', next: { wolfeFlaggedAt: now, gaborNotifiedAt: null } }
+  }
+  // Phase 1: the first flag of the spell, or a dedup-throttled re-flag while
+  // the same dialog persists. The re-flag preserves gaborNotifiedAt so the
+  // owner is not re-alerted.
+  if (wolfeFlaggedAt === null || now - wolfeFlaggedAt >= thresholds.dedupMs) {
+    return { action: 'notify-wolfe', next: { wolfeFlaggedAt: now, gaborNotifiedAt } }
+  }
+  // Phase 2: coordinator flagged but the grace window has elapsed with the
+  // dialog still up -> direct owner fallback, at most once per spell.
+  if (now - wolfeFlaggedAt >= thresholds.graceMs && gaborNotifiedAt === null) {
+    return { action: 'fallback-gabor', next: { wolfeFlaggedAt, gaborNotifiedAt: now } }
+  }
+  return { action: 'none', next: state }
+}
+
 // A stable signature of the text parked in the live input box, or null
 // when the pane is not in the 'typing' (parked-input) state.
 //
