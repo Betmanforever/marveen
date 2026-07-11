@@ -26,7 +26,7 @@ $CLAUDE --dangerously-skip-permissions \
   -p "Reggeli napindító - készítsd el és küld el Telegramra (chat_id: $CHAT_ID).
 
 1. Email check: search_emails az elmúlt 12 órából, szűrd ki a spam/promo emaileket
-2. Naptár: list-events a mai napra a $CALENDAR_ID naptárból (Europe/Budapest timezone)
+2. Naptár: getCalendarEvents a mai napra a $CALENDAR_ID naptárból (Europe/Budapest timezone)
 3. AI hírek: WebSearch \"AI news [tegnapi dátum]\"
 4. Küld el Telegramra a reply tool-lal (chat_id: $CHAT_ID)
 
