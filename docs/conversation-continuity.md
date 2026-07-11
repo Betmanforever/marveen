@@ -35,9 +35,21 @@ agent behaviour (which can fail or restart).
 
    The agent does not need to *remember* to look — the context and the open question
    are already in front of it.
+4b. **Mid-turn capture** — `UserPromptSubmit` only fires when a prompt STARTS a
+   turn. A message arriving **while a turn is already running** (async injection
+   alongside a tool result) never passes through it — this lost real messages
+   (kanban cab2c7e3, message_ids 1600/1605, 2026-07-11). The second capture path,
+   `scripts/hooks/ledger-midturn-scan.py` (matcher-less `PostToolUse` + `Stop`),
+   scans the session transcript (JSONL) incrementally for `<channel>` blocks in
+   user entries and records them with `created_at` taken from the message's own
+   `ts` attribute (its true arrival time — a late capture must not sort after
+   the reply that answered it, or it would read as a phantom open question to
+   the drain). Overlap with the UserPromptSubmit path is deduped by the
+   `UNIQUE(agent_id, chat_id, 'in', message_id)` constraint. Regression tests:
+   `src/__tests__/ledger-midturn-scan.test.ts`.
 5. **Live-session drain** — `SessionStart` replay only fires on a *respawn*, but a
    message can also be lost in an **already-running** session (a mid-session
-   deafness gap): capture still records it, yet the live session never sees it
+   deafness gap): capture (either path above) still records it, yet the live session never sees it
    until the next respawn. `scripts/hooks/ledger-live-drain.py` (run every ~2 min
    by the `ledger-live-drain` scheduled task in the live session) re-surfaces the
    still-unanswered inbound — `OPEN_QUESTION chat_id=… message_id=…\n<text>` on

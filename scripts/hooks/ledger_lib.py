@@ -12,6 +12,7 @@ derived from the running session's cwd so each session only ever sees its OWN
 chat. Pure stdlib (sqlite3) -- no node startup, no jq.
 """
 import os
+import re
 import sqlite3
 import time
 
@@ -34,6 +35,55 @@ CREATE TABLE IF NOT EXISTS conversation_log (
 INDEX = "CREATE INDEX IF NOT EXISTS idx_convlog_agent ON conversation_log(agent_id, created_at)"
 
 RECENT_LIMIT = 20
+
+# <channel source="plugin:telegram:telegram" chat_id="X" message_id="Y" ... ts="Z">
+#   TEXT
+# </channel>
+# Single source of truth for BOTH capture paths (UserPromptSubmit prompt text
+# and the mid-turn transcript scan) so they can never drift apart.
+CHANNEL_RX = re.compile(
+    r'<channel\s+source="plugin:telegram:telegram"([^>]*)>(.*?)</channel>',
+    re.DOTALL,
+)
+
+
+def _attr(attrs, name):
+    m = re.search(name + r'="([^"]*)"', attrs)
+    return m.group(1) if m else None
+
+
+def extract_channel_messages(text):
+    """All <channel source=telegram> blocks in `text` as dicts with chat_id,
+    message_id, ts and text. Blocks missing chat_id or message_id are skipped
+    (nothing to dedup on)."""
+    out = []
+    for m in CHANNEL_RX.finditer(text or ""):
+        attrs, body = m.group(1), m.group(2)
+        chat_id = _attr(attrs, "chat_id")
+        message_id = _attr(attrs, "message_id")
+        if chat_id and message_id:
+            out.append({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "ts": _attr(attrs, "ts"),
+                "text": body.strip(),
+            })
+    return out
+
+
+def ts_to_epoch(ts):
+    """Channel `ts` attribute (UTC ISO-8601, trailing Z) -> unix epoch, or None.
+    Used so a LATE capture (mid-turn scan running after the reply was already
+    logged) still records the message at its TRUE arrival time -- otherwise the
+    inbound would sort after its own answer and read as a phantom open
+    question to the live-drain."""
+    if not ts:
+        return None
+    try:
+        import datetime
+        return int(datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
 
 
 def db_path():
@@ -117,15 +167,18 @@ def connect():
     return con
 
 
-def log_inbound(agent_id, chat_id, message_id, text, ts):
-    """Record an inbound user message. Idempotent on (agent_id, chat_id, in, message_id)."""
+def log_inbound(agent_id, chat_id, message_id, text, ts, created_at=None):
+    """Record an inbound user message. Idempotent on (agent_id, chat_id, in, message_id).
+    created_at defaults to now; a late capture path (mid-turn scan) passes the
+    message's true arrival epoch instead, so ledger ordering stays truthful."""
     con = connect()
     try:
         con.execute(
             "INSERT OR IGNORE INTO conversation_log"
             " (agent_id, chat_id, direction, message_id, text, ts, created_at)"
             " VALUES (?, ?, 'in', ?, ?, ?, ?)",
-            (str(agent_id), str(chat_id), str(message_id), text, ts, int(time.time())),
+            (str(agent_id), str(chat_id), str(message_id), text, ts,
+             int(created_at) if created_at is not None else int(time.time())),
         )
         con.commit()
     finally:
