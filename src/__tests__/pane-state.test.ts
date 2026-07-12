@@ -18,6 +18,8 @@ import {
   parkedInputRowCount,
   submitLanded,
   paneShowsContextSaturation,
+  paneShowsContextLow,
+  decideContextBudgetEscalation,
 } from '../pane-state.js'
 
 // Realistic pane fixtures modelled on actual `tmux capture-pane -p`
@@ -2245,5 +2247,167 @@ describe('paneShowsContextSaturation', () => {
   it('is false on empty/null-ish input', () => {
     expect(paneShowsContextSaturation('')).toBe(false)
     expect(paneShowsContextSaturation('   \n  ')).toBe(false)
+  })
+})
+
+describe('paneShowsContextLow', () => {
+  // The pre-saturation budget warnings Claude Code renders in the footer/status
+  // region as it approaches the compaction threshold, in the wordings shipped
+  // across builds. Each sits one line above (or on) the idle footer, exactly
+  // where the saturation banner sits.
+  const CTX_LOW_UNTIL_COMPACT = [
+    '  some prior assistant output',
+    '',
+    '✻ Cooked for 2m 1s',
+    '                              Context left until auto-compact: 18%',
+    SEP,
+    '❯ ',
+    SEP,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ].join('\n')
+
+  const CTX_LOW_PERCENT = [
+    '  some prior assistant output',
+    '',
+    SEP,
+    '❯ ',
+    SEP,
+    '  ⏵⏵ bypass permissions on · 12% until auto-compact',
+  ].join('\n')
+
+  const CTX_LOW_WORDING = [
+    '  some prior assistant output',
+    '',
+    '  ⚠ Context low · run /compact to free up space',
+    SEP,
+    '❯ ',
+    SEP,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ].join('\n')
+
+  it('detects "Context left until auto-compact: N%"', () => {
+    expect(detectPaneState(CTX_LOW_UNTIL_COMPACT)).toBe('idle') // sanity: still reads idle
+    expect(paneShowsContextLow(CTX_LOW_UNTIL_COMPACT)).toBe(true)
+  })
+
+  it('detects the bare "N% until auto-compact" wording (no literal "context")', () => {
+    expect(paneShowsContextLow(CTX_LOW_PERCENT)).toBe(true)
+  })
+
+  it('detects the "Context low" wording', () => {
+    expect(paneShowsContextLow(CTX_LOW_WORDING)).toBe(true)
+  })
+
+  it('is false on a normal idle / busy pane', () => {
+    expect(paneShowsContextLow(IDLE_BYPASS)).toBe(false)
+    expect(paneShowsContextLow(IDLE_STRICT)).toBe(false)
+    expect(paneShowsContextLow(BUSY_FULL_FOOTER)).toBe(false)
+  })
+
+  it('does NOT match ordinary conversation prose mentioning "context" (footer scope)', () => {
+    // "context" in the assistant body far above the footer -- never in the last
+    // ~8 lines, so the tail scope alone rejects it.
+    const bodyMention = [
+      '  Sure -- to give you more context, the auth flow reads the token first.',
+      '  Then it compacts the payload before sending the request upstream.',
+      ...Array.from({ length: 8 }, () => '  more conversation scrollback'),
+      SEP,
+      '❯ ',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(paneShowsContextLow(bodyMention)).toBe(false)
+  })
+
+  it('does NOT match "context"/"low"/"compact" prose sitting INSIDE the footer region', () => {
+    // The conservative regex, not just the tail scoping: the trigger words are
+    // all present in the last lines but never in a CC budget-footer pattern
+    // ("context" not adjacent to "low"; "compact" not preceded by "until").
+    const proseNearFooter = [
+      '  I need more context about the low-priority queue before I compact it.',
+      '',
+      SEP,
+      '❯ ',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(paneShowsContextLow(proseNearFooter)).toBe(false)
+  })
+
+  it('is false on empty/null-ish input', () => {
+    expect(paneShowsContextLow('')).toBe(false)
+    expect(paneShowsContextLow('   \n  ')).toBe(false)
+  })
+})
+
+describe('decideContextBudgetEscalation', () => {
+  // Production-ish thresholds: 2-tick confirm, 6-min grace, 30-min dedup.
+  const TH = { confirmTicks: 2, graceMs: 360_000, dedupMs: 1_800_000 }
+  const FRESH = { consecutiveHits: 0, wolfeFlaggedAt: null, gaborNotifiedAt: null }
+
+  it('does not escalate before the signal persists confirmTicks consecutive ticks', () => {
+    const t1 = decideContextBudgetEscalation(true, FRESH, 1_000, TH)
+    expect(t1.action).toBe('none')
+    expect(t1.next.consecutiveHits).toBe(1)
+    expect(t1.next.wolfeFlaggedAt).toBe(null)
+  })
+
+  it('flags the coordinator once the confirm-tick threshold is reached', () => {
+    const t1 = decideContextBudgetEscalation(true, FRESH, 1_000, TH)
+    const t2 = decideContextBudgetEscalation(true, t1.next, 61_000, TH)
+    expect(t2.action).toBe('notify-wolfe')
+    expect(t2.next.wolfeFlaggedAt).toBe(61_000)
+    expect(t2.next.consecutiveHits).toBe(2)
+  })
+
+  it('with confirmTicks=1 flags on the first sighting', () => {
+    const TH1 = { confirmTicks: 1, graceMs: 360_000, dedupMs: 1_800_000 }
+    const d = decideContextBudgetEscalation(true, FRESH, 0, TH1)
+    expect(d.action).toBe('notify-wolfe')
+    expect(d.next.wolfeFlaggedAt).toBe(0)
+  })
+
+  it('resets to a fresh spell when the signal disappears (flapping guard)', () => {
+    // hit once, then a clear tick, then a single hit again: the reset means the
+    // second spell must re-confirm from scratch and never inherits the first.
+    const a = decideContextBudgetEscalation(true, FRESH, 1_000, TH)
+    const b = decideContextBudgetEscalation(false, a.next, 2_000, TH)
+    expect(b.action).toBe('none')
+    expect(b.next).toEqual(FRESH)
+    const c = decideContextBudgetEscalation(true, b.next, 3_000, TH)
+    expect(c.action).toBe('none') // hits back to 1, not yet confirmed
+    expect(c.next.consecutiveHits).toBe(1)
+  })
+
+  it('stays quiet within the coordinator grace, then falls back to the owner once', () => {
+    const TH1 = { confirmTicks: 1, graceMs: 360_000, dedupMs: 1_800_000 }
+    const flagged = decideContextBudgetEscalation(true, FRESH, 0, TH1)
+    expect(flagged.action).toBe('notify-wolfe')
+    const within = decideContextBudgetEscalation(true, flagged.next, 300_000, TH1)
+    expect(within.action).toBe('none')
+    const after = decideContextBudgetEscalation(true, flagged.next, 360_000, TH1)
+    expect(after.action).toBe('fallback-gabor')
+    expect(after.next.gaborNotifiedAt).toBe(360_000)
+    // Owner alerted at most once per spell: another tick past the grace stays quiet.
+    const again = decideContextBudgetEscalation(true, after.next, 500_000, TH1)
+    expect(again.action).toBe('none')
+  })
+
+  it('re-flags the coordinator after the dedup window without re-alerting the owner', () => {
+    const TH1 = { confirmTicks: 1, graceMs: 360_000, dedupMs: 1_800_000 }
+    const state = { consecutiveHits: 5, wolfeFlaggedAt: 0, gaborNotifiedAt: 600_000 }
+    const d = decideContextBudgetEscalation(true, state, 1_800_000, TH1)
+    expect(d.action).toBe('notify-wolfe')
+    expect(d.next.wolfeFlaggedAt).toBe(1_800_000)
+    expect(d.next.gaborNotifiedAt).toBe(600_000) // owner NOT re-alerted this spell
+  })
+
+  it('does not stall on backwards clock skew (delegated skew guard)', () => {
+    const TH1 = { confirmTicks: 1, graceMs: 360_000, dedupMs: 1_800_000 }
+    const state = { consecutiveHits: 3, wolfeFlaggedAt: 1_000_000, gaborNotifiedAt: 1_000_000 }
+    const d = decideContextBudgetEscalation(true, state, 500_000, TH1)
+    expect(d.action).toBe('notify-wolfe')
+    expect(d.next.wolfeFlaggedAt).toBe(500_000)
+    expect(d.next.gaborNotifiedAt).toBe(null)
   })
 })

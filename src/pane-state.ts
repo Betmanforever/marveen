@@ -1593,3 +1593,118 @@ export function paneShowsContextSaturation(capture: string): boolean {
   const footerRegion = lines.slice(-CTX_SAT_FOOTER_REGION_LINES).join('\n')
   return CTX_SAT_RX.test(footerRegion)
 }
+
+// --- Context-LOW predicate (pre-saturation warning) -------------------------
+// Before a pane hits full saturation ("100% context used", above) Claude Code
+// renders a lower-severity budget warning in the same footer/status region:
+// "Context low", "Context left until auto-compact: 23%", "23% until
+// auto-compact" (wording varies by build). Catching this EARLIER lets the
+// watchdog flag the coordinator to restart a sub-agent BEFORE it saturates and
+// starts silently dropping work -- the 2026-07-12 wedge (a sub-agent at 97%
+// context that dropped four inter-agent messages in both directions).
+//
+// Conservative by construction: each alternative encodes a real footer phrase
+// ("context low" as an adjacent pair; the compaction cue as the CC-specific
+// "until [auto-]compact"), so ordinary conversation prose that merely mentions
+// the word "context" -- without the compaction semantics -- never trips it. Same
+// tail-scope as paneShowsContextSaturation so a scrollback quote cannot fire it.
+const CTX_LOW_RX = /\bcontext\s+low\b|\buntil\s+(?:auto[-\s]?)?compact\b/i
+
+export function paneShowsContextLow(capture: string): boolean {
+  if (!capture || !capture.trim()) return false
+  const lines = capture.split('\n')
+  const footerRegion = lines.slice(-CTX_SAT_FOOTER_REGION_LINES).join('\n')
+  return CTX_LOW_RX.test(footerRegion)
+}
+
+// --- Context-budget escalation (two-phase + flapping guard) ------------------
+// A pane approaching ("Context low" / "N% until auto-compact") or already at
+// ("100% context used") its context ceiling still reads as idle, so the
+// scheduler/router keep dispatching work whose in-flight verdicts/outputs can no
+// longer be trusted. This escalates that condition on the SAME coordinator-first
+// two-phase model as the permission-dialog / thinking-block wedges
+// (decideDialogEscalation), with one addition: the signal must persist across
+// `confirmTicks` consecutive monitor ticks before the first flag, so a one-tick
+// capture flake never escalates. The resolution is a RESTART recommendation --
+// the watchdog NEVER auto-restarts (a false positive would nuke a healthy
+// session's context).
+
+export type ContextBudgetAction = 'notify-wolfe' | 'fallback-gabor' | 'none'
+
+export interface ContextBudgetState {
+  /** Consecutive ticks the low/saturation signal has been observed. Reset to 0
+   * on any tick the signal is absent (the spell is over), so a future spell
+   * re-confirms from scratch and flags the coordinator promptly. */
+  consecutiveHits: number
+  /** When the coordinator (mr-wolfe) was flagged for the CURRENT spell -- the
+   * phase-1 dedup anchor AND the grace-timer origin -- or null before the
+   * confirm threshold is reached / when no spell is active. Mirrors
+   * DialogEscalationState.wolfeFlaggedAt. */
+  wolfeFlaggedAt: number | null
+  /** When the direct owner (Gabor) fallback was sent during the CURRENT spell,
+   * or null. Gates the fallback to at most once per spell. */
+  gaborNotifiedAt: number | null
+}
+
+export interface ContextBudgetThresholds {
+  /** Consecutive ticks the signal must persist before the FIRST coordinator
+   * flag (flapping guard). 1 == flag on first sighting. */
+  confirmTicks: number
+  /** How long after the coordinator flag, signal still up, before the direct
+   * owner fallback fires. */
+  graceMs: number
+  /** Minimum gap before the coordinator is re-flagged for the SAME persisting
+   * spell. */
+  dedupMs: number
+}
+
+export interface ContextBudgetDecision {
+  action: ContextBudgetAction
+  next: ContextBudgetState
+}
+
+/**
+ * Pure two-phase escalation decision for a session at/near its context ceiling.
+ * Dependency-free (feed the per-tick signal + persisted state + a clock, get the
+ * action + next state). Once the signal has held for `confirmTicks` consecutive
+ * ticks it DELEGATES to decideDialogEscalation for the coordinator-first /
+ * owner-fallback timing, so the dedup + grace + clock-skew semantics stay
+ * identical to the dialog / thinking-block escalations (single source of truth).
+ *
+ * Cadence (caller invokes once per monitor tick while the pane shows the signal):
+ *   - signal absent                         -> reset to a fresh spell ('none')
+ *   - fewer than confirmTicks in a row      -> 'none' (still confirming)
+ *   - confirm reached, first time           -> 'notify-wolfe' (flag coordinator)
+ *   - within graceMs of the flag            -> 'none'
+ *   - graceMs elapsed, still up, owner unset -> 'fallback-gabor'
+ *   - dedupMs elapsed since the flag         -> 'notify-wolfe' again (owner gate
+ *     NOT reset, so the owner is alerted at most once per spell)
+ */
+export function decideContextBudgetEscalation(
+  signalPresent: boolean,
+  state: ContextBudgetState,
+  now: number,
+  thresholds: ContextBudgetThresholds,
+): ContextBudgetDecision {
+  if (!signalPresent) {
+    // Spell over: reset so a future ceiling re-confirms and flags promptly
+    // rather than inheriting a stale dedup/grace anchor.
+    return { action: 'none', next: { consecutiveHits: 0, wolfeFlaggedAt: null, gaborNotifiedAt: null } }
+  }
+  const hits = state.consecutiveHits + 1
+  if (hits < thresholds.confirmTicks) {
+    // Flapping guard: not yet seen on enough consecutive ticks to escalate.
+    return { action: 'none', next: { consecutiveHits: hits, wolfeFlaggedAt: null, gaborNotifiedAt: null } }
+  }
+  // Confirmed: reuse the proven two-phase machine for the coordinator-first /
+  // owner-fallback timing (keeps skew + dedup + grace identical everywhere).
+  const inner = decideDialogEscalation(
+    { wolfeFlaggedAt: state.wolfeFlaggedAt, gaborNotifiedAt: state.gaborNotifiedAt },
+    now,
+    { graceMs: thresholds.graceMs, dedupMs: thresholds.dedupMs },
+  )
+  return {
+    action: inner.action,
+    next: { consecutiveHits: hits, wolfeFlaggedAt: inner.next.wolfeFlaggedAt, gaborNotifiedAt: inner.next.gaborNotifiedAt },
+  }
+}

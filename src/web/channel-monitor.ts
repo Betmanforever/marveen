@@ -6,7 +6,7 @@ import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
-import { createAgentMessage } from '../db.js'
+import { createAgentMessage, getPendingMessages } from '../db.js'
 import {
   agentHasChannel,
   agentSessionName,
@@ -26,12 +26,15 @@ import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPlugin
 import {
   detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, detectsPermissionDialog, type PaneErrorAlertState, type PaneState,
   decideDialogEscalation, type DialogEscalationState,
+  paneShowsContextLow, paneShowsContextSaturation,
+  decideContextBudgetEscalation, type ContextBudgetState,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
   parkedInputText, shouldClearTruncatedPreamble,
   parkedInputRowCount, submitLanded, decideStuckInputAction,
   type StuckInputState, type StuckInputThresholds, type StuckInputAction,
   type StuckInputActionFacts,
 } from '../pane-state.js'
+import { decidePendingAgeAlert } from './message-router.js'
 // The plan limit modal wears the same navigable-modal footer as a genuine
 // menu; the limit-banner detector tells the two apart so the menu-recovery
 // alert can name the real cause (see the blocking-menu pass below).
@@ -489,6 +492,69 @@ function buildThinkingBlockOwnerFallback(label: string): string {
     'a koordinator pedig nem allitotta helyre. Valoszinuleg ujrainditas kell hozza. Ha raersz, nezd meg.'
   )
 }
+
+// Third call-site for the SAME two-phase escalation: a pane at/near its context
+// ceiling (paneShowsContextLow OR paneShowsContextSaturation). A saturated
+// session still reads as idle, so the scheduler/router keep dispatching work
+// whose in-flight verdicts/outputs can no longer be trusted -- the 2026-07-12
+// wedge (a sub-agent at 97% context silently dropped four inter-agent messages
+// in BOTH directions, escalation included). Own map so it can never cross-
+// throttle the dialog/thinking-block escalations. decideContextBudgetEscalation
+// adds a consecutive-tick confirm on top of the shared DIALOG_* dedup+grace.
+const paneContextBudgetEscalation: Map<string, ContextBudgetState> = new Map()
+// Persist the signal across this many consecutive ~60s ticks before the first
+// coordinator flag -- a one-tick capture flake never escalates (~2 min at the
+// 60s cadence). Reuses DIALOG_WOLFE_GRACE_MS / DIALOG_ESCALATE_DEDUP_MS.
+const CONTEXT_BUDGET_CONFIRM_TICKS = 2
+// Direct owner heads-up throttle for a context-LOW main channels session. Full
+// saturation of main is already handled by the dispatch readiness gate
+// (isSessionReadyForPrompt refuses a saturated pane) + the keepalive/down
+// cascade, so this only covers the pre-saturation warning, and only the owner
+// (the coordinator cannot flag itself).
+let mainContextLowAlertAt: number | null = null
+
+// The [AUTOMATIKUS DECISION-FLAG] inter-agent message sent to the coordinator
+// (mr-wolfe) when a SUB-AGENT is at/near its context ceiling. Same shape/triage
+// contract as buildDialogCoordinatorFlag / buildThinkingBlockCoordinatorFlag
+// (see marveen-auto-decision-flag-triage). The resolution is a RESTART: a
+// saturated session keeps reading idle and silently corrupts/drops work, so its
+// in-flight verdicts must not be trusted; the watchdog deliberately does NOT
+// auto-restart (a false positive would nuke a healthy session's context).
+// Deliberately NO tmux/session-id leak and no literal [DONTESRE-VAR:...] marker.
+function buildContextBudgetCoordinatorFlag(agentName: string): string {
+  return (
+    `[AUTOMATIKUS DECISION-FLAG] A(z) ${agentName} sub-agent a kontextus-plafonjahoz ert (a pane ` +
+    'context-low vagy teljes 100%-os telitettseget mutat) -- a watchdog a pane-scan alapjan eszlelte. ' +
+    'Amig ujra nem indul, a folyamatban levo megallapitasait, verdiktjeit es kimeneteit NE tekintsd ' +
+    'megbizhatonak (egy telitett session tovabb dolgozik, de csendben elront vagy eldob dolgokat). ' +
+    `A megoldas UJRAINDITAS: POST /api/agents/${agentName}/restart (vagy a dashboard agent-restart gombja) ` +
+    '-- ez a te hataskoreben van, futtasd le. A watchdog SZANDEKOSAN nem inditott auto-resetet (egy ' +
+    'false-positive nem nukealhat egy egeszseges session kontextusat). Ha ujraindulas utan is visszater, ' +
+    'forditsd emberi nyelvre es told tovabb Gabornak Telegramon.'
+  )
+}
+
+// The direct owner (Gabor) fallback for the context-ceiling case, fired only
+// after the coordinator grace expires (sub-agents) or as a deduped heads-up
+// (main). Human-friendly by design (mirrors buildThinkingBlockOwnerFallback):
+// no curl, no raw session-id -- just that the agent is at its context limit, its
+// recent output is unreliable, and it likely needs a restart.
+function buildContextBudgetOwnerFallback(label: string): string {
+  return (
+    `⚠️ A(z) ${label} elerte a kontextus-plafonjat, a friss megallapitasai es valaszai megbizhatatlanok, ` +
+    'amig ujra nem indul -- a koordinator pedig nem oldotta meg. Valoszinuleg ujrainditas kell hozza. Ha raersz, nezd meg.'
+  )
+}
+
+// Pending-age watchdog state (see the watchdog pass in check()). The wedge
+// escalation itself flows through agent_messages, so when THAT queue silently
+// starves (2026-07-12) the escalation dies with it. The pass reads the queue
+// DIRECTLY and alerts the owner via sendAlert (NEVER agent_messages), so it
+// survives the queue wedging. One alert per stuck episode; re-armed when the
+// backlog clears.
+let pendingAgeLastAlertAt: number | null = null
+const PENDING_AGE_ALERT_THRESHOLD_MS = 3 * 60 * 1000
+const PENDING_AGE_ALERT_DEDUP_MS = 15 * 60 * 1000
 
 // The plan usage-limit dialog is a recurring special case: model-fallback
 // respawns the limited session, the respawn re-hits the same plan-wide limit
@@ -1404,6 +1470,72 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       }
     }
 
+    // Context-budget escalation (main + sub-agents). A pane approaching
+    // ("Context low" / "N% until auto-compact") or already at ("100% context
+    // used") its ceiling still reads as idle, so the scheduler/router keep
+    // dispatching work whose in-flight verdicts/outputs can no longer be trusted
+    // (2026-07-12: a sub-agent at 97% context silently dropped four inter-agent
+    // messages in both directions). Escalate coordinator-first (mr-wolfe
+    // restarts it); the watchdog NEVER auto-restarts (a false positive would
+    // nuke a healthy session's context) -- it only RECOMMENDS a restart via
+    // POST /api/agents/<name>/restart. Own map + a consecutive-tick confirm so a
+    // one-frame capture flake never fires; reuses the shared DIALOG_* grace+dedup.
+    for (const t of targets) {
+      const now = Date.now()
+      const pane = capturePane(t.session)
+      const low = pane != null && paneShowsContextLow(pane)
+      const saturated = pane != null && paneShowsContextSaturation(pane)
+      const signal = low || saturated
+      if (!t.isMarveen && t.agentName) {
+        // Sub-agent: full two-phase escalation (coordinator first, owner
+        // fallback after the grace), behind the confirm-tick flapping guard.
+        const prevEsc = paneContextBudgetEscalation.get(t.session) ?? { consecutiveHits: 0, wolfeFlaggedAt: null, gaborNotifiedAt: null }
+        const esc = decideContextBudgetEscalation(signal, prevEsc, now, {
+          confirmTicks: CONTEXT_BUDGET_CONFIRM_TICKS,
+          graceMs: DIALOG_WOLFE_GRACE_MS,
+          dedupMs: DIALOG_ESCALATE_DEDUP_MS,
+        })
+        if (!signal) {
+          // Spell over: drop the entry so a future ceiling starts fresh.
+          paneContextBudgetEscalation.delete(t.session)
+        } else {
+          paneContextBudgetEscalation.set(t.session, esc.next)
+        }
+        const label = t.agentName
+        if (esc.action === 'notify-wolfe') {
+          logger.warn({ session: t.session, agent: label, saturated }, 'Sub-agent at/near context ceiling -- flagging coordinator (mr-wolfe) to restart')
+          try {
+            // from = the ceiling-hit sub-agent, to = coordinator: matches the
+            // decision-flag.py convention (mr-wolfe receives a trusted-peer flag).
+            createAgentMessage(t.agentName, MAIN_AGENT_ID, buildContextBudgetCoordinatorFlag(t.agentName))
+          } catch (err) {
+            // Router enqueue failed -- do not lose the escalation; fall straight
+            // to the direct owner alert.
+            logger.warn({ err, session: t.session }, 'Context-budget coordinator flag enqueue failed -- direct owner fallback')
+            sendAlert(buildContextBudgetOwnerFallback(label))
+          }
+        } else if (esc.action === 'fallback-gabor') {
+          logger.warn({ session: t.session, agent: label }, 'Sub-agent context ceiling unresolved after coordinator grace -- direct owner fallback')
+          sendAlert(buildContextBudgetOwnerFallback(label))
+        }
+      } else {
+        // Main channels session: full saturation is already handled by the
+        // dispatch readiness gate (isSessionReadyForPrompt refuses a saturated
+        // pane) + the keepalive/down cascade, and the coordinator cannot flag
+        // itself to restart. Only the pre-saturation context-LOW warning earns a
+        // single deduped DIRECT owner heads-up; re-armed once it clears.
+        if (low) {
+          if (mainContextLowAlertAt === null || now < mainContextLowAlertAt || now - mainContextLowAlertAt >= DIALOG_ESCALATE_DEDUP_MS) {
+            mainContextLowAlertAt = now
+            logger.warn({ session: t.session }, 'Main channels session approaching context ceiling -- deduped owner heads-up')
+            sendAlert(buildContextBudgetOwnerFallback(BOT_NAME))
+          }
+        } else {
+          mainContextLowAlertAt = null
+        }
+      }
+    }
+
     // Blocking-menu recovery (main + sub-agents). A session parked in an
     // interactive modal (/mcp manager, model/config picker, permission dialog)
     // is neither busy nor idle, so detectPaneState reads 'unknown' and the
@@ -1724,6 +1856,39 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           logger.error({ err, agent: t.agentName }, 'Failed to auto-restart agent after channel plugin down')
         }
       }
+    }
+
+    // In-process pending-age watchdog (independent of any agent session). The
+    // wedge escalation itself flows through agent_messages, so when THAT queue
+    // silently starves (2026-07-12: four messages pending 10+ min in BOTH
+    // directions, including a coordinator-bound pull-model message) the
+    // escalation dies with it. Read the queue DIRECTLY and alert the owner via
+    // sendAlert (NEVER agent_messages -- that is the failing channel). Include
+    // coordinator-bound (pull-model) messages: they are exactly the ones that
+    // silently starve. One alert per stuck episode; re-armed when the backlog
+    // clears. Wrapped so a DB hiccup can never break the rest of the monitor tick.
+    try {
+      const pending = getPendingMessages()
+      const nowMs = Date.now()
+      const agesMs = pending.map((m) => nowMs - m.created_at * 1000)
+      if (!agesMs.some((a) => a > PENDING_AGE_ALERT_THRESHOLD_MS)) {
+        // Backlog below threshold: re-arm so the next episode alerts promptly.
+        pendingAgeLastAlertAt = null
+      } else if (decidePendingAgeAlert(agesMs, pendingAgeLastAlertAt, nowMs, PENDING_AGE_ALERT_THRESHOLD_MS, PENDING_AGE_ALERT_DEDUP_MS)) {
+        pendingAgeLastAlertAt = nowMs
+        // List up to the 5 oldest stuck rows (id, from→to, minutes pending).
+        const stuck = pending
+          .map((m) => ({ m, ageMs: nowMs - m.created_at * 1000 }))
+          .filter((x) => x.ageMs > PENDING_AGE_ALERT_THRESHOLD_MS)
+          .sort((a, b) => b.ageMs - a.ageMs)
+          .slice(0, 5)
+        const list = stuck.map((x) => `#${x.m.id} ${x.m.from_agent}→${x.m.to_agent} (${Math.floor(x.ageMs / 60000)}p)`).join(', ')
+        const thresholdMin = Math.floor(PENDING_AGE_ALERT_THRESHOLD_MS / 60000)
+        logger.error({ stuck: stuck.length, oldestMin: Math.floor(stuck[0].ageMs / 60000) }, 'Inter-agent message queue starving -- pending rows past age threshold')
+        sendAlert(`⛔ Az inter-agent uzenetsor akad: ${stuck.length} uzenet ${thresholdMin}+ perce pending (a wedge-eszkalacio is ezen a soron menne, ezert kozvetlenul szolok). Legidosebbek: ${list}. Nezd meg a dashboard uzenetsort.`)
+      }
+    } catch (err) {
+      logger.warn({ err }, 'channel-monitor: pending-age watchdog pass failed')
     }
 
     // Desired-state reconciliation: bring back agents the operator wants

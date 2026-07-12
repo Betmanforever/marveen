@@ -19,6 +19,7 @@ import {
 } from './agent-process.js'
 import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
+import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 
 // A message that cannot be delivered within this window (target session never
 // exists / stays busy) is marked failed so it stops clogging the pending
@@ -88,6 +89,80 @@ export function shouldAbandonGaveUp(ageMs: number, windowMs: number): boolean {
   return ageMs > windowMs
 }
 
+/**
+ * Pure decision: should the in-process pending-age watchdog fire a DIRECT owner
+ * alert now? True iff any pending message has out-waited `thresholdMs` AND the
+ * dedup window has elapsed since the last alert. Returns false when nothing is
+ * over threshold so the CALLER re-arms (sets lastAlertAt = null) as the backlog
+ * clears -- the next stuck episode then alerts promptly.
+ *
+ * This backstops the queue that the wedge-escalation itself flows through: on
+ * 2026-07-12 four inter-agent messages sat pending 10+ min in BOTH directions
+ * (including a coordinator-bound pull-model message) with nothing alarming,
+ * because the escalation path is the same agent_messages queue that had
+ * starved. The watchdog reads the queue directly and NEVER writes to
+ * agent_messages, so it survives that queue wedging.
+ *
+ * A future-dated lastAlertAt (clock skew / NTP correction) counts as "alert now"
+ * rather than stalling the delta negative, mirroring the other decision guards.
+ */
+export function decidePendingAgeAlert(
+  pendingAgesMs: number[],
+  lastAlertAt: number | null,
+  now: number,
+  thresholdMs: number,
+  dedupMs: number,
+): boolean {
+  if (!pendingAgesMs.some((age) => age > thresholdMs)) return false
+  if (lastAlertAt === null) return true
+  if (now < lastAlertAt) return true
+  return now - lastAlertAt >= dedupMs
+}
+
+/**
+ * Pure decision: should the router inject a self-poll nudge into the main
+ * (coordinator) channels session? The main agent uses a PULL model -- it drains
+ * its own inbox each turn -- so an IDLE coordinator can leave a message pending
+ * for many minutes until something else makes it take a turn (2026-07-12: a
+ * coordinator-bound message starved 10+ min). True iff the oldest main-bound
+ * pending message has out-waited `thresholdMs` AND the dedup window has elapsed.
+ * The I/O gates (session exists, idle-ready, not cold-starting) stay in the
+ * caller; this owns only the age + dedup arithmetic.
+ *
+ * @param oldestPendingAgeMs Age of the oldest main-bound pending message, or
+ *                           null when there is none.
+ */
+export function decideCoordinatorNudge(
+  oldestPendingAgeMs: number | null,
+  lastNudgeAt: number | null,
+  now: number,
+  thresholdMs: number,
+  dedupMs: number,
+): boolean {
+  if (oldestPendingAgeMs === null || oldestPendingAgeMs <= thresholdMs) return false
+  if (lastNudgeAt === null) return true
+  if (now < lastNudgeAt) return true
+  return now - lastNudgeAt >= dedupMs
+}
+
+// Coordinator inbox self-poll (deliverable: pull-model backstop). The oldest
+// main-bound message must have waited this long before a nudge fires -- long
+// enough that a normal busy coordinator (which will drain on its next turn
+// anyway) is never nudged, short enough that an IDLE coordinator's inbox does
+// not starve for many minutes.
+const COORDINATOR_NUDGE_MIN_AGE_MS = 3 * 60 * 1000
+// At most one nudge per this window, globally. A nudge only has to START a turn
+// (the main agent's UserPromptSubmit hook auto-drains the whole inbox), so one
+// per 10 min is ample; reset when the coordinator's pending backlog drains.
+const COORDINATOR_NUDGE_DEDUP_MS = 10 * 60 * 1000
+// One-line self-poll prompt. Content is near-irrelevant (any turn auto-drains
+// the inbox); it just needs to start a turn and read sensibly if surfaced.
+const COORDINATOR_NUDGE_PROMPT =
+  '[inbox-nudge] Fuggoben levo inter-agent uzenetek varnak rad -- ezek ehhez a korhoz csatolodnak (az inboxod automatikusan behuzza oket). Nezd at es dolgozd fel oket.'
+// Global (single main session) nudge throttle + reset flag. In-module so it
+// survives across ticks but resets on a dashboard restart.
+let lastCoordinatorNudgeMs: number | null = null
+
 // Checks for pending messages every 5 seconds and injects them into target
 // agent tmux sessions.
 let _tickRunning = false
@@ -121,6 +196,11 @@ export async function runMessageRouterTick(): Promise<void> {
     // pattern. Ordering is preserved (oldest first) so nothing is starved.
     const pending = getPendingMessages().slice(0, MAX_MESSAGES_PER_TICK)
     const now = Date.now()
+    // Coordinator inbox self-poll bookkeeping for THIS tick (see the isMainAgent
+    // branch): fire at most one nudge, and re-arm the dedup once no main-bound
+    // message remains pending (backlog drained).
+    let mainBoundSeen = false
+    let mainNudgeFiredThisTick = false
     for (const msg of pending) {
       const ageMs = now - msg.created_at * 1000
       // The main agent runs in `${MAIN_AGENT_ID}-channels`, not `agent-${name}`,
@@ -133,7 +213,44 @@ export async function runMessageRouterTick(): Promise<void> {
       // what stalled inter-agent delivery to the main agent for ~1h on a busy
       // day. Leave the message pending; the next main-agent turn claims it
       // atomically. Sub-agents keep the tmux-inject path (they have idle gaps).
-      if (isMainAgent) continue
+      if (isMainAgent) {
+        // PULL MODEL (above): the router never tmux-injects a real message into
+        // the perpetually-busy main channels session. But an IDLE coordinator
+        // only drains its inbox when something makes it take a turn, so a
+        // message can starve for many minutes (2026-07-12: a coordinator-bound
+        // message sat pending 10+ min). `pending` is oldest-first, so the FIRST
+        // main-bound message here is the oldest -- its ageMs drives a single
+        // lightweight self-poll nudge. Gated on the session being idle-ready and
+        // past the cold-start hold, deduped globally, and 'landed'-checked so a
+        // gave-up send never retry-storms. The nudge content is near-irrelevant:
+        // the main agent's UserPromptSubmit hook auto-drains the whole inbox on
+        // ANY turn, so the nudge only has to START one.
+        mainBoundSeen = true
+        if (
+          !mainNudgeFiredThisTick &&
+          decideCoordinatorNudge(ageMs, lastCoordinatorNudgeMs, now, COORDINATOR_NUDGE_MIN_AGE_MS, COORDINATOR_NUDGE_DEDUP_MS) &&
+          sessionExistsOnHost(null, MAIN_CHANNELS_SESSION) &&
+          !channelColdStartHoldActive(MAIN_AGENT_ID) &&
+          isSessionReadyForPrompt(MAIN_CHANNELS_SESSION, null)
+        ) {
+          mainNudgeFiredThisTick = true
+          try {
+            const nudgeResult = sendPromptToSession(MAIN_CHANNELS_SESSION, COORDINATOR_NUDGE_PROMPT, null, { waitForIdle: false })
+            if (nudgeResult === 'landed') {
+              lastCoordinatorNudgeMs = now
+              logger.info({ id: msg.id, ageMs }, 'message-router: coordinator inbox nudge landed')
+            } else {
+              // gave-up: the input box was not clean. Do nothing more this tick
+              // -- no retry, and do NOT bump the dedup, so a later idle tick can
+              // try again once the box clears.
+              logger.warn({ id: msg.id }, 'message-router: coordinator inbox nudge gave up (input parked); will retry a later tick')
+            }
+          } catch (err) {
+            logger.warn({ err, id: msg.id }, 'message-router: coordinator inbox nudge injection failed')
+          }
+        }
+        continue
+      }
       const session = agentSessionName(msg.to_agent)
       // Remote sub-agents run their tmux session on the laptop; resolve the host
       // so the existence/readiness checks and the send all cross the ssh
@@ -341,6 +458,12 @@ export async function runMessageRouterTick(): Promise<void> {
         routerLoggedMisses.delete(msg.id)
       }
     }
+    // Re-arm the coordinator-nudge dedup once the main-bound backlog has drained,
+    // so the next starvation episode nudges promptly instead of waiting out a
+    // stale dedup window. (Guarded by the MAX_MESSAGES_PER_TICK slice: a >25-deep
+    // non-main backlog could hide a main-bound tail this tick; the pending-age
+    // watchdog covers that heavier case, and the next tick re-evaluates.)
+    if (!mainBoundSeen) lastCoordinatorNudgeMs = null
 }
 
 // ---- voice helpers (message-router level) ----------------------------------

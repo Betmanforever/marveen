@@ -58,6 +58,14 @@ vi.mock('../web/agent-message-wrap.js', () => ({
   wrapAgentMessageForDelivery: () => ({ prefix: '', wrapped: '' }),
 }))
 
+// message-router imports MAIN_CHANNELS_SESSION for the coordinator inbox nudge;
+// mock it (config.js is mocked without SERVICE_ID, so the real main-agent.ts
+// module cannot initialise). This test feeds only SUB-agent messages, so the
+// nudge branch is never entered -- only the import needs to resolve.
+vi.mock('../web/main-agent.js', () => ({
+  MAIN_CHANNELS_SESSION: 'orin-channels',
+}))
+
 import { runMessageRouterTick, MAX_MESSAGES_PER_TICK } from '../web/message-router.js'
 
 function makePending(count: number) {
