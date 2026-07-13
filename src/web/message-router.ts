@@ -180,8 +180,14 @@ const COORDINATOR_NUDGE_MIN_AGE_MS = 3 * 60 * 1000
 const COORDINATOR_NUDGE_DEDUP_MS = 10 * 60 * 1000
 // One-line self-poll prompt. Content is near-irrelevant (any turn auto-drains
 // the inbox); it just needs to start a turn and read sensibly if surfaced.
+// MUST stay short enough to render as a SINGLE input row (~80 cols): when the
+// submit silently fails (false-landed / bracketed-paste, 2026-07-13 10:22 the
+// nudge itself sat parked in the coordinator's box for 30+ min), the stale-
+// parked-input janitor auto-clears a single-row 'typing' box but deliberately
+// HOLDS multi-row text -- so a long nudge converts a recoverable miss into a
+// wedge that only a restart clears.
 const COORDINATOR_NUDGE_PROMPT =
-  '[inbox-nudge] Fuggoben levo inter-agent uzenetek varnak rad -- ezek ehhez a korhoz csatolodnak (az inboxod automatikusan behuzza oket). Nezd at es dolgozd fel oket.'
+  '[inbox-nudge] Fuggoben levo uzenetek varnak, dolgozd fel oket.'
 // Global (single main session) nudge throttle + reset flag. In-module so it
 // survives across ticks but resets on a dashboard restart.
 let lastCoordinatorNudgeMs: number | null = null
