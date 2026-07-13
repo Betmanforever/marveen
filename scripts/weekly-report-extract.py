@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Weekly report raw-data extractor (kanban #6A302E35).
 
-Collects errors, bugs and lessons for one ISO week from the three agreed
+Collects errors, bugs and lessons for one ISO week from the agreed
 sources (see shared memory "heti riport forrasdefinicio", #FF55DF20):
   1. memories table   -- cold/shared tier lessons (all categories included,
                          grouped, so the synthesizer can pick)
   2. daily_logs table -- per-agent daily journal entries
   3. git history      -- fix()/security()/revert commits + release markers
+  4. Skool activity log -- projects/skool/activity-log.md dated sections
+                         (Ive's Do-Track-Preserve journal, added 2026-07-13)
 
 Output: structured JSON on stdout. The report synthesis (filling
 agents/ive/deliverables/heti-riport-sablon.md) is done by the scheduled
@@ -184,6 +186,36 @@ def model_fallback_events(monday: dt.date, sunday: dt.date) -> dict:
     return {"events": events, "agent_status": status}
 
 
+def fetch_skool_activity(monday: dt.date, sunday: dt.date) -> list:
+    """Parse projects/skool/activity-log.md (append-only Do-Track-Preserve
+    journal, owner: ive) and return the dated sections that fall inside the
+    reported week. Sections are '## YYYY-MM-DD' headers followed by '-' bullet
+    lines; anything that isn't a bullet under a dated header is ignored so a
+    malformed edit can't break the extraction. Missing file = empty list (the
+    Skool project may be dormant), NOT an error."""
+    path = f"{REPO}/projects/skool/activity-log.md"
+    days: list[dict] = []
+    current: dict | None = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if line.startswith("## "):
+            current = None
+            try:
+                day = dt.date.fromisoformat(line[3:].strip())
+            except ValueError:
+                continue
+            if monday <= day <= sunday:
+                current = {"date": day.isoformat(), "entries": []}
+                days.append(current)
+        elif current is not None and line.lstrip().startswith("- "):
+            current["entries"].append(line.lstrip()[2:].strip())
+    return [d for d in days if d["entries"]]
+
+
 def fetch_git(monday: dt.date, sunday: dt.date) -> dict:
     out = subprocess.run(
         ["git", "-C", REPO, "log", "--date=short",
@@ -215,6 +247,7 @@ def main() -> int:
     git = fetch_git(monday, sunday)
     friction = friction_tracking(mems)
     fallback = model_fallback_events(monday, sunday)
+    skool = fetch_skool_activity(monday, sunday)
 
     result = {
         "week": week_id,
@@ -229,12 +262,14 @@ def main() -> int:
             "git_other_commits": len(git["other"]),
             "agent_friction_events": len(friction["events"]),
             "model_fallback_events": len(fallback["events"]),
+            "skool_activity_days": len(skool),
         },
         "daily_logs": logs,
         "memories": mems,
         "git": git,
         "agent_friction": friction,
         "model_fallback": fallback,
+        "skool_activity": skool,
     }
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
     return 0
