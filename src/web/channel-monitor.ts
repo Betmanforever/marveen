@@ -34,7 +34,7 @@ import {
   type StuckInputState, type StuckInputThresholds, type StuckInputAction,
   type StuckInputActionFacts,
 } from '../pane-state.js'
-import { decidePendingAgeAlert } from './message-router.js'
+import { decidePendingAgeAlert, shouldAlertStuckTarget } from './message-router.js'
 // The plan limit modal wears the same navigable-modal footer as a genuine
 // menu; the limit-banner detector tells the two apart so the menu-recovery
 // alert can name the real cause (see the blocking-menu pass below).
@@ -555,6 +555,9 @@ function buildContextBudgetOwnerFallback(label: string): string {
 let pendingAgeLastAlertAt: number | null = null
 const PENDING_AGE_ALERT_THRESHOLD_MS = 3 * 60 * 1000
 const PENDING_AGE_ALERT_DEDUP_MS = 15 * 60 * 1000
+// Past this age even a busy-working target alerts: an endless turn starves
+// the queue just as dead as a wedge (busy-vs-wedged discrimination ceiling).
+const PENDING_AGE_ALERT_HARD_CEILING_MS = 15 * 60 * 1000
 
 // The plan usage-limit dialog is a recurring special case: model-fallback
 // respawns the limited session, the respawn re-hits the same plan-wide limit
@@ -1875,17 +1878,50 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
         // Backlog below threshold: re-arm so the next episode alerts promptly.
         pendingAgeLastAlertAt = null
       } else if (decidePendingAgeAlert(agesMs, pendingAgeLastAlertAt, nowMs, PENDING_AGE_ALERT_THRESHOLD_MS, PENDING_AGE_ALERT_DEDUP_MS)) {
-        pendingAgeLastAlertAt = nowMs
-        // List up to the 5 oldest stuck rows (id, from→to, minutes pending).
-        const stuck = pending
+        // Busy-vs-wedged discrimination (2026-07-13 09:00 false alarm): a
+        // target that is ACTIVELY WORKING holds its inbox until the turn ends
+        // by design -- that is latency, not starvation. Classify each stuck
+        // row's target pane and alert only on rows whose target is not a
+        // healthy-busy session; a hard ceiling re-includes even busy targets
+        // (an endless turn starves the queue just as dead as a wedge). One
+        // capture per distinct target session, cached for this pass.
+        const stuckAll = pending
           .map((m) => ({ m, ageMs: nowMs - m.created_at * 1000 }))
           .filter((x) => x.ageMs > PENDING_AGE_ALERT_THRESHOLD_MS)
           .sort((a, b) => b.ageMs - a.ageMs)
-          .slice(0, 5)
-        const list = stuck.map((x) => `#${x.m.id} ${x.m.from_agent}→${x.m.to_agent} (${Math.floor(x.ageMs / 60000)}p)`).join(', ')
-        const thresholdMin = Math.floor(PENDING_AGE_ALERT_THRESHOLD_MS / 60000)
-        logger.error({ stuck: stuck.length, oldestMin: Math.floor(stuck[0].ageMs / 60000) }, 'Inter-agent message queue starving -- pending rows past age threshold')
-        sendAlert(`⛔ Az inter-agent uzenetsor akad: ${stuck.length} uzenet ${thresholdMin}+ perce pending (a wedge-eszkalacio is ezen a soron menne, ezert kozvetlenul szolok). Legidosebbek: ${list}. Nezd meg a dashboard uzenetsort.`)
+        const paneCache = new Map<string, { state: string | null; wedge: boolean }>()
+        const classifyTarget = (toAgent: string): { state: string | null; wedge: boolean } => {
+          const session = toAgent === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(toAgent)
+          const cached = paneCache.get(session)
+          if (cached) return cached
+          const pane = capturePane(session)
+          const out = pane == null
+            ? { state: null, wedge: false } // unreadable -> fail-open (alerts)
+            : {
+                state: detectPaneState(pane),
+                wedge: parkedInputText(pane) != null || paneShowsContextLow(pane) || paneShowsContextSaturation(pane),
+              }
+          paneCache.set(session, out)
+          return out
+        }
+        const stuck = stuckAll.filter((x) => {
+          const t = classifyTarget(x.m.to_agent)
+          return shouldAlertStuckTarget(t.state, t.wedge, x.ageMs, PENDING_AGE_ALERT_HARD_CEILING_MS)
+        }).slice(0, 5)
+        if (stuck.length === 0) {
+          // Every stuck row's target is healthy-busy: benign latency. Do NOT
+          // bump the dedup stamp -- if a target wedges (or the ceiling passes)
+          // on a later tick, the alert must fire promptly, not wait out a
+          // window consumed by a suppressed non-alert.
+          logger.info({ suppressed: stuckAll.length }, 'Pending-age watchdog: all stuck targets are busy-working (no wedge signal) -- alert suppressed')
+        } else {
+          pendingAgeLastAlertAt = nowMs
+          // List up to the 5 oldest alert-worthy rows (id, from→to, minutes pending).
+          const list = stuck.map((x) => `#${x.m.id} ${x.m.from_agent}→${x.m.to_agent} (${Math.floor(x.ageMs / 60000)}p)`).join(', ')
+          const thresholdMin = Math.floor(PENDING_AGE_ALERT_THRESHOLD_MS / 60000)
+          logger.error({ stuck: stuck.length, oldestMin: Math.floor(stuck[0].ageMs / 60000) }, 'Inter-agent message queue starving -- pending rows past age threshold')
+          sendAlert(`⛔ Az inter-agent uzenetsor akad: ${stuck.length} uzenet ${thresholdMin}+ perce pending, es a cel-agent NEM dolgozik epp (vagy wedge-jelet mutat). Legidosebbek: ${list}. Nezd meg a dashboard uzenetsort.`)
+        }
       }
     } catch (err) {
       logger.warn({ err }, 'channel-monitor: pending-age watchdog pass failed')

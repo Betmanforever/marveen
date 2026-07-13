@@ -15,7 +15,7 @@
 // Both are pure, so unit-test them directly -- no tmux/db mocking needed.
 
 import { describe, it, expect } from 'vitest'
-import { decidePendingAgeAlert, decideCoordinatorNudge } from '../web/message-router.js'
+import { decidePendingAgeAlert, decideCoordinatorNudge, shouldAlertStuckTarget } from '../web/message-router.js'
 
 const THRESHOLD_MS = 3 * 60 * 1000 // 3 min
 const DEDUP_MS = 15 * 60 * 1000 // 15 min
@@ -77,5 +77,36 @@ describe('decideCoordinatorNudge: idle-coordinator inbox self-poll', () => {
 
   it('does not stall on backwards clock skew (nudges now)', () => {
     expect(decideCoordinatorNudge(NUDGE_THRESHOLD_MS + 1, 2_000_000, 1_000_000, NUDGE_THRESHOLD_MS, NUDGE_DEDUP_MS)).toBe(true)
+  })
+})
+
+describe('shouldAlertStuckTarget: busy-vs-wedged discrimination', () => {
+  const CEILING_MS = 15 * 60 * 1000
+  const AGE_MS = 4 * 60 * 1000 // past the 3-min threshold, well under the ceiling
+
+  it('suppresses a healthy-busy target (working turn = latency, not starvation)', () => {
+    // The 2026-07-13 09:00 false alarm: coordinator mid-turn, no wedge signal.
+    expect(shouldAlertStuckTarget('busy', false, AGE_MS, CEILING_MS)).toBe(false)
+  })
+
+  it('alerts on a non-busy target regardless of wedge signal', () => {
+    expect(shouldAlertStuckTarget('idle', false, AGE_MS, CEILING_MS)).toBe(true)
+    expect(shouldAlertStuckTarget('typing', false, AGE_MS, CEILING_MS)).toBe(true)
+  })
+
+  it('alerts on a busy target that shows a wedge signal (parked input / context ceiling)', () => {
+    expect(shouldAlertStuckTarget('busy', true, AGE_MS, CEILING_MS)).toBe(true)
+  })
+
+  it('fail-open: an unreadable pane always alerts', () => {
+    expect(shouldAlertStuckTarget(null, false, AGE_MS, CEILING_MS)).toBe(true)
+    expect(shouldAlertStuckTarget('unknown', false, AGE_MS, CEILING_MS)).toBe(true)
+    expect(shouldAlertStuckTarget('error', false, AGE_MS, CEILING_MS)).toBe(true)
+  })
+
+  it('hard ceiling re-includes even a healthy-busy target (endless turn = starvation)', () => {
+    // Boundary-strict: exactly at the ceiling is still suppressed for busy.
+    expect(shouldAlertStuckTarget('busy', false, CEILING_MS, CEILING_MS)).toBe(false)
+    expect(shouldAlertStuckTarget('busy', false, CEILING_MS + 1, CEILING_MS)).toBe(true)
   })
 })

@@ -120,6 +120,29 @@ export function decidePendingAgeAlert(
 }
 
 /**
+ * Pure decision: does a stuck pending message's TARGET state warrant an owner
+ * alert, or is the delay benign? A pull-model/push target that is ACTIVELY
+ * WORKING (busy pane, no wedge signals) holds its inbox until the turn ends by
+ * design -- alerting on that is a false alarm (2026-07-13 09:00: the 3-minute
+ * blind alert fired on a merely-busy coordinator and paged the operator).
+ * Suppress ONLY while all three hold: the pane is genuinely busy, shows no
+ * wedge signal (parked input / context ceiling), and the message has not
+ * out-waited the hard ceiling -- past the ceiling a "busy" pane is itself
+ * suspect (an endless turn starves the queue just as dead as a wedge).
+ * Fail-open: an unreadable pane ('unknown'/'error'/null capture) always alerts.
+ */
+export function shouldAlertStuckTarget(
+  paneState: string | null,
+  wedgeSignal: boolean,
+  ageMs: number,
+  hardCeilingMs: number,
+): boolean {
+  if (ageMs > hardCeilingMs) return true
+  if (wedgeSignal) return true
+  return paneState !== 'busy'
+}
+
+/**
  * Pure decision: should the router inject a self-poll nudge into the main
  * (coordinator) channels session? The main agent uses a PULL model -- it drains
  * its own inbox each turn -- so an IDLE coordinator can leave a message pending
