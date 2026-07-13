@@ -42,10 +42,26 @@ def _web_port():
     return "3420"
 
 
+def _trace(line):
+    """Append a one-line trace to store/inbox-drain.log. The silent `except:
+    pass` below made a 2026-07-13 delivery outage undiagnosable (the hook
+    stopped claiming for hours with zero evidence of WHERE it died -- gate,
+    token, HTTP, or never invoked at all). Never raises; tracing must not
+    break the never-block-the-prompt contract."""
+    try:
+        import datetime
+        path = os.path.join(ledger_lib._install_dir(), "store", "inbox-drain.log")
+        with open(path, "a") as f:
+            f.write("%s %s\n" % (datetime.datetime.now().strftime("%m-%d %H:%M:%S"), line))
+    except Exception:
+        pass
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
     except Exception:
+        _trace("EXIT bad-stdin-payload")
         sys.exit(0)
 
     agent_id = ledger_lib.agent_id_from_cwd(payload.get("cwd"))
@@ -68,12 +84,14 @@ def main():
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.load(resp)
         text = (data or {}).get("text") or ""
+        _trace("OK count=%s" % (data or {}).get("count"))
         if text:
             # UserPromptSubmit hook stdout is prepended to the agent's context.
             sys.stdout.write(text)
             sys.stdout.write("\n")
-    except Exception:
-        pass  # never block the prompt on a drain error -- the next turn retries
+    except Exception as e:
+        # never block the prompt on a drain error -- the next turn retries
+        _trace("FAIL %s: %s" % (type(e).__name__, e))
 
     sys.exit(0)
 
