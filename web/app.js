@@ -286,6 +286,7 @@ function switchPage(pageId) {
   if (pageId === 'team') { loadTeamGraph() }
   if (pageId === 'messages') loadMessagesPage()
   if (pageId === 'tokenUsage') loadTokenUsage()
+  if (pageId === 'costs') loadCosts()
   if (pageId === 'ideas') loadIdeasPage()
   if (pageId === 'archived') loadArchivedPage()
   if (pageId === 'naplo') loadNaplo()
@@ -331,7 +332,7 @@ const NAV_I18N = {
   skills: 'nav.skills', connectors: 'nav.connectors', migrate: 'nav.migrate',
   docs: 'nav.docs', status: 'nav.status', autonomy: 'nav.autonomy',
   settings: 'nav.settings', vault: 'nav.vault', tokenUsage: 'nav.tokenUsage',
-  ideas: 'nav.ideas', updates: 'nav.updates',
+  ideas: 'nav.ideas', updates: 'nav.updates', costs: 'nav.costs',
 }
 
 function renderNav() {
@@ -374,6 +375,7 @@ const PAGE_HEADER_I18N = {
   tokenUsagePage: { title: 'tokenUsage.page_title',  sub: 'tokenUsage.page_subtitle' },
   updatesPage:    { title: 'updates.page_title',     sub: null },
   naploPage:      { title: 'naplo.page_title',       sub: 'naplo.page_subtitle' },
+  costsPage:      { title: 'costs.page_title',       sub: 'costs.page_subtitle' },
 }
 
 function renderStaticI18n() {
@@ -388,8 +390,8 @@ function renderStaticI18n() {
   }
   // Kanban column titles
   const colTitles = document.querySelectorAll('.kanban-col-title')
-  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.waiting', 'kanban.col.done']
-  const statuses = ['planned', 'in_progress', 'waiting', 'done']
+  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.waiting', 'kanban.col.testing', 'kanban.col.done']
+  const statuses = ['planned', 'in_progress', 'waiting', 'testing', 'done']
   colTitles.forEach((el) => {
     const status = el.closest('[data-status]')?.dataset?.status
     if (status) {
@@ -633,6 +635,9 @@ let kanbanGroupByInitialized = false
 // Which swimlane keys (assignee name or priority value) are collapsed. Lives
 // for the page session only -- intentionally not persisted across reloads.
 const kanbanCollapsedLanes = new Set()
+// Set of status column keys that are hidden from the board view.
+// Empty = all columns visible. Persisted in localStorage.
+let kanbanHiddenColumns = new Set()
 
 const cardModalOverlay = document.getElementById('cardModalOverlay')
 const cardDetailOverlay = document.getElementById('cardDetailOverlay')
@@ -688,6 +693,10 @@ async function loadKanban() {
         const storedLabels = JSON.parse(localStorage.getItem('marveen.kanbanLabelFilter') || '[]')
         if (Array.isArray(storedLabels)) kanbanLabelFilter = new Set(storedLabels)
       } catch { /* ignore malformed storage */ }
+      try {
+        const storedHiddenCols = JSON.parse(localStorage.getItem('marveen.kanbanHiddenColumns') || '[]')
+        if (Array.isArray(storedHiddenCols)) kanbanHiddenColumns = new Set(storedHiddenCols)
+      } catch { /* ignore malformed storage */ }
     }
     const [cardsRes, assigneesRes, projectsRes, labelsRes] = await Promise.all([
       fetch('/api/kanban'),
@@ -726,6 +735,27 @@ function populateProjectFilter() {
     sel.appendChild(opt)
   }
   if (prev && !kanbanProjects.includes(prev)) kanbanProjectFilter = ''
+}
+
+function renderKanbanColumnChips() {
+  const container = document.getElementById('kanbanColumnChips')
+  if (!container) return
+  container.innerHTML = ''
+  for (const def of KANBAN_STATUS_DEFS) {
+    const hidden = kanbanHiddenColumns.has(def.status)
+    const label = typeof def.title === 'function' ? def.title() : def.title
+    const chip = document.createElement('span')
+    chip.className = 'kanban-col-chip' + (hidden ? ' hidden' : '')
+    chip.title = hidden ? t('kanban.filter.column_show') : t('kanban.filter.column_hide')
+    chip.textContent = label
+    chip.addEventListener('click', () => {
+      if (kanbanHiddenColumns.has(def.status)) kanbanHiddenColumns.delete(def.status)
+      else kanbanHiddenColumns.add(def.status)
+      localStorage.setItem('marveen.kanbanHiddenColumns', JSON.stringify([...kanbanHiddenColumns]))
+      renderKanban()
+    })
+    container.appendChild(chip)
+  }
 }
 
 function populateProjectSuggestions() {
@@ -903,6 +933,7 @@ function renderKanbanQuickFilters() {
 function renderKanban() {
   const cardById = new Map(kanbanCards.map(c => [c.id, c]))
 
+  renderKanbanColumnChips()
   renderKanbanQuickFilters()
 
   // Determine which top-level cards are visible under current filters.
@@ -925,7 +956,7 @@ function renderKanban() {
     if (parent.status === card.status) embeddedSubtaskIds.add(card.id)
   }
 
-  const grouped = { planned: [], in_progress: [], waiting: [], done: [] }
+  const grouped = { planned: [], in_progress: [], waiting: [], testing: [], done: [] }
   for (const card of kanbanCards) {
     if (embeddedSubtaskIds.has(card.id)) continue
     if (!visibleCardIds.has(card.id)) continue
@@ -935,6 +966,7 @@ function renderKanban() {
   // Update counts (embedded subtasks don't count as separate cards)
   document.getElementById('countPlanned').textContent = grouped.planned.length
   document.getElementById('countInProgress').textContent = grouped.in_progress.length
+  document.getElementById('countTesting').textContent = grouped.testing.length
   document.getElementById('countWaiting').textContent = grouped.waiting.length
   document.getElementById('countDone').textContent = grouped.done.length
 
@@ -956,6 +988,25 @@ function renderKanban() {
         col.appendChild(createCardEl(card, embeddedChildren))
       }
     }
+    // Hide/show flat-board columns based on visibility set
+    const allColsHidden = KANBAN_STATUS_DEFS.every(d => kanbanHiddenColumns.has(d.status))
+    for (const def of KANBAN_STATUS_DEFS) {
+      const colEl = flatBoard.querySelector(`.kanban-col[data-status="${def.status}"]`)
+      if (colEl) colEl.hidden = kanbanHiddenColumns.has(def.status)
+    }
+    // "All columns hidden" hint
+    let allHiddenMsg = document.getElementById('kanbanAllHiddenMsg')
+    if (allColsHidden) {
+      if (!allHiddenMsg) {
+        allHiddenMsg = document.createElement('p')
+        allHiddenMsg.id = 'kanbanAllHiddenMsg'
+        allHiddenMsg.style.cssText = 'color:var(--muted);font-size:13px;padding:24px 0;text-align:center;width:100%;'
+        flatBoard.appendChild(allHiddenMsg)
+      }
+      allHiddenMsg.textContent = t('kanban.filter.all_cols_hidden')
+    } else {
+      allHiddenMsg?.remove()
+    }
     // Badge: only count subtasks that are in a different column (not embedded here)
     updateSubtaskBadges(embeddedSubtaskIds)
     // WIP limit badges (count/limit + colour) on the flat board too -- previously
@@ -973,6 +1024,7 @@ const KANBAN_STATUS_DEFS = [
   { status: 'planned', title: () => t('kanban.col.planned') },
   { status: 'in_progress', title: () => t('kanban.col.in_progress') },
   { status: 'waiting', title: () => t('kanban.col.waiting') },
+  { status: 'testing', title: () => t('kanban.col.testing') },
   { status: 'done', title: () => t('kanban.col.done') },
 ]
 const KANBAN_PRIORITY_LABELS = { urgent: () => t('kanban.priority.urgent'), high: () => t('kanban.priority.high'), normal: () => t('kanban.priority.normal'), low: () => t('kanban.priority.low') }
@@ -1028,7 +1080,7 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
     for (const def of KANBAN_STATUS_DEFS) {
       const cards = grouped[def.status].filter(c => kanbanSwimlaneKeyFor(c) === key)
       laneCardsByStatus[def.status] = cards
-      totalCount += cards.length
+      if (!kanbanHiddenColumns.has(def.status)) totalCount += cards.length
     }
 
     const lane = document.createElement('div')
@@ -1055,6 +1107,7 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
     const body = document.createElement('div')
     body.className = 'kanban-swimlane-body'
     for (const def of KANBAN_STATUS_DEFS) {
+      if (kanbanHiddenColumns.has(def.status)) continue
       const col = document.createElement('div')
       col.className = 'kanban-swimlane-col'
 
@@ -1093,6 +1146,7 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
 const WIP_COUNT_IDS = {
   planned: 'countPlanned',
   in_progress: 'countInProgress',
+  testing: 'countTesting',
   waiting: 'countWaiting',
   done: 'countDone',
 }
@@ -1550,7 +1604,7 @@ async function showCardDetail(card) {
     : null
   const assigneeDisplay = assignee ? (assignee.displayName || assignee.name) : (rawDetailAssignee || '-- nincs --')
   const priorityLabels = { low: t('kanban.priority.low'), normal: t('kanban.priority.normal'), high: t('kanban.priority.high'), urgent: t('kanban.priority.urgent') }
-  const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
+  const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
 
   const meta = document.getElementById('cardDetailMeta')
   const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
@@ -1642,7 +1696,7 @@ async function showCardDetail(card) {
     parentSelect.innerHTML = `<option value="">${t('kanban.parent.empty')}</option>`
     const availableParents = kanbanCards.filter(c =>
       !c.parent_id && c.id !== card.id && !c.archived_at &&
-      (c.status === 'planned' || c.status === 'in_progress' || c.status === 'waiting')
+      (c.status === 'planned' || c.status === 'in_progress' || c.status === 'testing' || c.status === 'waiting')
     )
     for (const p of availableParents) {
       const opt = document.createElement('option')
@@ -1799,7 +1853,7 @@ async function showCardDetail(card) {
       addSubtaskSection.style.display = 'none'
     }
 
-    const statusLabelsShort = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), waiting: t('kanban.status.waiting_short'), done: t('kanban.status.done') }
+    const statusLabelsShort = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting_short'), done: t('kanban.status.done') }
     if (children.length > 0 || isTask) {
       section.style.display = ''
       list.innerHTML = ''
@@ -2104,6 +2158,51 @@ function populateProfileSelect(selectEl, descEl, selected) {
     selectEl.onchange = updateDesc
     updateDesc()
   })
+}
+
+// Populate the per-agent Claude subscription plan dropdown from the named
+// registry (/api/claude-plans). The empty value means "no named plan" -> the
+// agent keeps its raw config-dir / host default. The description line shows the
+// plan type + config dir and flags a Channels-forbidden plan so the operator
+// sees the guardrail context before saving.
+function populatePlanSelect(selectEl, descEl, selected) {
+  if (!selectEl) return
+  fetch('/api/claude-plans')
+    .then(res => (res.ok ? res.json() : []))
+    .catch(() => [])
+    .then((plans) => {
+      const known = plans.some(p => p.id === selected)
+      const opts = [`<option value="">${escapeHtml(t('agents.settings.plan_default'))}</option>`]
+      for (const p of plans) {
+        opts.push(`<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}</option>`)
+      }
+      // Preserve an already-assigned plan id that is NOT in the loaded registry
+      // (registry edited/renamed, OR /api/claude-plans transiently failed and
+      // returned []). Without this the dropdown would resolve to '' and a save
+      // would silently wipe the real assignment.
+      if (selected && !known) {
+        opts.push(`<option value="${escapeHtml(selected)}">${escapeHtml(selected)}${escapeHtml(t('agents.settings.plan_not_found_suffix'))}</option>`)
+      }
+      selectEl.innerHTML = opts.join('')
+      selectEl.value = selected || ''
+      const updateDesc = () => {
+        if (!descEl) return
+        const val = selectEl.value
+        if (!val) {
+          descEl.textContent = t('agents.settings.plan_default_desc')
+          return
+        }
+        const p = plans.find(x => x.id === val)
+        if (!p) {
+          descEl.textContent = t('agents.settings.plan_unresolved_desc', { id: val })
+          return
+        }
+        const warn = p.channelsAllowed ? '' : t('agents.settings.plan_no_channels')
+        descEl.textContent = `${p.planType} · ${p.configDir}${warn}`
+      }
+      selectEl.onchange = updateDesc
+      updateDesc()
+    })
 }
 
 function resetWizard() {
@@ -2673,6 +2772,15 @@ async function openAgentDetail(agentName) {
     document.getElementById('editAgentProfileDesc'),
     currentAgent.securityProfile || 'default',
   )
+  // The main agent's Claude login is managed via channels.sh, not the per-agent
+  // config path, so plan selection does not apply to it. Hide the whole group.
+  const planGroup = document.getElementById('claudePlanGroup')
+  if (planGroup) planGroup.hidden = currentAgent.role === 'main'
+  populatePlanSelect(
+    document.getElementById('editAgentPlan'),
+    document.getElementById('editAgentPlanDesc'),
+    currentAgent.claudePlan || '',
+  )
   renderTeamEditor(currentAgent, agents)
   updateAuthModeUI(currentAgent.authMode || 'shared', currentAgent.hasApiKey || false)
   const memIsoToggle = document.getElementById('memoryIsolationToggle')
@@ -2711,6 +2819,43 @@ async function openAgentDetail(agentName) {
       loadAgents()
     } catch (err) {
       showToast(t('common.error_delete'))
+    }
+  }
+
+  // Export button: download a portable .tar.gz bundle of this agent. Offers to
+  // include channel tokens (off by default -- the safe-to-share variant).
+  // The download goes through the auth-wrapped fetch (the global fetch shim
+  // injects the Bearer header) and is turned into a Blob download, rather than
+  // a plain navigation -- a window.location download cannot carry the
+  // Authorization header and the API would 401 it.
+  document.getElementById('exportAgentBtn').onclick = async () => {
+    if (!currentAgent) return
+    const withSecrets = confirm(
+      'Belevegyük a titkokat (channel bot token, párosítási állapot)?\n\n' +
+      'OK = igen, csak saját gépek közötti átvitelhez.\n' +
+      'Mégse = nem, biztonságosan megosztható (csak identitás + viselkedés).'
+    )
+    const name = currentAgent.name
+    const url = `/api/agents/${encodeURIComponent(name)}/export${withSecrets ? '?secrets=1' : ''}`
+    try {
+      const res = await fetch(url)
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        showToast(data.error || 'Hiba az exportálás során')
+        return
+      }
+      const blob = await res.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = objectUrl
+      a.download = `marveen-agent-${name}.tar.gz`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(objectUrl)
+      showToast(`Ügynök exportálva${withSecrets ? ' (titkokkal)' : ''}`)
+    } catch {
+      showToast('Hiba az exportálás során')
     }
   }
 
@@ -3291,6 +3436,88 @@ document.getElementById('analyzeAllModelsBtn').addEventListener('click', async (
   } catch { panel.innerHTML = '<p style="color:var(--error);font-size:13px">' + t('agents.model.error') + '</p>' }
 })
 
+// === Export ALL agents (whole fleet) into one .tar.gz bundle ===
+const exportAllAgentsBtn = document.getElementById('exportAllAgentsBtn')
+if (exportAllAgentsBtn) {
+  exportAllAgentsBtn.addEventListener('click', async () => {
+    const withSecrets = confirm(
+      'Belevegyük a titkokat (channel bot tokenek, párosítási állapot) MINDEN ügynöknél?\n\n' +
+      'OK = igen, csak saját gépek közötti átvitelhez.\n' +
+      'Mégse = nem, biztonságosan megosztható (csak identitás + viselkedés).'
+    )
+    const url = `/api/agents/export-all${withSecrets ? '?secrets=1' : ''}`
+    try {
+      const res = await fetch(url)
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        showToast(data.error || 'Hiba az exportálás során')
+        return
+      }
+      const blob = await res.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = objectUrl
+      a.download = 'marveen-fleet.tar.gz'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(objectUrl)
+      showToast(`Flotta exportálva${withSecrets ? ' (titkokkal)' : ''}`)
+    } catch {
+      showToast('Hiba az exportálás során')
+    }
+  })
+}
+
+// === Agent import (upload a .tar.gz bundle exported from another machine) ===
+// Accepts both a single-agent bundle and a whole-fleet bundle -- the backend
+// auto-detects the format from the manifest.
+const importAgentBtn = document.getElementById('importAgentBtn')
+const importAgentFile = document.getElementById('importAgentFile')
+if (importAgentBtn && importAgentFile) {
+  importAgentBtn.addEventListener('click', () => importAgentFile.click())
+  importAgentFile.addEventListener('change', async () => {
+    const file = importAgentFile.files && importAgentFile.files[0]
+    if (!file) return
+    // Reset the input so picking the same file again re-fires change.
+    const upload = async (overwrite) => {
+      const form = new FormData()
+      form.append('file', file)
+      if (overwrite) form.append('overwrite', '1')
+      const res = await fetch('/api/agents/import', { method: 'POST', body: form })
+      const data = await res.json().catch(() => ({}))
+      return { res, data }
+    }
+    try {
+      let { res, data } = await upload(false)
+      if (res.status === 409) {
+        const prompt = data.kind === 'fleet'
+          ? 'Néhány ügynök már létezik ezen a gépen. Felülírjuk az ütközőket?'
+          : `Már létezik "${data.name || ''}" nevű ügynök. Felülírjuk?`
+        if (confirm(prompt)) {
+          ;({ res, data } = await upload(true))
+        } else {
+          return
+        }
+      }
+      if (!res.ok) { showToast(data.error || 'Hiba az importálás során'); return }
+      const note = data.includedSecrets ? ' (titkokkal)' : ''
+      if (data.kind === 'fleet') {
+        const n = (data.imported || []).length
+        const skipped = (data.skipped || []).length
+        showToast(`Flotta importálva: ${n} ügynök${note}${skipped ? ` (${skipped} kihagyva)` : ''}`)
+      } else {
+        showToast(`Ügynök importálva: ${data.name}${note}${data.overwritten ? ' (felülírva)' : ''}`)
+      }
+      loadAgents()
+    } catch {
+      showToast('Hiba az importálás során')
+    } finally {
+      importAgentFile.value = ''
+    }
+  })
+}
+
 document.getElementById('saveAutoRestartBtn').addEventListener('click', async () => {
   if (!currentAgent) return
   // Auto-restart applies to the main session too, so (unlike model/profile) we
@@ -3452,6 +3679,24 @@ document.getElementById('saveProfileBtn').addEventListener('click', async () => 
     showToast(body.requiresRestart ? t('agents.toast.profile_saved_restart') : t('agents.toast.profile_saved'))
     loadAgents()
   } catch { showToast(t('agents.toast.profile_error')) }
+})
+
+document.getElementById('savePlanBtn').addEventListener('click', async () => {
+  // The main agent's login comes up via channels.sh, not this path, so its
+  // plan is not settable here (the selector is hidden for it anyway).
+  if (!currentAgent || currentAgent.role === 'main') return
+  const claudePlan = document.getElementById('editAgentPlan').value
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claudePlan }),
+    })
+    if (!res.ok) throw new Error()
+    currentAgent.claudePlan = claudePlan || null
+    showToast(t('agents.toast.plan_saved'))
+    loadAgents()
+  } catch { showToast(t('agents.toast.plan_error')) }
 })
 
 // === Auth Mode ===
@@ -8612,6 +8857,68 @@ async function loadStatus() {
 }
 
 // ============================================================
+// === CostOps (v0.1, PR #524): local cost ledger summary ===
+// ============================================================
+
+document.getElementById('refreshCostsBtn').addEventListener('click', loadCosts)
+
+async function loadCosts() {
+  const el = document.getElementById('costsContent')
+  const mutedStyle = 'color:var(--text-muted);font-size:13px'
+  el.innerHTML = `<div style="${mutedStyle}">${t('costs.loading')}</div>`
+  try {
+    const res = await fetch('/api/costs/summary')
+    const s = await res.json()
+    if (!res.ok) throw new Error(s?.error || 'request failed')
+
+    const fmtMoney = (n) => (typeof n === 'number' ? n.toLocaleString('hu-HU') : '—') + ' ' + escapeHtml(s.currency || '')
+
+    let html = ''
+
+    if (!s.config_present) {
+      html += `<div style="${mutedStyle};margin-bottom:12px">${t('costs.no_config')}</div>`
+    }
+
+    html += `<div class="overview-stats">
+      <div class="overview-stat"><div class="overview-stat-value">${fmtMoney(s.current_spend)}</div><div class="overview-stat-label">${t('costs.current_spend')}</div></div>
+      <div class="overview-stat"><div class="overview-stat-value">${fmtMoney(s.forecast_month_end)}</div><div class="overview-stat-label">${t('costs.forecast')}</div></div>
+      <div class="overview-stat"><div class="overview-stat-value">${escapeHtml(s.month || '—')}</div><div class="overview-stat-label">${t('costs.month')}</div></div>
+    </div>`
+
+    if (s.budget) {
+      const pct = Math.round((s.budget.used_pct || 0) * 100)
+      const color = s.budget.status === 'hard' ? 'var(--danger,#e74c3c)' : s.budget.status === 'warning' ? 'var(--warn,#e0a800)' : 'var(--text-muted)'
+      html += `<div style="margin-top:16px;padding:12px 16px;border:1px solid var(--border,#333);border-radius:8px">
+        <div style="font-weight:600;margin-bottom:6px">${t('costs.budget_title')}: ${escapeHtml(s.budget.id)} (${fmtMoney(s.budget.amount)})</div>
+        <div style="${mutedStyle}">${t('costs.budget_used')}: <strong style="color:${color}">${pct}%</strong></div>
+      </div>`
+    }
+
+    const sources = Array.isArray(s.all_sources) ? s.all_sources : []
+    if (sources.length === 0) {
+      html += `<div style="${mutedStyle};margin-top:12px">${t('costs.no_sources')}</div>`
+    } else {
+      html += `<div style="overflow-x:auto;margin-top:16px"><table style="width:100%;border-collapse:collapse">
+        <thead><tr style="text-align:left;border-bottom:1px solid var(--border,#333)">
+          <th style="padding:6px 8px">${t('costs.source_name')}</th><th style="padding:6px 8px">${t('costs.source_provider')}</th><th style="padding:6px 8px">${t('costs.source_spend')}</th>
+        </tr></thead>
+        <tbody>${sources.map((src) => `<tr style="border-bottom:1px solid var(--border,#222)">
+          <td style="padding:6px 8px">${escapeHtml(src.name)}</td>
+          <td style="padding:6px 8px;${mutedStyle}">${escapeHtml(src.provider)}</td>
+          <td style="padding:6px 8px">${fmtMoney(src.spend)}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>`
+    }
+
+    html += `<p style="${mutedStyle};margin-top:16px">${t('costs.token_usage_note')} (${(s.token_usage?.calls ?? 0)} ${t('costs.calls')}, ${(s.token_usage?.input_tokens ?? 0) + (s.token_usage?.output_tokens ?? 0)} tokens)</p>`
+
+    el.innerHTML = html
+  } catch (err) {
+    el.innerHTML = `<div style="${mutedStyle}">${t('costs.load_failed')}</div>`
+  }
+}
+
+// ============================================================
 // === Memory Import ===
 // ============================================================
 
@@ -9277,6 +9584,24 @@ const CHAT_SYSTEM_AGENTS = new Set(['heartbeat','telegram-coordinator','channel-
 // recognizes its real owner. Empty until _marveen resolves (no false match).
 function chatOwnerName() { return window._marveen?.ownerName || '' }
 
+// The main agent's display name (BOT_NAME). mainAgentId() is the routing id
+// (e.g. "marveen") used for matching, avatar lookups and API calls; this is
+// what the user should SEE. Sourced from the backend (/api/marveen -> name,
+// mirrored into _brandTokens.bot by initSidebarBrand), so a renamed install
+// shows its real bot name. Falls back to the id before _marveen resolves.
+// Regression #519/#520: keep the four Messages-view display points routing the
+// main agent id through chatDisplayName -- a later refactor once stripped this
+// and leaked the raw routing id again. Guarded by messages-view-display-name.test.ts.
+function mainAgentDisplayName() {
+  return window._marveen?.name || window._brandTokens?.bot || mainAgentId()
+}
+// Map a routing agent id to its user-facing label: the main agent's id becomes
+// its BOT_NAME display name; every other agent already carries a human name as
+// its id, so it passes through unchanged.
+function chatDisplayName(name) {
+  return name === mainAgentId() ? mainAgentDisplayName() : name
+}
+
 function chatLastSeenKey(agentName) { return 'chat_last_seen_' + agentName }
 function chatGetLastSeen(agentName) { return parseInt(localStorage.getItem(chatLastSeenKey(agentName)) || '0', 10) }
 function chatMarkSeen(agentName, maxId) {
@@ -9349,7 +9674,7 @@ async function loadChatAgentList() {
       const isSelected = name === chatSelectedAgent ? ' selected' : ''
       const dimmed = info ? '' : ' style="opacity:0.5"'
       const unread = chatIsUnread(name, info)
-      const displayName = owner && name === owner ? owner + ' (te)' : name
+      const displayName = owner && name === owner ? owner + ' (te)' : chatDisplayName(name)
       return `<div class="chat-agent-item${isSelected}${unread ? ' unread' : ''}" data-agent="${escapeHtml(name)}"${dimmed}>
         <div class="chat-agent-avatar">${chatAvatarHtml(name, 40)}</div>
         <div class="chat-agent-info">
@@ -9393,7 +9718,7 @@ async function loadChatThread(agentName) {
   chatThreadState.loading = false
 
   const owner = chatOwnerName()
-  const threadDisplayName = owner && agentName === owner ? owner + ' (te)' : agentName
+  const threadDisplayName = owner && agentName === owner ? owner + ' (te)' : chatDisplayName(agentName)
 
   panel.innerHTML = `
     <div class="chat-thread-header">
@@ -9406,7 +9731,7 @@ async function loadChatThread(agentName) {
     <div class="chat-bubbles" id="chatBubbles"><div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">${t('messages.loading')}</div></div>
     <div class="chat-compose">
       <div class="chat-compose-row">
-        <textarea id="chatComposeText" class="chat-compose-input" rows="2" placeholder="${t('messages.placeholder', { agent: escapeHtml(agentName) })}"></textarea>
+        <textarea id="chatComposeText" class="chat-compose-input" rows="2" placeholder="${t('messages.placeholder', { agent: escapeHtml(chatDisplayName(agentName)) })}"></textarea>
         <button class="btn-primary btn-compact chat-send-btn" id="chatSendBtn">${t('messages.send_btn')}</button>
       </div>
     </div>
@@ -9446,7 +9771,10 @@ async function loadChatThread(agentName) {
 
 function buildBubbleHtml(m) {
   const isOutgoing = m.from_agent === mainAgentId()
+  // senderName stays the routing id (avatar lookup keys off it); senderLabel is
+  // what the user sees, so the main agent reads as its BOT_NAME, not "marveen".
   const senderName = isOutgoing ? mainAgentId() : m.from_agent
+  const senderLabel = chatDisplayName(senderName)
   const when = m.created_at ? new Date(m.created_at * 1000).toLocaleString('hu-HU', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''
   const statusMetaRaw = MSG_STATUS_META[m.status] || { label: m.status || '', cls: 'badge' }
   const statusMeta = { ...statusMetaRaw, label: typeof statusMetaRaw.label === 'function' ? statusMetaRaw.label() : statusMetaRaw.label }
@@ -9454,7 +9782,7 @@ function buildBubbleHtml(m) {
     ${!isOutgoing ? `<div class="chat-bubble-avatar">${chatAvatarHtml(senderName, 28)}</div>` : ''}
     <div class="chat-bubble ${isOutgoing ? 'bubble-out' : 'bubble-in'}">
       <div class="bubble-meta">
-        ${!isOutgoing ? `<span class="bubble-sender">${escapeHtml(senderName)}</span>` : ''}
+        ${!isOutgoing ? `<span class="bubble-sender">${escapeHtml(senderLabel)}</span>` : ''}
         <span class="bubble-id-chip">#${m.id}</span>
         <span class="badge ${statusMeta.cls}" style="font-size:10px">${escapeHtml(statusMeta.label)}</span>
       </div>
@@ -9787,8 +10115,14 @@ function escapeHtmlUpdates(s) {
 function renderUpdatesBadge(status) {
   const badge = document.getElementById('updatesBadge')
   if (!badge) return
-  if (status && status.behind && status.behind > 0) {
-    badge.textContent = String(status.behind)
+  // Version-centric: show the number of NEW VERSIONS, not raw commits. Fall back
+  // to the behind count only in the rare pre-release state (unreleased commits
+  // but no new version tag yet).
+  const versionCount = status && Array.isArray(status.releases)
+    ? status.releases.filter((r) => r.version).length : 0
+  const count = versionCount > 0 ? versionCount : ((status && status.behind) || 0)
+  if (count > 0) {
+    badge.textContent = String(count)
     badge.hidden = false
   } else {
     badge.hidden = true
@@ -9827,7 +10161,14 @@ async function loadUpdates() {
       applyBtn.hidden = true
     } else {
       summary.className = 'updates-summary behind'
-      summary.innerHTML = `<strong>${t('updates.behind', { n: data.behind })}</strong> ${t('updates.available_on', { remote: `<code>${escapeHtmlUpdates(data.remote)}</code>` })}<br>${t('updates.current_label')} <code>${cur}</code> → ${t('updates.latest_label')} <code>${lat}</code>`
+      const versions = (data.releases || []).filter((r) => r.version)
+      if (versions.length > 0) {
+        // Version-centric: "N uj verzio elerheto (v1.21.0)".
+        summary.innerHTML = `<strong>${t('updates.versions_available', { n: versions.length })}</strong> <code>${escapeHtmlUpdates(versions[0].version)}</code>`
+      } else {
+        // Pre-release: unreleased commits but no new version tag yet.
+        summary.innerHTML = `<strong>${t('updates.changes_available')}</strong> ${t('updates.available_on', { remote: `<code>${escapeHtmlUpdates(data.remote)}</code>` })}`
+      }
       applyBtn.hidden = false
     }
     const commitCard = (c) => `
@@ -9839,25 +10180,25 @@ async function loadUpdates() {
           <div class="updates-commit-msg">${escapeHtmlUpdates(c.message)}</div>
         </div>`
     if (data.releases && data.releases.length) {
-      // Grouped-by-release view: one collapsible <details> per version, newest
-      // open by default. Falls back to the flat list below when absent.
-      list.innerHTML = data.releases.map((rel, idx) => {
-        const label = rel.version
-          ? escapeHtmlUpdates(rel.version)
-          : t('updates.group.upcoming')
-        const summary = rel.summary
-          ? `<span class="updates-group-summary">${escapeHtmlUpdates(rel.summary)}</span>`
-          : ''
-        const count = t('updates.group.commit_count', { n: rel.commits.length })
+      // Version-centric: the human-language summary per version is the primary
+      // content; the raw commit list (SHAs, conventional-commit prefixes, author
+      // names) is tucked behind a collapsed "details" so it is never the first
+      // thing the operator sees.
+      list.innerHTML = data.releases.map((rel) => {
+        const isUpcoming = !rel.version
+        const label = isUpcoming ? t('updates.group.upcoming') : escapeHtmlUpdates(rel.version)
+        const human = rel.summary
+          ? escapeHtmlUpdates(rel.summary)
+          : (isUpcoming ? t('updates.upcoming_note') : '')
         return `
-        <details class="updates-group"${idx === 0 ? ' open' : ''}>
-          <summary class="updates-group-head">
-            <span class="updates-group-tag">${label}</span>
-            ${summary}
-            <span class="updates-group-count">${count}</span>
-          </summary>
-          <div class="updates-commit-list">${rel.commits.map(commitCard).join('')}</div>
-        </details>`
+        <div class="updates-version">
+          <div class="updates-version-tag">${label}</div>
+          ${human ? `<div class="updates-version-summary">${human}</div>` : ''}
+          <details class="updates-version-details">
+            <summary>${t('updates.details', { n: rel.commits.length })}</summary>
+            <div class="updates-commit-list">${rel.commits.map(commitCard).join('')}</div>
+          </details>
+        </div>`
       }).join('')
     } else if (data.commits && data.commits.length) {
       list.innerHTML = data.commits.map(commitCard).join('')
@@ -9868,6 +10209,50 @@ async function loadUpdates() {
     summary.className = 'updates-summary error'
     summary.textContent = 'Hiba: ' + (err.message || err)
     applyBtn.hidden = true
+  }
+  renderDiagnoseOffer()
+}
+
+// Post-rollback diagnosis offer (PR-D). Reads /api/updates/status: if the last
+// update failed/rolled-back and this host can run a Claude agent, offer the
+// opt-in fixer; if it cannot (AVX), show a manual-intervention note instead.
+async function renderDiagnoseOffer() {
+  const box = document.getElementById('updatesDiagnose')
+  if (!box) return
+  let data
+  try { data = await (await fetch('/api/updates/status')).json() } catch { box.hidden = true; return }
+  if (data.needsHuman) {
+    box.hidden = false
+    box.className = 'updates-diagnose needs-human'
+    box.innerHTML = `<strong>${escapeHtmlUpdates(t('updates.diagnose.title'))}</strong><p>${escapeHtmlUpdates(t('updates.diagnose.needs_human'))}</p>`
+    return
+  }
+  if (!data.canDiagnose) { box.hidden = true; box.innerHTML = ''; return }
+  box.hidden = false
+  box.className = 'updates-diagnose'
+  box.innerHTML = `<strong>${escapeHtmlUpdates(t('updates.diagnose.title'))}</strong>`
+    + `<p>${escapeHtmlUpdates(t('updates.diagnose.body'))}</p>`
+    + `<button class="btn-secondary btn-compact" id="updatesDiagnoseBtn">${escapeHtmlUpdates(t('updates.diagnose.btn'))}</button>`
+  document.getElementById('updatesDiagnoseBtn').addEventListener('click', runDiagnose)
+}
+
+async function runDiagnose() {
+  if (!confirm(t('updates.diagnose.consent'))) return
+  const btn = document.getElementById('updatesDiagnoseBtn')
+  if (btn) btn.disabled = true
+  try {
+    const res = await fetch('/api/updates/diagnose', { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (btn) btn.disabled = false
+      showToast(t('updates.diagnose.failed', { msg: data.error || ('HTTP ' + res.status) }))
+      return
+    }
+    showToast(data.already ? t('updates.diagnose.already') : t('updates.diagnose.started'))
+    if (btn) { btn.hidden = true }
+  } catch (err) {
+    if (btn) btn.disabled = false
+    showToast(t('updates.diagnose.failed', { msg: err.message || err }))
   }
 }
 
@@ -9911,12 +10296,57 @@ async function runUpdate(autoStash) {
       showToast(t('updates.toast.not_started', { msg: data.error || ('HTTP ' + res.status) }))
       return
     }
-    showToast(t('updates.toast.started'))
-    setTimeout(() => window.location.reload(), 30000)
+    showToast(t('updates.toast.applying'))
+    // Poll the real outcome instead of a blind timed reload. update.sh (and its
+    // detached finalizer) write store/update.last-result on exit, so we surface
+    // success / rolled-back / failed rather than a false "done" that reloads
+    // into an unchanged (or dead) dashboard.
+    await pollUpdateOutcome(resetBtn)
   } catch (err) {
     resetBtn()
     showToast(t('updates.toast.error', {msg: err.message || err}))
   }
+}
+
+// Poll /api/updates/status until the run finishes (pidfile gone AND a fresh
+// result is present), then show the true outcome. Reload only on success.
+async function pollUpdateOutcome(resetBtn) {
+  const startedAt = Date.now()
+  const deadline = startedAt + 5 * 60_000   // hard cap: 5 min
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 3000))
+    let data
+    try {
+      const res = await fetch('/api/updates/status')
+      data = await res.json()
+    } catch {
+      // Dashboard is mid-restart (expected): keep polling.
+      continue
+    }
+    const result = data && data.result
+    const fresh = result && typeof result.ts === 'number' && result.ts * 1000 >= startedAt - 5000
+    if (data && !data.running && fresh) {
+      const st = result.status
+      if (st === 'success') {
+        showToast(t('updates.toast.success', { old: result.old || '', new: result.new || '' }))
+        setTimeout(() => window.location.reload(), 2000)
+        return
+      }
+      if (st === 'rolled-back') {
+        if (resetBtn) resetBtn()
+        showToast(t('updates.toast.rolled_back', { old: result.old || '', msg: result.message || '' }))
+        renderDiagnoseOffer()
+        return
+      }
+      // failed
+      if (resetBtn) resetBtn()
+      showToast(t('updates.toast.failed', { phase: result.phase || '?', msg: result.message || ('code ' + result.code) }))
+      renderDiagnoseOffer()
+      return
+    }
+  }
+  if (resetBtn) resetBtn()
+  showToast(t('updates.toast.status_timeout'))
 }
 
 document.getElementById('updatesApplyBtn').addEventListener('click', async () => {
@@ -9929,11 +10359,154 @@ document.getElementById('updatesApplyBtn').addEventListener('click', async () =>
 pollUpdatesBadge()
 setInterval(pollUpdatesBadge, 5 * 60_000)
 
+// === First-run onboarding wizard ===
+// Full-screen overlay shown when /api/onboarding/status reports the install
+// still needs setup (pre-install-now / configure-later flow). Steps 2-3 reuse
+// the existing channel-setup + pairing backend endpoints.
+async function fetchOnboardingStatus() {
+  try { return await (await fetch('/api/onboarding/status')).json() } catch { return null }
+}
+function onboardingCurrentStep(s) {
+  if (!s.claudeAuthPresent || !s.agentsRunning) return 1
+  if (!s.telegramConfigured) return 2
+  if (!s.paired) return 3
+  return 0
+}
+async function initOnboarding() {
+  const s = await fetchOnboardingStatus()
+  if (!s || !s.needsOnboarding) return
+  renderOnboarding(s)
+}
+async function refreshOnboarding() {
+  const s = await fetchOnboardingStatus()
+  if (s) renderOnboarding(s)
+}
+function renderOnboarding(s) {
+  const overlay = document.getElementById('onboardingOverlay')
+  if (!overlay) return
+  const step = onboardingCurrentStep(s)
+  if (step === 0) { overlay.classList.remove('active'); overlay.hidden = true; document.body.style.overflow = ''; return }
+  overlay.hidden = false
+  overlay.classList.add('active')
+  document.body.style.overflow = 'hidden'
+  document.querySelectorAll('#onboardingSteps .onboarding-step').forEach((el) => {
+    const n = Number(el.dataset.ostep)
+    el.classList.toggle('active', n === step)
+    el.classList.toggle('done', n < step)
+  })
+  const body = document.getElementById('onboardingBody')
+  if (step === 1) body.innerHTML = onbStep1Html(s)
+  else if (step === 2) body.innerHTML = onbStep2Html()
+  else body.innerHTML = onbStep3Html()
+  wireOnboarding(step)
+}
+function onbMsg(text, isErr) {
+  const el = document.getElementById('onbMsg')
+  if (el) { el.textContent = text; el.className = 'onb-msg' + (isErr ? ' err' : ' ok') }
+}
+function onbStep1Html(s) {
+  return `<p>${escapeHtml(t('onboarding.step1.desc'))}</p>`
+    + (s.claudeAuthPresent
+      ? `<p class="onb-ok-line">${escapeHtml(t('onboarding.step1.auth_done'))}</p>`
+      : `<label class="form-label-sm">${escapeHtml(t('onboarding.step1.token_label'))}</label>`
+        + `<input id="onbToken" type="password" class="onb-input" placeholder="sk-ant-oat01-..." autocomplete="off">`
+        + `<div class="onb-hint">${escapeHtml(t('onboarding.step1.token_hint'))}</div>`
+        + `<button class="btn-primary btn-compact" id="onbAuthBtn">${escapeHtml(t('onboarding.step1.save_btn'))}</button>`)
+    + (s.claudeAuthPresent && !s.agentsRunning
+      ? `<button class="btn-primary btn-compact" id="onbLaunchBtn">${escapeHtml(t('onboarding.step1.launch_btn'))}</button>`
+      : '')
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function onbStep2Html() {
+  return `<p>${escapeHtml(t('onboarding.step2.desc'))}</p>`
+    + `<label class="form-label-sm">${escapeHtml(t('onboarding.step2.token_label'))}</label>`
+    + `<input id="onbBotToken" type="password" class="onb-input" placeholder="123456:ABC..." autocomplete="off">`
+    + `<div class="onb-hint">${escapeHtml(t('onboarding.step2.token_hint'))}</div>`
+    + `<button class="btn-primary btn-compact" id="onbBotBtn">${escapeHtml(t('onboarding.step2.save_btn'))}</button>`
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function onbStep3Html() {
+  return `<p>${escapeHtml(t('onboarding.step3.desc'))}</p>`
+    + `<ol class="onb-list"><li>${escapeHtml(t('onboarding.step3.li1'))}</li><li>${escapeHtml(t('onboarding.step3.li2'))}</li></ol>`
+    + `<div id="onbPending" class="onb-pending"></div>`
+    + `<button class="btn-secondary btn-compact" id="onbRefreshBtn">${escapeHtml(t('onboarding.step3.refresh_btn'))}</button>`
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function wireOnboarding(step) {
+  if (step === 1) {
+    const authBtn = document.getElementById('onbAuthBtn')
+    if (authBtn) authBtn.addEventListener('click', async () => {
+      const token = (document.getElementById('onbToken').value || '').trim()
+      if (!token) { onbMsg(t('onboarding.step1.token_empty'), true); return }
+      authBtn.disabled = true; onbMsg(t('onboarding.saving'))
+      try {
+        const res = await fetch('/api/onboarding/claude-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { authBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        onbMsg(d.verified ? t('onboarding.step1.saved_verified') : t('onboarding.step1.saved_unverified'))
+        await refreshOnboarding()
+      } catch (e) { authBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+    const launchBtn = document.getElementById('onbLaunchBtn')
+    if (launchBtn) launchBtn.addEventListener('click', async () => {
+      launchBtn.disabled = true; onbMsg(t('onboarding.step1.launching'))
+      try {
+        const res = await fetch('/api/onboarding/launch', { method: 'POST' })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { launchBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        onbMsg(t('onboarding.step1.launched'))
+        setTimeout(refreshOnboarding, 2500)
+      } catch (e) { launchBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+  } else if (step === 2) {
+    const botBtn = document.getElementById('onbBotBtn')
+    if (botBtn) botBtn.addEventListener('click', async () => {
+      const botToken = (document.getElementById('onbBotToken').value || '').trim()
+      if (!botToken) { onbMsg(t('onboarding.step2.token_empty'), true); return }
+      botBtn.disabled = true; onbMsg(t('onboarding.saving'))
+      try {
+        const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken }) })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { botBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        onbMsg(t('onboarding.step2.saved'))
+        setTimeout(refreshOnboarding, 2000)
+      } catch (e) { botBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+  } else if (step === 3) {
+    const refreshBtn = document.getElementById('onbRefreshBtn')
+    const loadPending = async () => {
+      try {
+        const p = await (await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/pending`)).json()
+        const list = Array.isArray(p) ? p : (p.pending || [])
+        const box = document.getElementById('onbPending')
+        if (!box) return
+        if (!list.length) { box.innerHTML = `<span class="onb-hint">${escapeHtml(t('onboarding.step3.no_pending'))}</span>`; return }
+        box.innerHTML = list.map((x) => {
+          const id = escapeHtml(String(x.id || x.chatId || x.userId || ''))
+          const label = escapeHtml(String(x.name || x.username || id))
+          return `<div class="onb-pending-row"><span>${label}</span><button class="btn-primary btn-compact onb-approve" data-id="${id}">${escapeHtml(t('onboarding.step3.approve_btn'))}</button></div>`
+        }).join('')
+        box.querySelectorAll('.onb-approve').forEach((b) => b.addEventListener('click', async () => {
+          b.disabled = true
+          try {
+            await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: b.dataset.id }) })
+            onbMsg(t('onboarding.step3.approved'))
+            setTimeout(refreshOnboarding, 1500)
+          } catch (e) { b.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+        }))
+      } catch { /* ignore */ }
+    }
+    if (refreshBtn) refreshBtn.addEventListener('click', () => { refreshOnboarding() })
+    loadPending()
+  }
+}
+
 // === Init ===
 populateAvatarGrid()
 loadMemAgents()
 loadOverview()
 loadAvailableModels()
+initOnboarding()
 
 // "DeepSeek API kulcs hozzáadása" link az agent edit panel-en --
 // a Vault page-re visz, ahol a felhasználó egy DEEPSEEK_API_KEY
@@ -10487,7 +11060,7 @@ window.addEventListener('beforeunload', (e) => {
 // entry never requires a frontend change just to render a sane heading.
 function settingsModuleLabel(mod) {
   const key = `settings.module.${mod}`
-  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true }
+  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true, channels: true }
   return known[mod] ? t(key) : (mod.charAt(0).toUpperCase() + mod.slice(1))
 }
 
@@ -10503,8 +11076,16 @@ function updateSettingsSaveBar() {
   if (countEl) countEl.textContent = t('settings.dirty_count', {n})
 }
 
+// Read the current editor value in the canonical form the API expects. A
+// boolean setting renders as a checkbox, so its value is derived from .checked
+// as the canonical "1"/"0" string (not the element's .value, which is "on").
+function settingInputValue(input, type) {
+  if (type === 'boolean') return input.checked ? '1' : '0'
+  return input.value
+}
+
 function markSettingDirty(key, input, originalValue, type, errorEl) {
-  const currentVal = type === 'color' ? input.value : input.value
+  const currentVal = settingInputValue(input, type)
   if (currentVal === String(originalValue)) {
     settingsDirty.delete(key)
   } else {
@@ -10607,6 +11188,11 @@ function buildSettingRow(def) {
       valueInput.appendChild(o)
     }
     valueInput.value = originalValue
+  } else if (def.type === 'boolean') {
+    valueInput = document.createElement('input')
+    valueInput.type = 'checkbox'
+    valueInput.className = 'settings-toggle'
+    valueInput.checked = String(def.value) === '1'
   } else if (def.type === 'color') {
     valueInput = document.createElement('input')
     valueInput.type = 'color'
@@ -10651,7 +11237,7 @@ async function saveAllSettings() {
 
   for (const [key, { input, type, errorEl }] of settingsDirty) {
     errorEl.textContent = ''
-    const raw = type === 'int' ? Number(input.value) : input.value
+    const raw = type === 'int' ? Number(input.value) : settingInputValue(input, type)
     try {
       const res = await fetch('/api/settings', {
         method: 'POST',
@@ -10673,8 +11259,8 @@ async function saveAllSettings() {
   }
 
   // Remove successfully saved keys from dirty map
-  for (const [key, { input }] of settingsDirty) {
-    if (String(input.value) === input.dataset.originalValue) settingsDirty.delete(key)
+  for (const [key, { input, type }] of settingsDirty) {
+    if (settingInputValue(input, type) === input.dataset.originalValue) settingsDirty.delete(key)
   }
   updateSettingsSaveBar()
 
@@ -10816,8 +11402,65 @@ const TU_COLORS = {
 let tuSelectedAgent = ''
 let tuChartState = null
 
+// Model pricing in USD per million tokens (input / output / cache-write / cache-read).
+// Fallback row is used when model is unknown or not yet captured.
+const TU_MODEL_PRICING = {
+  'claude-sonnet-4-6':   { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+  'claude-sonnet-4-5':   { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+  'claude-sonnet-5':     { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+  'claude-opus-4':       { in: 15.0,  out: 75.0,  cw: 18.75, cr: 1.50 },
+  'claude-opus-4-8':     { in: 15.0,  out: 75.0,  cw: 18.75, cr: 1.50 },
+  'claude-haiku-4-5':    { in: 0.80,  out: 4.0,   cw: 1.00,  cr: 0.08 },
+  'claude-fable-5':      { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+  default:               { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+}
+
+function tuPriceForModel(model) {
+  if (!model) return TU_MODEL_PRICING.default
+  for (const key of Object.keys(TU_MODEL_PRICING)) {
+    if (key !== 'default' && model.startsWith(key)) return TU_MODEL_PRICING[key]
+  }
+  return TU_MODEL_PRICING.default
+}
+
+function tuCalcCostUSD(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, model) {
+  const p = tuPriceForModel(model)
+  return (
+    (inputTokens || 0) * p.in +
+    (outputTokens || 0) * p.out +
+    (cacheCreationTokens || 0) * p.cw +
+    (cacheReadTokens || 0) * p.cr
+  ) / 1_000_000
+}
+
+function tuFormatCostUSD(usd) {
+  if (usd < 0.001) return '<$0.001'
+  if (usd < 1) return '$' + usd.toFixed(3)
+  return '$' + usd.toFixed(2)
+}
+
+// Pie chart color palette for model distribution (distinct from agent colors)
+const TU_MODEL_COLORS = ['#6366f1','#06b6d4','#f59e0b','#22c55e','#ef4444','#8b5cf6','#ec4899','#10b981']
+
+function tuGetModelColor(idx) { return TU_MODEL_COLORS[idx % TU_MODEL_COLORS.length] }
+
 function tuGetColor(agent) {
   return TU_COLORS[agent] || '#64748b'
+}
+
+function tuMcpServerFromTool(toolName) {
+  if (!toolName || !toolName.startsWith('mcp__')) return null
+  const parts = toolName.split('__')
+  // parts: ['mcp', '<server>', '<tool>'] for a full tool name, or
+  // ['mcp', '<server>'] for a tuMcpGroupKey() group key -- without accepting
+  // the 2-part form, every grouped MCP row would be mislabelled as builtin.
+  return parts.length >= 2 && parts[1] ? parts[1] : null
+}
+
+function tuMcpGroupKey(toolName) {
+  if (!toolName || !toolName.startsWith('mcp__')) return toolName
+  const parts = toolName.split('__')
+  return parts.length >= 3 ? 'mcp__' + parts[1] : toolName
 }
 
 function tuFormatTokens(n) {
@@ -10880,6 +11523,17 @@ async function loadTokenUsage() {
   tuDetailSearch = ''
   const searchEl = document.getElementById('tuSearchInput')
   if (searchEl) searchEl.value = ''
+
+  const agentParam = agent ? '&agent=' + encodeURIComponent(agent) : ''
+  const baseQuery = params.toString()
+
+  const [modelDistRes, toolStatsRes] = await Promise.all([
+    fetch('/api/token-usage/model-dist?' + baseQuery + agentParam),
+    fetch('/api/token-usage/tool-stats?' + baseQuery + agentParam),
+  ])
+  if (modelDistRes.ok) renderTuModelDist(await modelDistRes.json())
+  if (toolStatsRes.ok) renderTuToolStats(await toolStatsRes.json())
+
   await tuFetchDetails()
 }
 
@@ -10894,12 +11548,20 @@ function renderTuSummary(summary) {
     const totalIn = (s.totalInput || 0) + (s.totalCacheRead || 0) + (s.totalCacheCreation || 0)
     const isActive = tuSelectedAgent === s.agent
     const dimmed = tuSelectedAgent && !isActive
+    const costUSD = Array.isArray(s.perModel) && s.perModel.length
+      ? s.perModel.reduce((sum, m) => sum + tuCalcCostUSD(m.totalInput || 0, m.totalOutput || 0, m.totalCacheRead || 0, m.totalCacheCreation || 0, m.model && m.model !== '(unknown)' ? m.model : null), 0)
+      : tuCalcCostUSD(s.totalInput, s.totalOutput, s.totalCacheRead, s.totalCacheCreation, null)
+    const sessions = s.totalSessions || 0
+    const tokPerSession = sessions > 0 ? Math.round(totalIn / sessions) : 0
+    const costPerSession = sessions > 0 ? costUSD / sessions : 0
     return `
       <div class="overview-stat tu-agent-card${isActive ? ' tu-active' : ''}" data-agent="${escapeHtml(s.agent)}"
         style="border-left:3px solid ${tuGetColor(s.agent)};cursor:pointer;${dimmed ? 'opacity:0.4;' : ''}transition:opacity 0.2s">
         <div class="overview-stat-label">${escapeHtml(s.agent)}</div>
         <div class="overview-stat-value">${tuFormatTokens(totalIn)}</div>
         <div class="overview-stat-sub">${t('tokenUsage.calls_sub', { calls: (s.totalCalls || 0).toLocaleString(), out: tuFormatTokens(s.totalOutput) })}</div>
+        <div class="overview-stat-sub" style="margin-top:4px;color:var(--text-secondary)">${tuFormatCostUSD(costUSD)} &middot; ${sessions} sess</div>
+        <div class="overview-stat-sub" style="font-size:11px;color:var(--text-secondary)">${tuFormatTokens(tokPerSession)} tok/sess &middot; ${tuFormatCostUSD(costPerSession)}/sess</div>
       </div>`
   }).join('')
 
@@ -11490,12 +12152,176 @@ document.getElementById('tuCollectBtn')?.addEventListener('click', async () => {
 document.getElementById('tuPeriod')?.addEventListener('change', () => { tuSelectedAgent = ''; loadTokenUsage() })
 document.getElementById('tuAgent')?.addEventListener('change', () => { tuSelectedAgent = document.getElementById('tuAgent').value; loadTokenUsage() })
 document.getElementById('tuMinTokens')?.addEventListener('change', () => tuFetchDetails())
+document.getElementById('tuToolAgentBreakdown')?.addEventListener('change', () => {
+  if (tuToolStatsData) renderTuToolStats(tuToolStatsData)
+})
 
 window.addEventListener('resize', () => {
   if (!document.getElementById('tokenUsagePage')?.hidden) {
     if (tuChartState && renderTuTimeline.__lastData) renderTuTimeline(renderTuTimeline.__lastData, renderTuTimeline.__lastAgent)
+    if (tuModelDistData) renderTuModelDist(tuModelDistData)
   }
 })
+
+// ============================================================
+// Token Monitor: Model distribution pie chart
+// ============================================================
+let tuModelDistData = null
+
+function renderTuModelDist(data) {
+  tuModelDistData = data
+  const section = document.getElementById('tuModelDistSection')
+  const tableEl = document.getElementById('tuModelDistTable')
+  const canvas = document.getElementById('tuModelPieCanvas')
+  if (!section || !tableEl || !canvas) return
+
+  if (!data || !data.length) {
+    tableEl.innerHTML = `<span style="color:var(--text-secondary);font-size:13px">${t('tokenUsage.model_dist_no_data')}</span>`
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    return
+  }
+
+  // Pie chart
+  const dpr = window.devicePixelRatio || 1
+  const size = 180
+  canvas.width = size * dpr
+  canvas.height = size * dpr
+  canvas.style.width = size + 'px'
+  canvas.style.height = size + 'px'
+  const ctx = canvas.getContext('2d')
+  ctx.scale(dpr, dpr)
+  ctx.clearRect(0, 0, size, size)
+
+  const total = data.reduce((s, d) => s + (d.count || 0), 0)
+  const cx = size / 2, cy = size / 2, r = size / 2 - 8
+  let startAngle = -Math.PI / 2
+  for (let i = 0; i < data.length; i++) {
+    const frac = (data[i].count || 0) / total
+    const endAngle = startAngle + frac * Math.PI * 2
+    ctx.beginPath()
+    ctx.moveTo(cx, cy)
+    ctx.arc(cx, cy, r, startAngle, endAngle)
+    ctx.closePath()
+    ctx.fillStyle = tuGetModelColor(i)
+    ctx.fill()
+    // Thin separator
+    ctx.strokeStyle = 'var(--bg-primary, #0f172a)'
+    ctx.lineWidth = 1.5
+    ctx.stroke()
+    startAngle = endAngle
+  }
+
+  // Center hole (donut effect)
+  ctx.beginPath()
+  ctx.arc(cx, cy, r * 0.5, 0, Math.PI * 2)
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated') || '#1e293b'
+  ctx.fill()
+
+  // Legend + table
+  const thStyle = 'text-align:left;padding:4px 8px 4px 0;font-size:12px;color:var(--text-secondary);border-bottom:1px solid var(--border);font-weight:600'
+  const tdStyle = 'padding:4px 8px 4px 0;font-size:13px;vertical-align:middle'
+  const tdRStyle = tdStyle + ';text-align:right'
+
+  let rows = data.map((d, i) => {
+    const pct = total > 0 ? ((d.count / total) * 100).toFixed(1) : '0.0'
+    const costUSD = tuCalcCostUSD(d.totalInput, d.totalOutput, d.totalCacheRead, d.totalCacheCreation, d.model !== '(unknown)' ? d.model : null)
+    return `<tr>
+      <td style="${tdStyle}">
+        <span style="display:inline-block;width:10px;height:10px;background:${tuGetModelColor(i)};border-radius:2px;margin-right:6px;vertical-align:middle"></span>
+        <code style="font-size:12px">${escapeHtml(d.model)}</code>
+      </td>
+      <td style="${tdRStyle}">${(d.count || 0).toLocaleString()}</td>
+      <td style="${tdRStyle}">${pct}%</td>
+      <td style="${tdRStyle}">${tuFormatCostUSD(costUSD)}</td>
+    </tr>`
+  }).join('')
+
+  tableEl.innerHTML = `<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;min-width:300px">
+    <thead><tr>
+      <th style="${thStyle}">Modell</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">${t('tokenUsage.model_dist_calls', { n: '' }).trim()}</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">%</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">Becsült USD</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`
+}
+
+// ============================================================
+// Token Monitor: MCP tool usage grid
+// ============================================================
+let tuToolStatsData = null
+
+function renderTuToolStats(data) {
+  tuToolStatsData = data
+  const el = document.getElementById('tuToolStatsContent')
+  if (!el) return
+
+  if (!data || !data.length) {
+    el.innerHTML = `<span style="color:var(--text-secondary);font-size:13px">${t('tokenUsage.tool_stats_no_data')}</span>`
+    return
+  }
+
+  // Aggregate per-model rows into one entry per tool (MCP tools grouped by server)
+  const byTool = new Map()
+  for (const row of data) {
+    const key = tuMcpGroupKey(row.tool_name)
+    let entry = byTool.get(key)
+    if (!entry) {
+      entry = { tool_name: key, count: 0, agentSet: new Set(), costUSD: 0 }
+      byTool.set(key, entry)
+    }
+    entry.count += row.count || 0
+    ;(row.agents || '').split(',').forEach(a => { const s = a.trim(); if (s) entry.agentSet.add(s) })
+    entry.costUSD += tuCalcCostUSD(row.totalInput || 0, row.totalOutput || 0, row.totalCacheRead || 0, row.totalCacheCreation || 0, row.model || null)
+  }
+  const aggregated = Array.from(byTool.values()).sort((a, b) => b.count - a.count).slice(0, 50)
+
+  const showAgents = document.getElementById('tuToolAgentBreakdown')?.checked
+  const thStyle = 'text-align:left;padding:4px 8px 4px 0;font-size:12px;color:var(--text-secondary);border-bottom:1px solid var(--border);font-weight:600'
+  const tdStyle = 'padding:4px 8px 4px 0;font-size:13px;overflow:hidden;text-overflow:ellipsis;max-width:260px;white-space:nowrap'
+  const tdRStyle = 'padding:4px 8px 4px 0;font-size:13px;text-align:right;font-variant-numeric:tabular-nums'
+
+  const maxCount = Math.max(...aggregated.map(d => d.count || 0))
+
+  const rows = aggregated.map(d => {
+    const barPct = maxCount > 0 ? Math.round((d.count / maxCount) * 100) : 0
+    const server = tuMcpServerFromTool(d.tool_name)
+    const serverLabel = server
+      ? `<span style="font-size:11px;color:var(--text-secondary)">${escapeHtml(server)}</span>`
+      : `<span style="font-size:11px;color:var(--text-secondary);opacity:0.6">${t('tokenUsage.tool_stats_builtin')}</span>`
+    const agentChips = Array.from(d.agentSet).map(a => {
+      const color = tuGetColor(a)
+      return `<span style="display:inline-block;padding:1px 6px;border-radius:10px;font-size:11px;font-weight:500;border:1px solid ${color};color:${color};margin:1px 2px 1px 0;white-space:nowrap">${escapeHtml(a)}</span>`
+    }).join('')
+    const agentCell = showAgents ? `<td style="${tdStyle};white-space:normal">${agentChips}</td>` : ''
+    return `<tr>
+      <td style="${tdStyle}" title="${escapeHtml(d.tool_name)}"><code style="font-size:12px">${escapeHtml(d.tool_name)}</code></td>
+      <td style="${tdRStyle}">${(d.count || 0).toLocaleString()}</td>
+      <td style="padding:4px 8px 4px 0;vertical-align:middle;min-width:70px">
+        <div style="background:var(--accent,#6366f1);height:6px;border-radius:3px;width:${barPct}%;opacity:0.7"></div>
+      </td>
+      <td style="${tdStyle}">${serverLabel}</td>
+      <td style="${tdRStyle}">${tuFormatCostUSD(d.costUSD)}</td>
+      ${agentCell}
+    </tr>`
+  }).join('')
+
+  const agentHeader = showAgents ? `<th style="${thStyle}">${t('tokenUsage.tool_stats_col_agents')}</th>` : ''
+
+  el.innerHTML = `<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;min-width:400px">
+    <thead><tr>
+      <th style="${thStyle}">${t('tokenUsage.tool_stats_col_tool')}</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">${t('tokenUsage.tool_stats_col_calls')}</th>
+      <th style="${thStyle}"></th>
+      <th style="${thStyle}">${t('tokenUsage.tool_stats_col_server')}</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">${t('tokenUsage.tool_stats_col_cost')}</th>
+      ${agentHeader}
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`
+}
 
 // ============================================================
 // Ideas (Ötletláda)

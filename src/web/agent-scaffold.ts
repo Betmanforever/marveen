@@ -5,8 +5,9 @@ import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WE
 import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
-import { agentDir, agentConfigRoot } from './agent-config.js'
+import { agentDir, agentConfigRoot, listAgentNames, readAgentCapabilities } from './agent-config.js'
 import { resolveProfilePlaceholders, absolutizeFsPermissionRule, type ProfileTemplate } from './profiles.js'
+import { sanitizeCapabilityTag, CAPABILITY_TAG_MAX_PER_AGENT } from '../prompt-safety.js'
 
 // Identity values the template substitution injects. Pulled out so the
 // substitution is a pure, parameterizable function (the runtime binds these to
@@ -47,7 +48,9 @@ export function resolveTemplatePlaceholders(content: string): string {
 
 // Return the settings.json path for an agent.
 // The main agent's settings live at ~/.claude/settings.json (not inside agents/).
-function agentSettingsPath(name: string): string {
+// Exported so the startup self-heal (hook-registration-guard) can prune stale
+// entries from the same files this module writes.
+export function agentSettingsPath(name: string): string {
   if (name === MAIN_AGENT_ID) return join(homedir(), '.claude', 'settings.json')
   return join(agentDir(name), '.claude', 'settings.json')
 }
@@ -418,6 +421,127 @@ export function renderProfileClaudeMdSections(
     .join('\n\n')
 }
 
+// HTML comment markers that delimit the auto-generated fleet roster block.
+// Using HTML comments means they are invisible to the LLM when the CLAUDE.md
+// is read as plain text, but are stable enough for regex replacement.
+// Do NOT change the marker strings without a coordinated migration: existing
+// CLAUDE.md files already contain them and ensureFleetRosterSection() relies
+// on exact string matching for idempotent replacement.
+const FLEET_ROSTER_BEGIN = '<!-- BEGIN GENERATED: fleet-roster (auto-generated, do not edit by hand) -->'
+const FLEET_ROSTER_END = '<!-- END GENERATED: fleet-roster -->'
+
+// Non-greedy ([\\s\\S]*?) so the regex stops at the FIRST occurrence of the
+// end-marker. A greedy match would span from BEGIN all the way to the LAST
+// END in the file, eating unrelated content in between.
+const FLEET_ROSTER_BLOCK_RE = new RegExp(
+  `${FLEET_ROSTER_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${FLEET_ROSTER_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+// Builds the text body that goes between the BEGIN/END markers.
+// Single source of truth -- called by both generateClaudeMd() (initial
+// generation) and ensureFleetRosterSection() (idempotent update on respawn).
+//
+// Threat model for capability tags:
+// - Capability strings come from two external-input paths: the Bearer-gated
+//   PUT /api/agents/:name/capabilities endpoint and user-editable persona
+//   frontmatter. Both can contain arbitrary text.
+// - Each tag ends up embedded in every PEER agent's CLAUDE.md, so a poisoned
+//   capability could inject instructions into the prompt of another agent.
+// - sanitizeCapabilityTag() DROPS (does not normalise) any value outside
+//   /^[a-z0-9][a-z0-9-]{0,31}$/. No character substitution is allowed:
+//   replace(/[^a-z0-9-]/g, '-') would silently turn "IGNORE ALL PREVIOUS
+//   INSTRUCTIONS" into "ignore-all-previous-instructio" -- still 32 chars,
+//   still passes the regex. DROP closes this path entirely.
+//
+// Why MAIN_AGENT_ID is always prepended:
+// - listAgentNames() reads the agents/ directory; the main agent has no
+//   subdirectory there (it lives in the project root). Without explicit
+//   prepending, the main agent would be absent from every peer's roster.
+function buildFleetRosterBody(selfName: string): string {
+  let agentNames: string[]
+  try {
+    agentNames = listAgentNames()
+  } catch {
+    agentNames = []
+  }
+
+  // Ensure the main agent appears even though it has no agents/ subdirectory.
+  const names = agentNames.includes(MAIN_AGENT_ID)
+    ? agentNames
+    : [MAIN_AGENT_ID, ...agentNames]
+
+  const lines: string[] = []
+  for (const agentName of names) {
+    if (agentName === selfName) continue
+
+    let rawCaps: string[]
+    try {
+      rawCaps = readAgentCapabilities(agentName)
+    } catch {
+      rawCaps = []
+    }
+
+    const caps = rawCaps
+      .map(sanitizeCapabilityTag)
+      .filter((c): c is string => c !== null)
+      .slice(0, CAPABILITY_TAG_MAX_PER_AGENT)
+
+    const capsStr = caps.length > 0 ? caps.join(', ') : '-'
+    lines.push(`- **${agentName}** (agent_id: ${agentName}): ${capsStr}`)
+  }
+
+  const roster = lines.length > 0 ? lines.join('\n') : '(nincs regisztrált ágens)'
+
+  return [
+    '## A flotta többi agense',
+    '',
+    'Ez a lista automatikusan generálódik az ágens indulásakor, ez a mérvadó és naprakész forrás.',
+    'Ha a fenti szövegben régebbi, kézzel írt felsorolás szerepel, ezt a szekciót vedd figyelembe.',
+    '',
+    roster,
+    '',
+    'Ha egy kérés egyértelműen más szakterületére esik, jelezd vagy delegáld inter-agent üzenettel a megfelelő ágensnek.',
+  ].join('\n')
+}
+
+// Idempotently ensures the fleet roster block is present and current in the
+// agent's CLAUDE.md. Called on every startAgentProcess() so that existing
+// agents receive the block automatically on respawn -- no manual migration.
+//
+// Idempotency contract (five rules, in order):
+//   1. No CLAUDE.md present  → skip entirely (e.g. main agent or fresh install).
+//   2. Marker block present  → replace ONLY the block; content outside the
+//      markers is never touched.
+//   3. No marker block       → append block after existing content (first run).
+//   4. Computed content identical to existing → return immediately; no disk
+//      write, no mtime change (safe to call on every respawn).
+//   5. Any write             → goes through atomicWriteFileSync to avoid a
+//      torn file if the process is killed mid-write.
+export function ensureFleetRosterSection(name: string): void {
+  const claudeMdPath = join(agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) return
+
+  const body = buildFleetRosterBody(name)
+  const block = `${FLEET_ROSTER_BEGIN}\n${body}\n${FLEET_ROSTER_END}`
+
+  let existing: string
+  try {
+    existing = readFileSync(claudeMdPath, 'utf-8')
+  } catch {
+    return
+  }
+
+  let updated: string
+  if (FLEET_ROSTER_BLOCK_RE.test(existing)) {
+    updated = existing.replace(FLEET_ROSTER_BLOCK_RE, block)
+  } else {
+    updated = existing.trimEnd() + '\n\n' + block + '\n'
+  }
+
+  if (updated === existing) return
+  atomicWriteFileSync(claudeMdPath, updated)
+}
+
 export async function generateClaudeMd(name: string, description: string, model: string, profile?: ProfileTemplate): Promise<string> {
   const profileBlock = renderProfileClaudeMdSections(
     profile?.claudeMdSections,
@@ -569,6 +693,11 @@ Output ONLY the markdown content, no code fences.`
   if (cleaned.startsWith('```')) {
     cleaned = cleaned.replace(/^```\w*\n?/, '').replace(/\n?```$/, '')
   }
+  // Append the marker-delimited fleet roster block using the same
+  // buildFleetRosterBody() as ensureFleetRosterSection() -- single source of truth.
+  // Appended after LLM output so the model never sees or can rewrite it.
+  const body = buildFleetRosterBody(name)
+  cleaned = cleaned.trimEnd() + '\n\n' + FLEET_ROSTER_BEGIN + '\n' + body + '\n' + FLEET_ROSTER_END + '\n'
   return cleaned
 }
 

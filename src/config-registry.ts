@@ -9,7 +9,7 @@
 // array is how a future setting becomes editable from the UI -- no route or
 // frontend change needed beyond what already reads the registry.
 
-export type SettingType = 'int' | 'string' | 'color'
+export type SettingType = 'int' | 'string' | 'color' | 'boolean'
 
 export interface SettingDefinition {
   key: string
@@ -47,6 +47,17 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     min: 0,
     max: 100,
     description: 'Az "in_progress" oszlop WIP-limitje (max. kártyaszám). 0 = korlátlan.',
+    module: 'kanban',
+    secret: false,
+    requiresRestart: false,
+  },
+  {
+    key: 'KANBAN_WIP_TESTING',
+    type: 'int',
+    default: 0,
+    min: 0,
+    max: 100,
+    description: 'A "testing" oszlop WIP-limitje (max. kártyaszám). 0 = korlátlan.',
     module: 'kanban',
     secret: false,
     requiresRestart: false,
@@ -343,6 +354,25 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     secret: false,
     requiresRestart: false,
   },
+  // --- Channels module ---
+  {
+    key: 'MAIN_AGENT_ISOLATED_CONFIG',
+    type: 'boolean',
+    default: '0',
+    description: 'CSAK macOS: a fő channels-agent kapjon-e saját, izolált CLAUDE_CONFIG_DIR-t (mint a sub-agentek). Bekapcsolva a fő agent a hosszú élettartamú fleet setup-tokenből (store/.claude-oauth-token) hitelesít, nem a rotálódó macOS Keychain OAuth-sessionből, ami periodikusan lejár és 401-et ad ("Please run /login"), amitől a bot elnémul. Token hiányában vagy nem-macOS gépen no-op. A módosítás a channels session újraindításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    key: 'MAIN_AGENT_CONFIG_DIR',
+    type: 'string',
+    default: '',
+    description: 'A fő channels-agent explicit CLAUDE_CONFIG_DIR-je (pl. ~/.claude-bot). Akkor kell, ha a botnak SAJÁT Claude-loginja van, külön a flottáétól: a MAIN_AGENT_ISOLATED_CONFIG erre nem alkalmas, mert az a fleet setup-tokenből hitelesít, tehát a flotta identitását adja a botnak (és token nélkül no-op). Üresen hagyva a fő agent a közös ~/.claude-ot használja (alapértelmezés). Ha a megadott könyvtár nem létezik, a beállítás no-op és figyelmeztetést logol. Elsőbbséget élvez a MAIN_AGENT_ISOLATED_CONFIG-gal szemben. A módosítás a channels session újraindításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
 ]
 
 export function getSettingDefinition(key: string): SettingDefinition | undefined {
@@ -369,6 +399,16 @@ export function validateSettingValue(def: SettingDefinition, raw: unknown): Sett
       return { ok: false, error: `Érvénytelen érték. Megengedett: ${def.valueSet.join(', ')}` }
     }
     return { ok: true, value: str }
+  }
+
+  if (def.type === 'boolean') {
+    // Normalise any of true/false, 1/0, "1"/"0", "true"/"false" to the
+    // canonical "1"/"0" string so it round-trips through .env and the bash
+    // launcher (which compares against "1") identically.
+    const s = String(raw).trim().toLowerCase()
+    if (raw === true || s === '1' || s === 'true') return { ok: true, value: '1' }
+    if (raw === false || s === '0' || s === 'false' || s === '') return { ok: true, value: '0' }
+    return { ok: false, error: 'Logikai érték szükséges (be/ki).' }
   }
 
   if (def.type === 'int') {

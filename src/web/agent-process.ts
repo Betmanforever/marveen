@@ -18,7 +18,8 @@ import {
   paneShowsContextSaturation,
   idleConsideringDimGhost,
 } from '../pane-state.js'
-import { agentDir, listAgentNames, readAgentModel, readAgentClaudeConfigDir, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost, readAgentMemoryIsolation } from './agent-config.js'
+import { agentDir, listAgentNames, readAgentModel, readAgentClaudeConfigDir, readAgentClaudePlan, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost, readAgentMemoryIsolation } from './agent-config.js'
+import { resolveAgentConfigDir } from './claude-plans.js'
 import { provisionMemoryBoundaryDir } from './memory-boundary.js'
 import { renameSharedCredentialsIfSafe } from './claude-credentials-guard.js'
 import {
@@ -35,10 +36,11 @@ import {
 } from './ssh-tmux.js'
 import { parseTelegramToken } from './telegram.js'
 import { getProvider, getProviderType, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
-import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR } from '../config.js'
+import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT } from '../config.js'
+import { getEffectiveSettingValue } from '../settings-store.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
-import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
+import { writeAgentSettingsFromProfile, ensureFleetRosterSection } from './agent-scaffold.js'
 import { schedulePluginUnlockAfterRespawn, getSessionClaudePid, hasBunChild, hasPluginInUseMarker, channelPluginInitPending, CHANNEL_INIT_PENDING_MAX_MS } from './channel-plugin-unlock.js'
 import { getSecret } from './vault.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
@@ -124,33 +126,81 @@ export function hasFleetOauthToken(): boolean {
   }
 }
 
-// H1 silent-degradation hardening (2026-06-30).
+// H1 silent-degradation hardening (2026-06-30, refined 2026-07-10).
 //
 // When the fleet OAuth token is absent, channel sub-agents skip isolation and
 // fall back to the SHARED ~/.claude (the pre-isolation behaviour, gated in
 // startAgentProcess). ONE channel sub-agent on the shared dir is harmless -- it
-// owns the single plugin-install slot and poller. TWO OR MORE collide on that
-// slot, which is exactly the fleet outage isolation was built to end (only one
-// agent registers its plugin, the rest go deaf -- see
-// ensureIsolatedChannelConfigDir). Today that collision is logged at WARN only,
-// so it stays invisible until a bot silently stops answering.
+// owns the single plugin-install slot and poller. The collision the alert
+// guards against needs TWO OR MORE agents actually contending for the SAME
+// provider's plugin slot at the same time (only one registers its plugin, the
+// rest go deaf -- see ensureIsolatedChannelConfigDir).
 //
-// The decision is pure (token-absent AND more-than-one channel sub-agent) so it
-// is unit-tested without I/O, mirroring shouldSendDeferAlert. Token PRESENT ->
-// isolation works -> never alerts, regardless of agent count.
+// 2026-07-10 refinement -- the original check over-triggered ("cried wolf"):
+//   - It counted CONFIGURED channel sub-agents. An agent that is not running
+//     cannot contend for anything: 6 configured / 2 running must not read as
+//     a 6-way collision.
+//   - It counted across providers. Plugin installs are keyed per plugin id
+//     (telegram/slack/teams/... are separate slots in installed_plugins.json),
+//     so a running Teams agent never collides with running Telegram agents.
+//   - On macOS the collision does not manifest (verified empirically
+//     2026-07-10 on the origin host: three concurrent telegram pollers --
+//     main + two sub-agents, distinct own tokens, a live `bun server.ts`
+//     each, all on the shared ~/.claude while the installed_plugins.json
+//     telegram slot pointed at a THIRD agent's projectPath). Channel agents
+//     always launch fresh with an explicit --channels plugin:<id> flag, which
+//     loads the plugin regardless of the project-scoped install slot; and
+//     macOS auth lives in the Keychain, so the Linux credentials-refresh
+//     motive for isolation does not apply either. The guard is
+//     process.platform-based -- nothing host-specific is baked into this
+//     distribution artifact. On Linux/other the alert stays: the shared-config
+//     multi-bot eviction remains the documented failure mode there and has
+//     not been empirically cleared. If a real macOS collision is ever
+//     observed again, drop the darwin early-return.
+//
+// The decision stays pure (token, same-provider contender count, platform) so
+// it is unit-tested without I/O, mirroring shouldSendDeferAlert. Token PRESENT
+// -> isolation works -> never alerts, regardless of agent count.
 export function shouldAlertSharedConfigCollision(
   hasToken: boolean,
-  channelSubAgentCount: number,
+  sameProviderContenderCount: number,
+  platform: NodeJS.Platform = process.platform,
 ): boolean {
-  return !hasToken && channelSubAgentCount > 1
+  if (platform === 'darwin') return false
+  return !hasToken && sameProviderContenderCount > 1
 }
 
-// Count of channel-HAVING sub-agents in the fleet (main agent excluded -- it
-// comes up via channels.sh and keeps the shared root by design). Uses the same
-// own-token signal as the launch path, so the count reflects which agents will
-// actually contend for the shared ~/.claude plugin slot.
-export function countChannelSubAgents(): number {
-  return listAgentNames().filter((n) => n !== MAIN_AGENT_ID && agentHasChannel(n)).length
+// Pure: the largest number of channel sub-agents contending for a single
+// provider's plugin slot. Only RUNNING agents with a channel of their own
+// count; agents on different providers occupy different slots and never
+// collide with each other.
+export function maxSameProviderContenders(
+  agents: Array<{ provider: string; running: boolean; hasChannel: boolean }>,
+): number {
+  const counts = new Map<string, number>()
+  for (const a of agents) {
+    if (!a.running || !a.hasChannel) continue
+    counts.set(a.provider, (counts.get(a.provider) ?? 0) + 1)
+  }
+  return counts.size ? Math.max(...counts.values()) : 0
+}
+
+// Same-provider contender count for the fleet (main agent excluded -- it comes
+// up via channels.sh and keeps the shared root by design). Uses the same
+// own-token signal as the launch path. `startingName` is the agent being
+// spawned right now: its tmux session does not exist yet at alert time, so it
+// is treated as running -- otherwise the very launch that completes a real
+// collision would never see itself in the count.
+export function countSameProviderChannelContenders(startingName: string): number {
+  return maxSameProviderContenders(
+    listAgentNames()
+      .filter((n) => n !== MAIN_AGENT_ID)
+      .map((n) => ({
+        provider: resolveAgentProvider(n),
+        running: n === startingName || agentRunState(n) === 'running',
+        hasChannel: agentHasChannel(n),
+      })),
+  )
 }
 
 // One operator alert per degradation episode: spamming on every spawn would
@@ -165,17 +215,18 @@ export function resetSharedConfigCollisionAlert(): void {
 // Loud, owner-facing alert routed via notifyChannel (direct Bot API POST from
 // the dashboard process) -- NOT an inter-agent relay, which would itself need a
 // healthy channel agent to deliver. No-op unless the token is absent AND >1
-// channel sub-agent would share ~/.claude.
+// RUNNING same-provider channel sub-agent would share ~/.claude (and never on
+// macOS -- see shouldAlertSharedConfigCollision).
 function maybeAlertSharedConfigCollision(name: string): void {
-  const count = countChannelSubAgents()
+  const count = countSameProviderChannelContenders(name)
   if (!shouldAlertSharedConfigCollision(false, count) || sharedConfigCollisionAlerted) return
   sharedConfigCollisionAlerted = true
   logger.error(
-    { name, channelSubAgentCount: count },
-    'isolated-config: fleet OAuth token missing with multiple channel sub-agents -- shared ~/.claude plugin-slot collision, bots will go deaf',
+    { name, sameProviderContenders: count },
+    'isolated-config: fleet OAuth token missing with multiple RUNNING same-provider channel sub-agents -- shared ~/.claude plugin-slot collision, bots may go deaf',
   )
   void notifyChannel(
-    `⚠️ Flotta-figyelmeztetes: hianyzik a fleet OAuth token (store/.claude-oauth-token), de ${count} csatornas sub-agent fut. Izolacio nelkul mind a kozos ~/.claude-ot hasznalja, igy a plugin-slot utkozik es csak egy bot marad eleresheto (a tobbi elnemul). Javitas: futtasd a \`claude setup-token\`-t, mentsd a store/.claude-oauth-token fajlba, majd inditsd ujra az agenseket.`,
+    `⚠️ Flotta-figyelmeztetes: hianyzik a fleet OAuth token (store/.claude-oauth-token), es ${count} AZONOS csatorna-providerü sub-agent fut egyszerre. Izolacio nelkul mind a kozos ~/.claude-ot hasznalja, igy a plugin-slot utkozhet es bot nemulhat el. Javitas: futtasd a \`claude setup-token\`-t, mentsd a store/.claude-oauth-token fajlba, majd inditsd ujra az agenseket.`,
   ).catch(() => { /* notifyChannel logs internally */ })
 }
 
@@ -218,9 +269,88 @@ export function ensureIsolatedChannelConfigDir(
   name: string,
   providerType: ChannelProviderType,
 ): string | null {
+  return provisionIsolatedConfigDir(join(agentDir(name), '.claude-config'), agentDir(name), providerType, name)
+}
+
+// The main channels agent (started by scripts/channels.sh, cwd = PROJECT_ROOT)
+// normally keeps the shared ~/.claude by design. On macOS that means it
+// authenticates from the ROTATING Keychain OAuth session, which periodically
+// expires and 401s the main bot (a manual /login is then needed) -- while the
+// isolated sub-agents, which authenticate from the long-lived fleet setup-token,
+// never do. This gives the main agent the SAME isolated CLAUDE_CONFIG_DIR as the
+// sub-agents so it too authenticates from CLAUDE_CODE_OAUTH_TOKEN and never
+// touches the rotating Keychain.
+//
+// Deliberately narrow and OPT-IN (default OFF), so nothing changes for existing
+// installs unless the operator turns it on:
+//   - macOS only -- on Linux the main agent's rotating credentials.json is
+//     handled by the separate credentials-guard; the Keychain-expiry motive is
+//     macOS-specific. This does NOT touch shouldAlertSharedConfigCollision's
+//     darwin early-return (a different failure mode: plugin-slot collision).
+//   - gated on the MAIN_AGENT_ISOLATED_CONFIG setting via the settings-store, so
+//     BOTH the dashboard toggle (config-overrides.json) AND a hand-set .env key
+//     take effect (resolution: override > .env > default '0'). channels.sh no
+//     longer parses the flag itself -- it always calls the helper on macOS and
+//     this function is the single gate.
+//   - gated on the fleet OAuth token (no token -> no isolation, since the
+//     isolated dir carries no .credentials.json -- identical gate to the
+//     sub-agent path in startAgentProcess);
+//   - returns null (caller keeps the shared root) whenever not applicable.
+export function ensureMainAgentIsolatedConfigDir(
+  provider?: string,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  if (platform !== 'darwin') return null
+  let enabled = false
+  try { enabled = String(getEffectiveSettingValue('MAIN_AGENT_ISOLATED_CONFIG')) === '1' } catch { enabled = false }
+  if (!enabled) return null
+  if (!hasFleetOauthToken()) return null
+  return provisionIsolatedConfigDir(
+    join(PROJECT_ROOT, '.channels-config'),
+    PROJECT_ROOT,
+    getProviderType(provider),
+    MAIN_AGENT_ID,
+  )
+}
+
+// An EXPLICIT config dir for the main channels agent (MAIN_AGENT_CONFIG_DIR),
+// for the operator who already keeps a separate Claude login for the main bot --
+// e.g. a personal subscription for the bot and a different one for the fleet.
+// The isolated-config path above cannot serve that case: it provisions a dir with
+// NO .credentials.json and authenticates from the fleet setup-token, so the main
+// agent necessarily shares the fleet's identity, and it is a hard no-op without
+// that token. Pointing CLAUDE_CONFIG_DIR at an existing, separately logged-in dir
+// is the only way to keep the two identities apart.
+//
+// Fails closed: unset -> null (shared ~/.claude, unchanged default); set but
+// missing on disk -> null + a warn, because silently falling back to the shared
+// root with the WRONG identity is how a bot ends up authenticated as the fleet.
+// Takes precedence over MAIN_AGENT_ISOLATED_CONFIG: an explicit dir is a
+// deliberate choice, and the two cannot both own CLAUDE_CONFIG_DIR.
+export function resolveMainAgentConfigDir(): string | null {
+  let raw = ''
+  try { raw = String(getEffectiveSettingValue('MAIN_AGENT_CONFIG_DIR') ?? '').trim() } catch { return null }
+  if (!raw) return null
+  const dir = raw.startsWith('~') ? join(homedir(), raw.slice(1)) : raw
+  if (!existsSync(dir)) {
+    logger.warn({ dir }, 'main-agent config dir: MAIN_AGENT_CONFIG_DIR does not exist, keeping the shared ~/.claude')
+    return null
+  }
+  return dir
+}
+
+// Shared provisioning core for BOTH the sub-agents (ensureIsolatedChannelConfigDir)
+// and the main agent (ensureMainAgentIsolatedConfigDir) -- one code path so the
+// two can never diverge. `cfg` is the isolated CLAUDE_CONFIG_DIR to create; `cwd`
+// is the agent's project dir stamped into its own installed_plugins.json; `name`
+// is used for logs only.
+function provisionIsolatedConfigDir(
+  cfg: string,
+  cwd: string,
+  providerType: ChannelProviderType,
+  name: string,
+): string | null {
   try {
-    const cwd = agentDir(name)
-    const cfg = join(cwd, '.claude-config')
     const realClaude = join(homedir(), '.claude')
     if (!existsSync(realClaude)) return null
     mkdirSync(cfg, { recursive: true })
@@ -731,6 +861,7 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean; resumeS
     // without hardcoding agent names.
     const profile = loadProfileTemplate(resolveAgentSecurityProfile(name))
     writeAgentSettingsFromProfile(name, profile)
+    ensureFleetRosterSection(name)
     // A sub-agent must load ONLY its own channel plugin. The user-scope
     // enabledPlugins would otherwise make EVERY sub-agent spawn a telegram
     // (and slack/discord) poller that falls back to the main agent's bot
@@ -786,7 +917,23 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean; resumeS
     // the sub-agent would launch logged-out -- so when the token is absent we skip
     // isolation and keep the shared ~/.claude (the pre-isolation, still-stable
     // behaviour) rather than break auth.
-    let claudeConfigDir = readAgentClaudeConfigDir(name)
+    // Named plan wins over the raw per-agent claudeConfigDir; both are opt-in,
+    // so with neither set this is exactly the prior behaviour. The plan's
+    // configDir is already launcher-validated (claude-plans.ts reuses
+    // expandAndValidateConfigDir). NOTE: this covers regular agents only; the
+    // main agent still launches via channels.sh (separate, gated follow-up).
+    const planResolution = resolveAgentConfigDir(name)
+    if (planResolution.planUnresolved) {
+      // The agent has a claudePlan set but it no longer resolves (registry
+      // entry removed/renamed). Do NOT silently boot on the host login --
+      // surface it. The channelsAllowed enforcement guardrail is a separate
+      // gated follow-up; this is just the visibility floor.
+      logger.warn(
+        { name, plan: readAgentClaudePlan(name) },
+        'claude-plan: configured plan id does not resolve in store/claude-plans.json; falling back to raw config-dir / default login',
+      )
+    }
+    let claudeConfigDir = planResolution.configDir
     let oauthTokenEnv = ''
     // Shared-home agents (no isolated config dir) authenticate from the rotating
     // ~/.claude/.credentials.json by default. If the operator has a long-lived

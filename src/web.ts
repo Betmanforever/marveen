@@ -1,6 +1,7 @@
 import http from 'node:http'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
 import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID } from './config.js'
 import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-auth.js'
@@ -8,7 +9,8 @@ import { isBlockedCrossOriginWrite, originMatchesServedHost } from './web/csrf-o
 import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
-import { ensureAgentHooks, ensureAgentStalenessHook, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureAgentStalenessHook, ensureDefaultScheduledTasks, agentSettingsPath } from './web/agent-scaffold.js'
+import { shouldRegisterHooks, pruneStaleHooksFromSettingsFile } from './web/hook-registration-guard.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
 import { startUpdateChecker } from './web/update-checker.js'
@@ -21,6 +23,7 @@ import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
 import { startReauthHealer } from './web/reauth-healer.js'
 import { startAutoRestartRunner } from './web/auto-restart-runner.js'
 import { startModelFallbackRunner } from './web/model-fallback-runner.js'
+import { startContextGuardRunner } from './web/context-guard-runner.js'
 import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
@@ -45,13 +48,16 @@ import { tryHandleRecall } from './web/routes/recall.js'
 import { tryHandleBackgroundTasks, sweepOrphanedBackgroundTasks } from './web/routes/background-tasks.js'
 import { tryHandleOverview } from './web/routes/overview.js'
 import { tryHandleUpdates } from './web/routes/updates.js'
+import { tryHandleOnboarding } from './web/routes/onboarding.js'
 import { tryHandleStatus } from './web/routes/status.js'
 import { tryHandleAutonomy } from './web/routes/autonomy.js'
 import { tryHandleTokenUsage } from './web/routes/token-usage.js'
+import { tryHandleCosts, startCostsSyncTask } from './web/routes/costs.js'
 import { tryHandleIdeas } from './web/routes/ideas.js'
 import { tryHandleToolLog } from './web/routes/tool-log.js'
 import { tryHandleSettings } from './web/routes/settings.js'
 import { tryHandleAuditLog } from './web/routes/audit-log.js'
+import { tryHandleFleetQ } from './web/routes/fleet-q.js'
 import { tryHandleStatic } from './web/routes/static.js'
 import { tryHandleVoice } from './web/routes/voice.js'
 import { tryHandleVaultSsh } from './web/routes/vault-ssh.js'
@@ -131,7 +137,10 @@ export function startWebServer(port = 3420): http.Server {
     // path, validated with the same constant-time check. Everything else stays
     // header-only.
     const isSseStream = method === 'GET' && /^\/api\/agents\/[^/]+\/pane\/stream$/.test(path)
-    if (path.startsWith('/api/') && !isPublicApi) {
+    // /.well-known/fleetq exposes the agent roster; protect it with the same
+    // Bearer token as /api/* so LAN-exposed instances don't leak fleet topology.
+    const isFleetManifest = path === '/.well-known/fleetq' && method === 'GET'
+    if ((path.startsWith('/api/') && !isPublicApi) || isFleetManifest) {
       const headerOk = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
       const queryOk = isSseStream && checkBearerToken(`Bearer ${url.searchParams.get('token') ?? ''}`, DASHBOARD_TOKEN)
       if (!headerOk && !queryOk) {
@@ -174,9 +183,11 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleRecall(routeCtx)) return
       if (await tryHandleOverview(routeCtx)) return
       if (await tryHandleUpdates(routeCtx)) return
+      if (await tryHandleOnboarding(routeCtx)) return
       if (await tryHandleStatus(routeCtx)) return
       if (await tryHandleAutonomy(routeCtx)) return
       if (await tryHandleTokenUsage(routeCtx)) return
+      if (await tryHandleCosts(routeCtx)) return
       if (await tryHandleIdeas(routeCtx)) return
       if (await tryHandleToolLog(routeCtx)) return
       if (await tryHandleSettings(routeCtx)) return
@@ -184,6 +195,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleVaultSshKeys(routeCtx)) return
       if (await tryHandleVaultSsh(routeCtx)) return
       if (await tryHandleAuditLog(routeCtx)) return
+      if (await tryHandleFleetQ(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
       res.writeHead(404)
@@ -331,6 +343,12 @@ export function startWebServer(port = 3420): http.Server {
   const channelHealthInterval = webOnly ? undefined : startChannelHealthMonitor()
   if (!webOnly) logger.info('Channel MCP health monitor started (60s poll, 45s offset)')
 
+  // CostOps: reflect the local config's fixed costs into the ledger once at boot + every
+  // 10 minutes. Deliberately NOT done inside the GET /api/costs/summary handler -- a read
+  // endpoint must not write (was flagged in review); this is the one place that does.
+  const costsSyncInterval = webOnly ? undefined : startCostsSyncTask()
+  if (!webOnly) logger.info('CostOps fixed-cost sync started (10min poll + startup)')
+
   const stuckInputInterval = webOnly ? undefined : startStuckInputWatcher()
   if (!webOnly) logger.info('Stuck-input watcher started (15s poll, 20s offset)')
 
@@ -345,6 +363,9 @@ export function startWebServer(port = 3420): http.Server {
 
   const modelFallbackInterval = webOnly ? undefined : startModelFallbackRunner()
   if (!webOnly) logger.info('Model-fallback runner started (60s poll, 50s offset)')
+
+  const contextGuardInterval = webOnly ? undefined : startContextGuardRunner()
+  if (!webOnly) logger.info('Context-guard runner started (5min poll, 4.5min initial delay)')
 
   const updateCheckerInterval = webOnly ? undefined : startUpdateChecker()
   if (!webOnly) logger.info('Update checker started (15min poll)')
@@ -382,19 +403,36 @@ export function startWebServer(port = 3420): http.Server {
   // Backfill the PreCompact hook into existing agents' settings.json so the
   // auto-skill / auto-memory flow runs on context compaction. No-op if the
   // agent already has its own hooks block.
-  try {
-    const patched: string[] = []
-    const stalePatched: string[] = []
-    // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
-    // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
-    for (const agentName of [MAIN_AGENT_ID, ...listAgentNames()]) {
-      if (ensureAgentHooks(agentName)) patched.push(agentName)
-      if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
+  //
+  // Guarded: a worktree checkout or a WEB_ONLY staging instance must NEVER
+  // register hooks -- its PROJECT_ROOT is temporary, and baking it into the
+  // user-global ~/.claude/settings.json leaves stale absolute paths behind
+  // once the worktree is deleted. A failing (exit 2) UserPromptSubmit hook
+  // then BLOCKS every prompt and deafens the main agent (2026-07-11 incident).
+  const hookDecision = shouldRegisterHooks({ projectRoot: PROJECT_ROOT, webOnly, tmpDir: tmpdir() })
+  if (!hookDecision.register) {
+    logger.info({ reason: hookDecision.reason, projectRoot: PROJECT_ROOT }, 'Hook registration skipped')
+  } else {
+    try {
+      const patched: string[] = []
+      const stalePatched: string[] = []
+      const pruned: string[] = []
+      // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
+      // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
+      for (const agentName of [MAIN_AGENT_ID, ...listAgentNames()]) {
+        // Self-heal FIRST: drop entries this app previously wrote whose script
+        // file no longer exists (e.g. a deleted worktree instance's paths), so
+        // the re-registration below lands on a clean, unblocked settings file.
+        pruned.push(...pruneStaleHooksFromSettingsFile(agentSettingsPath(agentName)))
+        if (ensureAgentHooks(agentName)) patched.push(agentName)
+        if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
+      }
+      if (pruned.length) logger.info({ pruned }, 'Stale hook entries pruned from agent settings.json')
+      if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
+      if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
+    } catch (err) {
+      logger.warn({ err }, 'Agent hook backfill skipped')
     }
-    if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
-    if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
-  } catch (err) {
-    logger.warn({ err }, 'Agent hook backfill skipped')
   }
 
   try {
@@ -423,11 +461,13 @@ export function startWebServer(port = 3420): http.Server {
     clearInterval(scheduleInterval)
     if (pluginMonitorInterval) clearInterval(pluginMonitorInterval)
     clearInterval(channelHealthInterval)
+    if (costsSyncInterval) clearInterval(costsSyncInterval)
     clearInterval(stuckInputInterval)
     clearInterval(stuckToolCallInterval)
     if (reauthHealerInterval) clearInterval(reauthHealerInterval)
     clearInterval(autoRestartInterval)
     clearInterval(modelFallbackInterval)
+    clearInterval(contextGuardInterval)
     clearInterval(updateCheckerInterval)
     clearInterval(tokenCollectInterval)
     return origClose(cb)

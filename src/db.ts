@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, chmodSync, openSync, c
 import { STORE_DIR, DB_FILENAME, ALLOWED_CHAT_ID, OLLAMA_URL } from './config.js'
 import { getEffectiveSettingValue } from './settings-store.js'
 import { logger } from './logger.js'
+import { TOOL_TIMEOUTS } from './tool-timeouts.js'
 
 let db: Database.Database
 
@@ -143,7 +144,7 @@ export function initDatabase(dbPathOverride?: string): void {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       description TEXT,
-      status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','in_progress','waiting','done')),
+      status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','in_progress','testing','waiting','done')),
       assignee TEXT,
       priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),
       project TEXT,
@@ -190,6 +191,51 @@ export function initDatabase(dbPathOverride?: string): void {
     'work_completed_at INTEGER',
   ]) {
     try { db.exec(`ALTER TABLE kanban_cards ADD COLUMN ${col}`) } catch { /* already exists */ }
+  }
+  // Migration: add 'testing' status to kanban_cards CHECK constraint.
+  // SQLite can't ALTER a CHECK constraint, so we recreate the table when the
+  // current schema doesn't yet include 'testing'. Idempotent on fresh DBs.
+  // The recreated table carries the estimate-tracking columns added just above
+  // (estimated_hours, estimated_by, work_started_at, work_completed_at) in both
+  // its schema and the INSERT..SELECT, so an install that already has estimate
+  // data does NOT lose it when the testing-status recreate fires.
+  try {
+    const kcSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='kanban_cards'").get() as { sql: string } | undefined
+    if (kcSchema?.sql && !kcSchema.sql.includes("'testing'")) {
+      db.exec(`
+        CREATE TABLE kanban_cards_new (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          description TEXT,
+          status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','in_progress','testing','waiting','done')),
+          assignee TEXT,
+          priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),
+          project TEXT,
+          due_date INTEGER,
+          sort_order REAL NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          archived_at INTEGER,
+          parent_id TEXT REFERENCES kanban_cards_new(id),
+          dispatched_at INTEGER,
+          estimated_hours REAL,
+          estimated_by TEXT,
+          work_started_at INTEGER,
+          work_completed_at INTEGER
+        );
+        INSERT INTO kanban_cards_new
+          SELECT id, title, description, status, assignee, priority, project, due_date,
+                 sort_order, created_at, updated_at, archived_at, parent_id, dispatched_at,
+                 estimated_hours, estimated_by, work_started_at, work_completed_at
+          FROM kanban_cards;
+        DROP TABLE kanban_cards;
+        ALTER TABLE kanban_cards_new RENAME TO kanban_cards;
+      `)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_kanban_parent ON kanban_cards(parent_id)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_kanban_status ON kanban_cards(status, archived_at)`)
+    }
+  } catch (err) {
+    logger.warn({ err }, 'kanban_cards testing-status migration failed -- continuing')
   }
   // Migration: add agent_id, category, auto_generated columns to memories
   try {
@@ -481,6 +527,8 @@ export function initDatabase(dbPathOverride?: string): void {
       output_tokens INTEGER NOT NULL DEFAULT 0,
       cache_read_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      thinking_tokens INTEGER NOT NULL DEFAULT 0,
+      model TEXT,
       content_preview TEXT,
       tool_name TEXT,
       task_title TEXT,
@@ -490,6 +538,10 @@ export function initDatabase(dbPathOverride?: string): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_token_usage_agent ON token_usage(agent)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_token_usage_ts ON token_usage(timestamp)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_token_usage_agent_ts ON token_usage(agent, timestamp)`)
+  // Migrations for columns added after initial release
+  try { db.exec('ALTER TABLE token_usage ADD COLUMN thinking_tokens INTEGER NOT NULL DEFAULT 0') } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE token_usage ADD COLUMN model TEXT') } catch { /* already exists */ }
+
   // Deduplicate existing rows before creating unique index
   try {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_token_usage_dedup ON token_usage(agent, session_id, timestamp, input_tokens, output_tokens)`)
@@ -606,6 +658,54 @@ export function initDatabase(dbPathOverride?: string): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_store_file_audit_ts ON store_file_audit(created_at)`)
   // Migration: add agent column to installs that created the table before this column existed.
   try { db.exec(`ALTER TABLE store_file_audit ADD COLUMN agent TEXT`) } catch { /* column already exists */ }
+
+  // --- CostOps (local cost ledger) ---
+  // Read-mostly, FOCUS-inspired. cost_sources = provider/subscription origin,
+  // cost_line_items = individual charge rows (estimate or provider-sourced).
+  // No secrets/account IDs stored raw. Budgets are config-driven (costops/config.ts's
+  // BudgetEntry, from store/costops-config.json) -- there is deliberately no separate
+  // `budgets` DB table: an earlier draft of this schema had one, but it was never
+  // read from or written to (config.budgets was always the actual source), so it was
+  // a dead, unused second source of truth. Removed rather than wired up, since the
+  // config file already covers this fully and a DB table would just be a sync burden
+  // for no benefit.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cost_sources (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      account_ref TEXT,
+      currency TEXT NOT NULL DEFAULT 'HUF',
+      active INTEGER NOT NULL DEFAULT 1,
+      notes TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cost_line_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id TEXT NOT NULL REFERENCES cost_sources(id),
+      charge_period_start INTEGER NOT NULL,
+      charge_period_end INTEGER NOT NULL,
+      charge_category TEXT NOT NULL,
+      service_name TEXT,
+      usage_type TEXT,
+      consumed_quantity REAL,
+      consumed_unit TEXT,
+      billed_cost REAL NOT NULL,
+      effective_cost REAL,
+      currency TEXT NOT NULL DEFAULT 'HUF',
+      confidence TEXT NOT NULL,
+      data_freshness INTEGER NOT NULL,
+      source_ref TEXT,
+      dedup_key TEXT UNIQUE,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cost_line_items_period ON cost_line_items(charge_period_start, charge_period_end)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cost_line_items_source ON cost_line_items(source_id)`)
 
   // --- Vault SSH Keys (shared pool) ---
   db.exec(`
@@ -756,7 +856,10 @@ export function buildFtsMatchExpression(query: string): string {
   const MAX_TOKEN_LEN = 64
   const sanitized = query
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, '')
+    // Replace punctuation with a space (not delete) so "rank-check" / "serper.dev"
+    // tokenize the same way unicode61 indexed them (rank + check), instead of
+    // fusing into a single unfindable token "rankcheck".
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .trim()
   if (!sanitized) return ''
   const tokens = sanitized
@@ -767,19 +870,73 @@ export function buildFtsMatchExpression(query: string): string {
   return tokens.join(' ')
 }
 
+// -- Recency-weighted retrieval (Roitman 17.4.2) --
+//
+// score = λ·relevance + (1−λ)·recency, where recency = exp(−age/τ). Pure
+// keyword rank returns whichever memory FTS scores highest regardless of age,
+// so a stale fact ("reply tool down") can outrank its own correction ("reply
+// tool up"). The blend keeps relevance dominant (λ = 0.7) but breaks
+// near-ties in favour of the newer memory.
+//
+// FTS5 `rank` is bm25: negative, more negative = better. Normalized to 0..1
+// via −rank/(1−rank) (monotonic, no unbounded tail). The blend runs in JS on
+// an oversampled candidate set rather than in SQL so it does not depend on
+// SQLite being compiled with math functions, and stays unit-testable.
+export const RECENCY_LAMBDA = 0.7
+export const RECENCY_TAU_SEC = 7 * 86400
+// Candidates fetched per requested row before re-ranking. Bounded so a broad
+// query still touches at most 4x the requested rows.
+const RECENCY_OVERSAMPLE = 4
+
+export interface RecencyRankable {
+  rank: number
+  created_at: number
+}
+
+export function recencyWeightedScore(
+  row: RecencyRankable,
+  nowSec: number,
+  lambda = RECENCY_LAMBDA,
+  tauSec = RECENCY_TAU_SEC,
+): number {
+  const relevance = row.rank < 0 ? -row.rank / (1 - row.rank) : 0
+  const ageSec = Math.max(0, nowSec - row.created_at)
+  const recency = Math.exp(-ageSec / tauSec)
+  return lambda * relevance + (1 - lambda) * recency
+}
+
+export function reRankByRecency<T extends RecencyRankable>(
+  rows: T[],
+  limit: number,
+  nowSec: number = Math.floor(Date.now() / 1000),
+): T[] {
+  return rows
+    .map((row) => ({ row, score: recencyWeightedScore(row, nowSec) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((x) => x.row)
+}
+
+// Strip the FTS rank column the oversampled queries select for re-ranking, so
+// the public return shape stays exactly Memory.
+function withoutRank<T extends { rank: number }>(rows: T[]): Omit<T, 'rank'>[] {
+  return rows.map(({ rank: _rank, ...rest }) => rest)
+}
+
 export function searchMemories(query: string, chatId: string, limit = 3): Memory[] {
   const terms = buildFtsMatchExpression(query)
   if (!terms) return []
   try {
-    return db
+    const candidates = db
       .prepare(
-        `SELECT m.* FROM memories m
+        `SELECT m.*, f.rank AS rank FROM memories m
          JOIN memories_fts f ON m.id = f.rowid
          WHERE f.content MATCH ? AND m.chat_id = ?
          ORDER BY rank
          LIMIT ?`
       )
-      .all(terms, chatId, limit) as Memory[]
+      .all(terms, chatId, limit * RECENCY_OVERSAMPLE) as (Memory & { rank: number })[]
+    return withoutRank(reRankByRecency(candidates, limit)) as Memory[]
   } catch {
     return []
   }
@@ -844,12 +1001,13 @@ export function searchAgentMemories(agentId: string, query: string, limit: numbe
   const terms = buildFtsMatchExpression(query)
   if (!terms) return []
   try {
-    return db.prepare(
-      `SELECT m.* FROM memories m
+    const candidates = db.prepare(
+      `SELECT m.*, f.rank AS rank FROM memories m
        JOIN memories_fts f ON m.id = f.rowid
        WHERE f.memories_fts MATCH ? AND (m.agent_id = ? OR m.category = 'shared')
        ORDER BY rank LIMIT ?`
-    ).all(terms, agentId, limit) as Memory[]
+    ).all(terms, agentId, limit * RECENCY_OVERSAMPLE) as (Memory & { rank: number })[]
+    return withoutRank(reRankByRecency(candidates, limit)) as Memory[]
   } catch {
     return db.prepare(
       "SELECT * FROM memories WHERE (agent_id = ? OR category = 'shared') AND (content LIKE ? OR keywords LIKE ?) ORDER BY accessed_at DESC LIMIT ?"
@@ -884,7 +1042,10 @@ export function updateMemory(id: number, content: string, category?: string, age
 
 export function appendDailyLog(agentId: string, content: string): void {
   const now = Math.floor(Date.now() / 1000)
-  const today = new Date().toISOString().split('T')[0]
+  // Budapest calendar day, not UTC -- otherwise an entry written 00:00-02:00
+  // local time lands on the previous day and the "ma" recall query misses it.
+  // en-CA formats as YYYY-MM-DD.
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Budapest' })
   db.prepare('INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)').run(agentId, today, content, now)
 }
 
@@ -948,12 +1109,16 @@ export function recallSearch(query: string, agentId?: string, limit = 50): Recal
   const escaped = escapeLike(query)
   if (terms) {
     try {
+      // Was ORDER BY created_at DESC (pure recency, relevance ignored); now the
+      // same λ-blend as the other search paths, so a strongly matching older
+      // memory can still surface above barely-matching fresh noise.
       const sql = agentId
-        ? `SELECT m.* FROM memories m JOIN memories_fts f ON m.id = f.rowid WHERE f.memories_fts MATCH ? AND (m.agent_id = ? OR m.category = 'shared') ORDER BY m.created_at DESC LIMIT ?`
-        : `SELECT m.* FROM memories m JOIN memories_fts f ON m.id = f.rowid WHERE f.memories_fts MATCH ? ORDER BY m.created_at DESC LIMIT ?`
-      memories = agentId
-        ? db.prepare(sql).all(terms, agentId, limit) as Memory[]
-        : db.prepare(sql).all(terms, limit) as Memory[]
+        ? `SELECT m.*, f.rank AS rank FROM memories m JOIN memories_fts f ON m.id = f.rowid WHERE f.memories_fts MATCH ? AND (m.agent_id = ? OR m.category = 'shared') ORDER BY rank LIMIT ?`
+        : `SELECT m.*, f.rank AS rank FROM memories m JOIN memories_fts f ON m.id = f.rowid WHERE f.memories_fts MATCH ? ORDER BY rank LIMIT ?`
+      const candidates = agentId
+        ? db.prepare(sql).all(terms, agentId, limit * RECENCY_OVERSAMPLE) as (Memory & { rank: number })[]
+        : db.prepare(sql).all(terms, limit * RECENCY_OVERSAMPLE) as (Memory & { rank: number })[]
+      memories = withoutRank(reRankByRecency(candidates, limit)) as Memory[]
     } catch {
       const sql = agentId
         ? "SELECT * FROM memories WHERE (agent_id = ? OR category = 'shared') AND (content LIKE ? ESCAPE '\\' OR keywords LIKE ? ESCAPE '\\') ORDER BY created_at DESC LIMIT ?"
@@ -1124,7 +1289,7 @@ export interface KanbanCard {
   seq?: number
   title: string
   description: string | null
-  status: 'planned' | 'in_progress' | 'waiting' | 'done'
+  status: 'planned' | 'in_progress' | 'waiting' | 'testing' | 'done'
   assignee: string | null
   priority: 'low' | 'normal' | 'high' | 'urgent'
   project: string | null
@@ -1865,6 +2030,7 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: EMBED_MODEL, prompt: text.slice(0, 2000) }),
+      signal: AbortSignal.timeout(TOOL_TIMEOUTS['ollama-embedding']),
     })
     const data = await resp.json() as { embedding?: number[] }
     return data.embedding || null

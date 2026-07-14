@@ -46,6 +46,73 @@ case "$CHANNEL_PROVIDER" in
   *)        PLUGIN_ID="telegram@claude-plugins-official" ;;
 esac
 
+# Self-healing guard: ensure PLUGIN_ID is enabled in the PROJECT settings.json
+# before launch. A PR review-reset or branch-switch that reverts
+# .claude/settings.json can silently drop the entry and disable the channel
+# plugin, leaving Claude running with no active channel; this re-adds it.
+#
+# Deliberately PROJECT-SCOPED only ($INSTALL_DIR/.claude/settings.json). We do
+# NOT force-enable in the user-global ~/.claude/settings.json: that would make
+# EVERY Claude context (all sub-agent sessions) load the channel plugin, and a
+# provider that opens a single Socket-Mode connection (Slack) would then have
+# multiple sessions fighting over one workspace socket -- a duplicate-socket /
+# 409 hazard.
+_ensure_plugin_enabled() {
+  local settings_file="$1"
+  [ -f "$settings_file" ] || return 0
+  python3 - "$settings_file" "$PLUGIN_ID" <<'PYEOF'
+import json, os, sys, tempfile
+
+path, plugin_id = sys.argv[1], sys.argv[2]
+
+# SKIP-ON-PARSE-FAILURE: if the file is unreadable or not valid JSON (e.g. a
+# concurrent writer caught mid-write, or a genuinely corrupt file), NEVER fall
+# back to an empty object and write it back -- that would clobber the user's
+# hooks / model / permissions. Leave the file untouched; the next launch retries.
+try:
+    with open(path, "r") as f:
+        data = json.load(f)
+except (OSError, ValueError):
+    print("channels.sh: settings.json unreadable/invalid, guard skipped: %s" % path,
+          file=sys.stderr, flush=True)
+    sys.exit(0)
+
+if not isinstance(data, dict):
+    sys.exit(0)
+
+plugins = data.get("enabledPlugins")
+if not isinstance(plugins, dict):
+    plugins = {}
+    data["enabledPlugins"] = plugins
+
+if plugins.get(plugin_id) is True:
+    sys.exit(0)  # already enabled -> no write, no needless churn
+
+plugins[plugin_id] = True
+
+# ATOMIC write: serialize to a temp file in the SAME directory, then os.replace
+# (atomic rename on POSIX). A reader -- or the hook-registration guard (#565)
+# running concurrently -- never observes a half-written settings.json.
+dir_name = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=dir_name, prefix=".settings-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+
+print("channels.sh: enabled %s in %s" % (plugin_id, path), flush=True)
+PYEOF
+}
+_ensure_plugin_enabled "$INSTALL_DIR/.claude/settings.json"
+unset -f _ensure_plugin_enabled
+
 # ROOT-CAUSE NOTE (kali-linux WSL, claude-code 2.1.152, 2026-05-27):
 # Inbound MCP notifications from the `--channels` plugin go through a SECOND
 # gate beyond --dangerously-skip-permissions / --dangerously-load-development-
@@ -85,6 +152,15 @@ export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HO
 # root-only host there is no non-root user to drop to, so opt into the
 # documented sandbox escape hatch. Harmless for non-root (guarded by uid check).
 [ "$(id -u)" = "0" ] && export IS_SANDBOX=1
+
+# AVX-less x86 host: the install pinned a Node-based claude (cli.js entrypoint,
+# see install-linux.sh CLAUDE_PIN) because the Bun standalone binary SIGILLs
+# without AVX. The auto-updater would swap the pin for the latest Bun binary on
+# first run, killing every session -- disable it here so all agent sessions
+# inherit the guard via tmux. No-op on AVX-capable and ARM hosts.
+if grep -qE '^flags[[:space:]]*:' /proc/cpuinfo 2>/dev/null && ! grep -qiw avx /proc/cpuinfo 2>/dev/null; then
+  export DISABLE_AUTOUPDATER=1
+fi
 
 # Disable Claude Code's "Prompt Suggestions" (the grayed-out/DIM suggested command
 # shown in the input box, picked from git history / conversation). For headless
@@ -137,6 +213,58 @@ MODEL_FLAG=""
 # Single-quote the model id so values like `claude-opus-4-8[1m]` survive the
 # tmux command-string round-trip without the inner shell glob-expanding `[1m]`.
 [ -n "$MAIN_MODEL" ] && MODEL_FLAG="--model '$MAIN_MODEL' "
+
+# macOS main-agent config isolation (OPT-IN, default OFF).
+#
+# By default the main channels agent keeps the shared ~/.claude and, on macOS,
+# authenticates from the ROTATING Keychain OAuth session -- which periodically
+# expires and 401s the main bot ("Please run /login"), while the isolated
+# sub-agents (long-lived fleet setup-token) never do. The helper provisions an
+# isolated CLAUDE_CONFIG_DIR (same code path as the sub-agents, via
+# dist/web/agent-process.js) and authenticates the main agent from the fleet
+# setup-token instead.
+#
+# The decision lives ENTIRELY in the helper, which prints "<mode>\t<path>" (or
+# nothing) and covers the two mutually exclusive ways the main agent can get its
+# own CLAUDE_CONFIG_DIR:
+#
+#   explicit -- MAIN_AGENT_CONFIG_DIR points at an EXISTING dir the operator has
+#     already logged into (the bot has its OWN Claude account, separate from the
+#     fleet's). That dir carries its own .credentials.json, so we must NOT inject
+#     the fleet token: doing so would authenticate the bot as the fleet. Works on
+#     every platform.
+#   isolated -- MAIN_AGENT_ISOLATED_CONFIG=1 on macOS with a fleet setup-token:
+#     the helper provisions a credential-less dir and we export the fleet token
+#     (same code path as the sub-agents), so the bot stops depending on the
+#     rotating Keychain OAuth session.
+#
+# Both settings resolve through the settings-store (dashboard toggle in
+# store/config-overrides.json OR a hand-set .env key -- resolution override>.env>
+# default), and explicit wins over isolated. When neither applies the helper
+# prints nothing, CFG_ENV stays EMPTY and the agent keeps the shared ~/.claude --
+# strict no-op for existing installs (no setting, no fleet token, no dist build).
+CFG_ENV=""
+mkdir -p "$INSTALL_DIR/store" 2>/dev/null || true
+_node_bin="$(command -v node || true)"
+if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
+  _cfg_line="$("$_node_bin" "$INSTALL_DIR/scripts/main-agent-isolated-config.mjs" "$CHANNEL_PROVIDER" 2>>"$INSTALL_DIR/store/channels-failures.log" || true)"
+  _cfg_mode="${_cfg_line%%	*}"
+  _cfg_dir="${_cfg_line#*	}"
+  if [ -n "$_cfg_line" ] && [ -d "$_cfg_dir" ]; then
+    if [ "$_cfg_mode" = "explicit" ]; then
+      CFG_ENV="export CLAUDE_CONFIG_DIR='$_cfg_dir' && "
+    else
+      # Seed the token from the SAME 0600 file the isolated dir is gated on, so
+      # the config dir and the active token always match (the isolated dir carries
+      # no .credentials.json). $(cat) is evaluated in the launched shell so the
+      # secret never lands in the argv/`ps` command string.
+      CFG_ENV="export CLAUDE_CONFIG_DIR='$_cfg_dir' && export CLAUDE_CODE_OAUTH_TOKEN=\"\$(cat '$INSTALL_DIR/store/.claude-oauth-token')\" && "
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: main-agent $_cfg_mode CLAUDE_CONFIG_DIR=$_cfg_dir" >> "$INSTALL_DIR/store/channels-failures.log"
+  fi
+  unset _cfg_line _cfg_mode _cfg_dir
+fi
+unset _node_bin
 
 # Régi session takarítás
 $TMUX kill-session -t "$SESSION" 2>/dev/null
@@ -232,7 +360,7 @@ $TMUX set-environment -g CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION false 2>/dev/null 
 # otherwise new-session below fails with "duplicate session".
 $TMUX kill-session -t "$SESSION" 2>/dev/null || true
 $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
-  "${MCP_BATCH_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
+  "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
 
 # Session startup guard: a Claude Code first-run dialogusait auto-accept-eljuk
 # kulonben a headless session orokre parkolna a prompton es a Telegram plugin
@@ -273,7 +401,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         # entry); see the PR description / card 7EB18437.
         [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
         $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
-          "${MCP_BATCH_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
+          "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
         unset _CHANNELS_STARTDIR
       fi
       continue

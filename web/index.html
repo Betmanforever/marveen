@@ -36,6 +36,20 @@
   </script>
 </head>
 <body>
+  <!-- First-run onboarding wizard (shown by app.js when /api/onboarding/status needs setup) -->
+  <div class="modal-overlay onboarding-overlay" id="onboardingOverlay" hidden>
+    <div class="modal onboarding-modal">
+      <h2 data-i18n="onboarding.title">Marveen beállítása</h2>
+      <p class="onb-sub" data-i18n="onboarding.subtitle">Fejezd be a beállítást innen, a dashboardból -- SSH nélkül.</p>
+      <div class="onboarding-steps" id="onboardingSteps">
+        <div class="onboarding-step" data-ostep="1"><span class="onb-num">1</span> <span data-i18n="onboarding.step1.tab">Claude auth</span></div>
+        <div class="onboarding-step" data-ostep="2"><span class="onb-num">2</span> <span data-i18n="onboarding.step2.tab">Telegram bot</span></div>
+        <div class="onboarding-step" data-ostep="3"><span class="onb-num">3</span> <span data-i18n="onboarding.step3.tab">Párosítás</span></div>
+      </div>
+      <div id="onboardingBody" class="onboarding-body"></div>
+    </div>
+  </div>
+
   <div class="mobile-topbar">
     <button class="mobile-menu-btn" id="mobileMenuBtn" aria-label="Menü" aria-expanded="false">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
@@ -132,6 +146,10 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
         <span class="sb-label">Token Monitor</span>
       </a>
+      <a href="#" class="sb-link" data-page="costs">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+        <span class="sb-label">Költségek</span>
+      </a>
       <a href="#" class="sb-link" data-page="ideas">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
         <span class="sb-label">Ötletláda</span>
@@ -216,7 +234,7 @@
       </div>
 
       <!-- Board-specific filter row (hidden when gantt active) -->
-      <div id="kanbanBoardFilters" style="margin-bottom:12px;display:flex;align-items:center;gap:8px;">
+      <div id="kanbanBoardFilters" style="margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <label for="kanbanProjectFilter" style="font-size:13px;color:var(--muted);white-space:nowrap;">Projekt:</label>
         <select id="kanbanProjectFilter" style="font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);min-width:140px;">
           <option value="">Mind</option>
@@ -227,6 +245,8 @@
           <option value="assignee" data-i18n="kanban.filter.group_assignee">Felelős szerint</option>
           <option value="priority" data-i18n="kanban.filter.group_priority">Prioritás szerint</option>
         </select>
+        <span id="kanbanColumnChipsLabel" style="font-size:13px;color:var(--muted);white-space:nowrap;margin-left:8px;" data-i18n="kanban.filter.columns_label">Oszlopok:</span>
+        <div id="kanbanColumnChips" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;"></div>
         <div class="kanban-quick-filters" id="kanbanQuickFilters" style="margin-left:auto; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
       </div>
 
@@ -265,6 +285,14 @@
             <button class="kanban-add-btn" data-status="waiting" title="Új kártya">+</button>
           </div>
           <div class="kanban-col-body" data-status="waiting"></div>
+        </div>
+        <div class="kanban-col" data-status="testing">
+          <div class="kanban-col-header">
+            <span class="kanban-col-title">Tesztelés</span>
+            <span class="kanban-col-count" id="countTesting">0</span>
+            <button class="kanban-add-btn" data-status="testing" title="Új kártya">+</button>
+          </div>
+          <div class="kanban-col-body" data-status="testing"></div>
         </div>
         <div class="kanban-col" data-status="done">
           <div class="kanban-col-header">
@@ -308,6 +336,9 @@
             <p class="subtitle" data-i18n="agents.page_subtitle">AI csapattagok kezelése</p>
           </div>
           <div class="header-actions">
+            <button class="btn-secondary btn-compact" id="exportAllAgentsBtn">Összes exportálása</button>
+            <button class="btn-secondary btn-compact" id="importAgentBtn">Ügynök importálása</button>
+            <input type="file" id="importAgentFile" accept=".gz,.tgz,application/gzip" hidden>
             <button class="btn-secondary btn-compact" id="analyzeAllModelsBtn" data-i18n="agents.page.analyze_btn">Modell elemzés</button>
           </div>
         </div>
@@ -1571,6 +1602,27 @@
         </div>
       </div>
 
+      <div class="overview-card" id="tuModelDistSection" style="margin-bottom:16px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+          <h3 style="margin:0" data-i18n="tokenUsage.model_dist_title">Modell eloszlás</h3>
+        </div>
+        <div id="tuModelDistContent" style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap">
+          <canvas id="tuModelPieCanvas" width="180" height="180" style="flex-shrink:0"></canvas>
+          <div id="tuModelDistTable" style="flex:1;min-width:220px"></div>
+        </div>
+      </div>
+
+      <div class="overview-card" id="tuToolStatsSection" style="margin-bottom:16px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">
+          <h3 style="margin:0" data-i18n="tokenUsage.tool_stats_title">MCP eszközhasználat</h3>
+          <label style="font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:4px;cursor:pointer">
+            <input type="checkbox" id="tuToolAgentBreakdown">
+            <span data-i18n="tokenUsage.tool_stats_agent_toggle">Ágens bontás</span>
+          </label>
+        </div>
+        <div id="tuToolStatsContent"></div>
+      </div>
+
       <div class="overview-card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
           <h3 style="margin:0" data-i18n="tokenUsage.biggest_calls_title">Legnagyobb hívások</h3>
@@ -1607,10 +1659,32 @@
 
       <div id="updatesSummary" class="updates-summary"></div>
 
+      <div id="updatesDiagnose" class="updates-diagnose" hidden></div>
+
       <div class="updates-commits">
         <h3 data-i18n="tokenUsage.changes_title">Változások</h3>
         <div id="updatesCommitList" class="updates-commit-list"></div>
       </div>
+    </div>
+
+    <!-- Costs page (CostOps v0.1, PR #524) -->
+    <div class="page" id="costsPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1 data-i18n="costs.page_title">Költségek</h1>
+            <p class="subtitle" data-i18n="costs.page_subtitle">Havi költség-összefoglaló a helyi konfigurációból</p>
+          </div>
+          <button class="btn-secondary btn-compact" id="refreshCostsBtn" data-i18n="common.btn.refresh">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+            Frissítés
+          </button>
+        </div>
+      </div>
+
+      <div id="costsContent"></div>
     </div>
 
     <!-- Naplo page -->
@@ -2195,6 +2269,12 @@
             <small id="editAgentProfileDesc" style="display:block;margin-top:6px;color:var(--text-muted);font-size:12px;line-height:1.4"></small>
             <button class="btn-secondary btn-compact agent-save-section" id="saveProfileBtn" data-i18n="common.btn.save">Mentés</button>
           </div>
+          <div class="form-group" id="claudePlanGroup">
+            <label for="editAgentPlan" data-i18n="agents.settings.plan_label">Claude előfizetés</label>
+            <select id="editAgentPlan"></select>
+            <small id="editAgentPlanDesc" style="display:block;margin-top:6px;color:var(--text-muted);font-size:12px;line-height:1.4"></small>
+            <button class="btn-secondary btn-compact agent-save-section" id="savePlanBtn" data-i18n="common.btn.save">Mentés</button>
+          </div>
           <div class="form-group">
             <label for="editClaudeMd">CLAUDE.md</label>
             <textarea id="editClaudeMd" class="code-textarea" rows="12"></textarea>
@@ -2402,6 +2482,7 @@
 
         <!-- Bottom actions -->
         <div class="detail-actions agent-detail-bottom" id="agentDetailActions">
+          <button class="btn-secondary" id="exportAgentBtn">Exportálás</button>
           <button class="btn-danger" id="deleteAgentBtn" data-i18n="common.btn.delete">Törlés</button>
         </div>
       </div>
