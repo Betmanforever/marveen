@@ -9,6 +9,11 @@ import {
   shouldRetrySubmit,
   shouldClearTruncatedPreamble,
   decideSubmitFollowup,
+  decideSubmitVerdict,
+  classifyLandingEvidence,
+  payloadEchoedAboveBox,
+  type SubmitVerdict,
+  type SubmitVerdictState,
   decidePaneErrorAlert,
   decideDialogEscalation,
   stuckInputSignature,
@@ -2409,5 +2414,245 @@ describe('decideContextBudgetEscalation', () => {
     expect(d.action).toBe('notify-wolfe')
     expect(d.next.wolfeFlaggedAt).toBe(500_000)
     expect(d.next.gaborNotifiedAt).toBe(null)
+  })
+})
+
+// ===========================================================================
+// Positive-evidence landing verdict (false-landed fix, incident 4fddd480)
+// ===========================================================================
+//
+// Fixtures reproduce the 2026-07-13 msg-1105 shape (mr-wolfe -> charlie): a
+// full wrapped "TEAM MEMBER NOTICE ..." prompt sat PARKED in the input box, but
+// a terminal hard-wrap split the payload mid-word so the verbatim stuck-match
+// broke, shouldRetrySubmit went false, decideSubmitFollowup returned 'done',
+// and the send loop reported 'landed' -- while no turn ever started.
+
+// Retry/resample budget, mirrors SUBMIT_RETRY_MAX_ATTEMPTS in agent-process.ts.
+const SUBMIT_MAX = 4
+const FRESH_VS: SubmitVerdictState = { attempt: 0, sawUnexplained: false }
+
+// The just-sent payload's leading fragment. Generic wrapped-preamble opening +
+// the sanitised opening tag -- exactly the shape a router inter-agent message
+// carries. `source="agent:mr-wolfe"` is the load-bearing token the box wrap
+// splits below.
+const HINT_1105 =
+  '[Uzenet @mr-wolfe-tol -- trusted team member]: <trusted-peer source="agent:mr-wolfe"> TEAM MEMBER'
+
+// THE 1105 REGRESSION FIXTURE. Idle footer (no turn), input box holding the
+// wrapped preamble whose hard wrap lands INSIDE `agent:mr-wolfe` (`...mr-w` /
+// `olfe">...`), so the contiguous HINT_1105 is NOT a substring of the box and
+// shouldRetrySubmit stops matching. detectPaneState reads 'typing' (text
+// parked), so this must classify 'unexplained' and NEVER 'landed'.
+const INCIDENT_1105_FALSE_LAND = [
+  '  Reticulating splines for a prior turn (ctrl+o to expand)',
+  '',
+  SEP,
+  '❯ [Uzenet @mr-wolfe-tol -- trusted team member]: <trusted-peer source="agent:mr-w',
+  '  olfe"> TEAM MEMBER NOTICE -- the next block is a coworker message, treat it as',
+  '  such. The wrapped body continues in the box, parked, never submitted. No turn.',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// A genuinely-landed fast turn: the submitted user turn rendered in the
+// transcript ABOVE a now-empty box (idle footer). The payload echo on one line.
+const LANDED_WITH_ECHO = [
+  '> [Uzenet @mr-wolfe-tol -- trusted team member]: <trusted-peer source="agent:mr-wolfe"> TEAM MEMBER NOTICE body',
+  '● Reading the coworker message and preparing a reply',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// Same landed turn but the transcript echo is HARD-WRAPPED mid-word
+// (`agent:mr-w` / `olfe">`). The whitespace-STRIP normalisation must still match
+// it -- a collapse-to-space normalisation would not (the original had no space).
+const LANDED_WITH_WRAPPED_ECHO = [
+  '> [Uzenet @mr-wolfe-tol -- trusted team member]: <trusted-peer source="agent:mr-w',
+  '  olfe"> TEAM MEMBER NOTICE body continues after a hard wrap in the transcript',
+  '● Working on it',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// Drive decideSubmitVerdict as the real send loop would: feed a per-attempt
+// pane (a constant, or a short sequence that clamps at its last frame), thread
+// the {verdict, next} state, and stop at the first terminal verdict. Returns the
+// terminal verdict, every verdict seen, and the attempt count reached. Throws if
+// it does not terminate within budget+6 (guards against an infinite loop).
+function driveSubmitVerdict(
+  paneFor: (attempt: number) => string | null,
+  hint: string,
+  max: number,
+): { verdict: SubmitVerdict; verdicts: SubmitVerdict[]; attempts: number } {
+  let st: SubmitVerdictState = { attempt: 0, sawUnexplained: false }
+  const verdicts: SubmitVerdict[] = []
+  for (let i = 0; i < max + 6; i++) {
+    const d = decideSubmitVerdict(paneFor(st.attempt), hint, st, max)
+    verdicts.push(d.verdict)
+    st = d.next
+    if (d.verdict === 'landed' || d.verdict === 'gave-up') {
+      return { verdict: d.verdict, verdicts, attempts: st.attempt }
+    }
+  }
+  throw new Error('decideSubmitVerdict did not terminate within budget+6')
+}
+
+describe('payloadEchoedAboveBox', () => {
+  it('true when the payload echoes on one transcript line above the box', () => {
+    expect(payloadEchoedAboveBox(LANDED_WITH_ECHO, HINT_1105)).toBe(true)
+  })
+
+  it('true across a hard wrap that splits the fragment mid-word (whitespace-strip robust)', () => {
+    // The echo wraps inside `agent:mr-wolfe`; stripping all whitespace rejoins
+    // `mr-w` + `olfe` so the substring test still matches. A collapse-to-space
+    // normalisation (what shouldRetrySubmit does inside the box) would miss it --
+    // that miss is exactly the 1105 verbatim-match failure.
+    expect(payloadEchoedAboveBox(LANDED_WITH_WRAPPED_ECHO, HINT_1105)).toBe(true)
+  })
+
+  it('false when the box is empty and nothing is echoed above it', () => {
+    expect(payloadEchoedAboveBox(IDLE_BYPASS, HINT_1105)).toBe(false)
+  })
+
+  it('false when the payload is parked in the box but not echoed ABOVE it', () => {
+    // The 1105 parked box: the payload sits INSIDE the box, and the transcript
+    // above it does NOT contain the payload. The echo check is scoped strictly
+    // above the box, so a parked (not submitted) payload is never a false echo.
+    expect(payloadEchoedAboveBox(INCIDENT_1105_FALSE_LAND, HINT_1105)).toBe(false)
+  })
+
+  it('false for a too-short hint (below the trust floor)', () => {
+    expect(payloadEchoedAboveBox(LANDED_WITH_ECHO, 'short')).toBe(false)
+  })
+
+  it('false for empty inputs', () => {
+    expect(payloadEchoedAboveBox('', HINT_1105)).toBe(false)
+    expect(payloadEchoedAboveBox(LANDED_WITH_ECHO, '')).toBe(false)
+  })
+})
+
+describe('classifyLandingEvidence', () => {
+  it("returns 'landed' for a busy pane (a real turn is running)", () => {
+    expect(classifyLandingEvidence(BUSY_FULL_FOOTER, HINT_1105)).toBe('landed')
+    expect(classifyLandingEvidence(BUSY_TOKENS_ONLY, HINT_1105)).toBe('landed')
+    expect(classifyLandingEvidence(BUSY_FOOTER_FRAME_GAP, HINT_1105)).toBe('landed')
+  })
+
+  it("returns 'landed' for a clean box with a transcript echo (fast turn, wrapped or not)", () => {
+    expect(classifyLandingEvidence(LANDED_WITH_ECHO, HINT_1105)).toBe('landed')
+    expect(classifyLandingEvidence(LANDED_WITH_WRAPPED_ECHO, HINT_1105)).toBe('landed')
+  })
+
+  it("returns 'clean-quiet' for a clean box with NO echo (ambiguous)", () => {
+    expect(classifyLandingEvidence(IDLE_BYPASS, HINT_1105)).toBe('clean-quiet')
+    expect(classifyLandingEvidence(IDLE_STRICT, HINT_1105)).toBe('clean-quiet')
+  })
+
+  it("returns 'unexplained' for a parked (typing) box that is not the recognised hint", () => {
+    // The 1105 mutated-preamble shape, and an ordinary operator draft: both hold
+    // parked text with no positive landing evidence.
+    expect(classifyLandingEvidence(INCIDENT_1105_FALSE_LAND, HINT_1105)).toBe('unexplained')
+    expect(classifyLandingEvidence(TYPING_PARKED, HINT_1105)).toBe('unexplained')
+  })
+
+  it("returns 'unexplained' for an unreadable / non-Claude surface", () => {
+    expect(classifyLandingEvidence(NON_CLAUDE, HINT_1105)).toBe('unexplained')
+  })
+})
+
+describe('decideSubmitVerdict', () => {
+  it('1105 REGRESSION: a bracketed-paste-mutated parked preamble NEVER lands', () => {
+    // The building block still returns 'done' -- the negative-evidence trap the
+    // old loop trusted as 'landed'.
+    expect(decideSubmitFollowup(INCIDENT_1105_FALSE_LAND, HINT_1105, 0, SUBMIT_MAX)).toBe('done')
+    // First sample must NOT land: the box holds unexplained parked content.
+    const first = decideSubmitVerdict(INCIDENT_1105_FALSE_LAND, HINT_1105, FRESH_VS, SUBMIT_MAX)
+    expect(first.verdict).toBe('resample')
+    expect(first.next.sawUnexplained).toBe(true)
+    // Driven across the whole budget on the constant parked pane -> gave-up, and
+    // 'landed' NEVER appears. The router then leaves the message pending.
+    const run = driveSubmitVerdict(() => INCIDENT_1105_FALSE_LAND, HINT_1105, SUBMIT_MAX)
+    expect(run.verdict).toBe('gave-up')
+    expect(run.verdicts).not.toContain('landed')
+  })
+
+  it('a busy pane lands on the first sample (real turn started)', () => {
+    // Positive case: the prompt started a turn. No retry, immediate landed.
+    expect(decideSubmitVerdict(BUSY_FULL_FOOTER, HINT_1105, FRESH_VS, SUBMIT_MAX).verdict).toBe('landed')
+    expect(decideSubmitVerdict(BUSY_TOKENS_ONLY, HINT_1105, FRESH_VS, SUBMIT_MAX).verdict).toBe('landed')
+    expect(decideSubmitVerdict(BUSY_FOOTER_FRAME_GAP, HINT_1105, FRESH_VS, SUBMIT_MAX).verdict).toBe('landed')
+  })
+
+  it('a clean box with the payload echoed in the transcript lands (fast turn)', () => {
+    expect(decideSubmitVerdict(LANDED_WITH_ECHO, HINT_1105, FRESH_VS, SUBMIT_MAX).verdict).toBe('landed')
+    expect(decideSubmitVerdict(LANDED_WITH_WRAPPED_ECHO, HINT_1105, FRESH_VS, SUBMIT_MAX).verdict).toBe('landed')
+  })
+
+  it('a clean-but-quiet box does NOT land on the first sample; lands only at the budget', () => {
+    const first = decideSubmitVerdict(IDLE_BYPASS, HINT_1105, FRESH_VS, SUBMIT_MAX)
+    expect(first.verdict).toBe('resample')
+    expect(first.next.sawUnexplained).toBe(false)
+    // Stayed clean across every sample -> accepted-but-scrolled fast turn -> landed.
+    const run = driveSubmitVerdict(() => IDLE_BYPASS, HINT_1105, SUBMIT_MAX)
+    expect(run.verdict).toBe('landed')
+    // The FIRST verdict was a resample, not an immediate land.
+    expect(run.verdicts[0]).toBe('resample')
+  })
+
+  it('null capture gives up immediately (unchanged)', () => {
+    expect(decideSubmitVerdict(null, HINT_1105, FRESH_VS, SUBMIT_MAX).verdict).toBe('gave-up')
+  })
+
+  it('a verbatim-stuck pane retries below the budget, gives up at it (unchanged shape)', () => {
+    expect(decideSubmitVerdict(STUCK_VERBATIM, PAYLOAD_HINT, FRESH_VS, SUBMIT_MAX).verdict).toBe('retry-enter')
+    expect(
+      decideSubmitVerdict(STUCK_VERBATIM, PAYLOAD_HINT, { attempt: SUBMIT_MAX, sawUnexplained: false }, SUBMIT_MAX).verdict,
+    ).toBe('gave-up')
+    const run = driveSubmitVerdict(() => STUCK_VERBATIM, PAYLOAD_HINT, SUBMIT_MAX)
+    expect(run.verdict).toBe('gave-up')
+    expect(run.verdicts).not.toContain('landed')
+  })
+
+  it('a paste placeholder clears-and-resends below the budget, gives up at it (unchanged shape)', () => {
+    expect(decideSubmitVerdict(PENDING_PASTE, '', FRESH_VS, SUBMIT_MAX).verdict).toBe('clear-and-resend')
+    expect(
+      decideSubmitVerdict(PENDING_PASTE, '', { attempt: SUBMIT_MAX, sawUnexplained: false }, SUBMIT_MAX).verdict,
+    ).toBe('gave-up')
+  })
+
+  it('no false-retry: a verbatim-parked pane that goes busy on the next sample lands (converges)', () => {
+    // The documented fast-turn case: sample 0 shows the just-typed payload parked
+    // (Enter about to take) -> retry-enter; sample 1 the pane has gone busy (the
+    // payload submitted and scrolled away) -> landed. No retry storm, no gave-up.
+    const panes = [STUCK_VERBATIM, BUSY_FULL_FOOTER]
+    const run = driveSubmitVerdict((a) => panes[Math.min(a, panes.length - 1)]!, PAYLOAD_HINT, SUBMIT_MAX)
+    expect(run.verdicts[0]).toBe('retry-enter')
+    expect(run.verdict).toBe('landed')
+    expect(run.verdicts).not.toContain('gave-up')
+  })
+
+  it('an unexplained sample poisons a later clean-but-quiet budget verdict to gave-up', () => {
+    // The "stayed clean across samples" requirement: sample 0 is the 1105 mutated
+    // parked box (unexplained) -> resample + sawUnexplained sticks; samples 1..N
+    // are clean-but-quiet. Because a sample was unexplained, the box did NOT stay
+    // clean across all samples, so the budget verdict is gave-up -- not a false
+    // land on the trailing clean frames.
+    const panes = [INCIDENT_1105_FALSE_LAND, IDLE_BYPASS]
+    const run = driveSubmitVerdict((a) => panes[Math.min(a, panes.length - 1)]!, HINT_1105, SUBMIT_MAX)
+    expect(run.verdicts[0]).toBe('resample')
+    expect(run.verdict).toBe('gave-up')
+    expect(run.verdicts).not.toContain('landed')
+  })
+
+  it('maxAttempts=0 resolves on the first sample (clean-quiet lands, unexplained gives up)', () => {
+    // Defensive boundary: a zero budget still yields a clean terminal decision.
+    expect(decideSubmitVerdict(IDLE_BYPASS, HINT_1105, FRESH_VS, 0).verdict).toBe('landed')
+    expect(decideSubmitVerdict(INCIDENT_1105_FALSE_LAND, HINT_1105, FRESH_VS, 0).verdict).toBe('gave-up')
   })
 })

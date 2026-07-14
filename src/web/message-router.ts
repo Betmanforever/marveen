@@ -59,13 +59,19 @@ export function shouldAbandon(sessionExists: boolean, ageMs: number, windowMs: n
  * Pure decision: given the outcome of a sendPromptToSession call, should the
  * router mark the message delivered, or leave it pending for a later retry?
  *
- *   - 'landed'  -> 'delivered': the text was submitted (or accepted by a busy
- *                               pane). Mark the message delivered, as before.
- *   - 'gave-up' -> 'retry':     the submit-retry budget was spent with the text
- *                               STILL parked in the input box. Marking it
- *                               delivered here is the exact "delivered != landed"
- *                               bug (2026-07-08: a parked-unsubmitted message
- *                               read delivered=true). Leave it pending instead.
+ *   - 'landed'  -> 'delivered': the send loop saw POSITIVE evidence the prompt
+ *                               landed -- a real turn started, the payload echoed
+ *                               into the transcript, or the box stayed provably
+ *                               clean across the whole retry budget (4fddd480).
+ *                               Mark the message delivered, as before.
+ *   - 'gave-up' -> 'retry':     the retry budget was spent WITHOUT that positive
+ *                               evidence -- the text is still parked, or the box
+ *                               holds unexplained (bracketed-paste-mutated)
+ *                               content. Marking it delivered here is the
+ *                               "delivered != landed" bug (2026-07-08: a
+ *                               parked-unsubmitted message read delivered=true;
+ *                               2026-07-13 msg 1105: a mutated parked box read
+ *                               landed). Leave it pending instead.
  *
  * Kept pure so the router's tmux/db-bound loop stays trivially testable: feed a
  * SendResult in, assert the outcome out.
@@ -393,12 +399,14 @@ export async function runMessageRouterTick(): Promise<void> {
         // Inline preamble so a fresh session (post hard-restart) doesn't miss
         // the context that explains the tag semantics.
         //
-        // sendPromptToSession reports whether the text actually LANDED
-        // (submitted / accepted by a busy pane) or the submit-retry budget was
-        // exhausted with the text STILL parked in the input box ('gave-up').
-        // Marking a 'gave-up' send delivered is the exact "delivered != landed"
-        // gap (2026-07-08: a message sat parked-unsubmitted in the pane yet read
-        // delivered=true). Only a 'landed' send is a real delivery.
+        // sendPromptToSession reports whether the text actually LANDED (POSITIVE
+        // evidence: a real turn started, the payload echoed into the transcript,
+        // or the box stayed provably clean across the whole retry budget) or the
+        // budget was spent WITHOUT that evidence ('gave-up': still parked, or an
+        // unexplained bracketed-paste-mutated box). Marking a 'gave-up' send
+        // delivered is the "delivered != landed" gap (2026-07-08 parked-
+        // unsubmitted; 2026-07-13 msg 1105 mutated-parked false landed). Only a
+        // 'landed' send is a real delivery.
         const sendResult = sendPromptToSession(session, prefix + wrapped, host)
         if (decideDeliveryOutcome(sendResult) === 'delivered') {
           if (!markMessageDelivered(msg.id)) {

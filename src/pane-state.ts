@@ -822,8 +822,13 @@ export type SubmitFollowupAction = 'retry-enter' | 'clear-and-resend' | 'done' |
  * been made. Returns one of three discrete actions so the caller can
  * branch without re-running the detection logic itself.
  *
- *   - 'done'             -- the prompt landed (or the pane is busy
- *                           processing); no further action.
+ *   - 'done'             -- the pane is no longer a RECOGNISED stuck signature
+ *                           (no placeholder, no verbatim-parked payload). This
+ *                           is NEGATIVE evidence only -- it does NOT prove the
+ *                           prompt landed. decideSubmitVerdict wraps this action
+ *                           and gates the actual 'landed' verdict on POSITIVE
+ *                           evidence (busy turn / transcript echo / clean across
+ *                           the budget); the send loop calls THAT, not this.
  *   - 'retry-enter'      -- the pane shows a VERBATIM stuck send; send
  *                           another Enter and re-sample. (A plain Enter
  *                           submits verbatim parked text.)
@@ -868,6 +873,228 @@ export function decideSubmitFollowup(
   // clear-and-resend recovery instead of wasting a retry-Enter on it.
   if (detectsPastePlaceholder(pane)) return 'clear-and-resend'
   return 'retry-enter'
+}
+
+// =============================================================================
+// Positive-evidence landing verdict (false-landed fix, incident 4fddd480)
+// =============================================================================
+//
+// decideSubmitFollowup returns 'done' as soon as the pane is no longer a
+// RECOGNISED stuck signature (no `[Pasted text #N]` placeholder, and the
+// just-sent payload is not a verbatim substring of the input box). The send
+// loop historically read that 'done' as "landed". That is NEGATIVE evidence
+// only -- "the stuck-detector stopped matching" -- NOT proof a turn started.
+//
+// Incident 4fddd480 (2026-07-13, msg 1105 mr-wolfe -> charlie): bracketed-paste
+// artifacts mutated the box so the full wrapped "TEAM MEMBER NOTICE ..." prompt
+// no longer contained the payloadHint verbatim (a terminal hard-wrap split the
+// hint mid-word). shouldRetrySubmit went false, the loop reported 'landed' in
+// ~4s, the router marked the message delivered -- yet the text sat parked in
+// charlie's box for 20+ minutes with no turn ever started.
+//
+// The fix requires POSITIVE evidence before 'landed':
+//   - the live input box is provably CLEAN (empty -- no parked payload, no
+//     parked TRUSTED/UNTRUSTED preamble marker, no paste placeholder), AND
+//   - EITHER the pane shows real turn activity (busy: spinner / token counter /
+//     esc-to-interrupt -- the existing busy detection) OR the sent payload's
+//     leading fragment is echoed into the transcript region ABOVE the box (the
+//     submitted user turn rendered), i.e. the prompt demonstrably ran.
+//
+// A box that is clean but shows NO turn/transcript evidence is AMBIGUOUS (an
+// accepted-but-scrolled fast turn, or a send that silently produced nothing):
+// the loop re-samples, and only at the retry budget does it settle -- 'landed'
+// ONLY if the box stayed clean across every sample, otherwise 'gave-up'. A box
+// holding unexplained parked content (the 1105 mutated-preamble shape) is never
+// 'landed'; it resolves to 'gave-up' so the router leaves the message pending
+// and the stale-parked-input janitor + readiness gate recover it, rather than a
+// false delivered.
+
+/** Landing evidence of a pane that is NOT a recognised stuck signature. */
+export type LandingEvidence =
+  | 'landed'       // clean box + real turn activity, or clean box + transcript echo
+  | 'clean-quiet'  // clean box, but no turn/transcript evidence yet (ambiguous)
+  | 'unexplained'  // parked/unreadable box, no positive evidence (never landed)
+
+// Minimum length (after whitespace strip) the payload fragment must reach before
+// the transcript-echo check trusts a match -- mirrors shouldRetrySubmit's
+// minHintChars floor so a short, generic fragment cannot match arbitrary
+// transcript prose.
+const ECHO_MIN_HINT_CHARS = 16
+
+// Everything ABOVE the live input box (the rendered transcript region), or null
+// when the pane has no live input box (no idle footer / no framing separators).
+// The box is the span between the two most recent BOX_SEP_RX separators above
+// the idle footer -- the SAME anchoring liveInputBox() uses -- so what is
+// returned is strictly the transcript, never the box itself. The footer is found
+// from the BOTTOM so a footer-looking line quoted in scrollback cannot shift the
+// scope.
+function transcriptAboveInputBox(pane: string): string | null {
+  const lines = pane.split('\n')
+  let footerIdx = -1
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (IDLE_FOOTER_RX.test(lines[i])) { footerIdx = i; break }
+  }
+  if (footerIdx < 0) return null
+  let bottomSep = -1
+  for (let i = footerIdx - 1; i >= 0; i--) {
+    if (BOX_SEP_RX.test(lines[i])) { bottomSep = i; break }
+  }
+  if (bottomSep <= 0) return null
+  let topSep = -1
+  for (let i = bottomSep - 1; i >= 0; i--) {
+    if (BOX_SEP_RX.test(lines[i])) { topSep = i; break }
+  }
+  if (topSep < 0) return null
+  return lines.slice(0, topSep).join('\n')
+}
+
+/**
+ * True when the payload's leading fragment is echoed into the transcript region
+ * ABOVE the live input box -- positive evidence the submitted user turn rendered
+ * (the prompt ran, even if the turn already finished and the pane is idle again).
+ *
+ * Whitespace is STRIPPED (not collapsed) from both the transcript and the hint
+ * before the substring test: Claude Code re-wraps the submitted user turn at the
+ * pane width, and a hard wrap can split the fragment mid-word (`agent:mr-w` /
+ * `olfe">`). Collapsing to single spaces would still miss that (the original had
+ * no space there); stripping all whitespace makes the match wrap- AND
+ * word-split-robust. The fragment is long and distinctive (a wrapped-message
+ * preamble + opening tag), so an all-whitespace-stripped substring collision
+ * with unrelated prose is implausible; the check is additionally only consulted
+ * on a provably CLEAN box (see classifyLandingEvidence), where the payload is
+ * NOT parked in the box, so a match can only come from a rendered turn.
+ *
+ * Returns false when the pane has no transcript region, or the stripped hint is
+ * shorter than ECHO_MIN_HINT_CHARS (too short to trust).
+ */
+export function payloadEchoedAboveBox(pane: string, payloadHint: string): boolean {
+  if (!pane || !payloadHint) return false
+  const needle = payloadHint.replace(/\s+/g, '')
+  if (needle.length < ECHO_MIN_HINT_CHARS) return false
+  const above = transcriptAboveInputBox(pane)
+  if (above == null) return false
+  return above.replace(/\s+/g, '').includes(needle)
+}
+
+/**
+ * Classify the landing evidence of a pane that is NOT a recognised stuck
+ * signature (the caller has already ruled out placeholder / verbatim-parked via
+ * shouldRetrySubmit). Pure + dependency-free.
+ *
+ *   - 'busy' pane    -> 'landed'. A real turn is running. sendPromptToSession's
+ *     pre-flight wait-until-idle gate means the pane was idle immediately before
+ *     the send, so a live turn NOW is our prompt's turn -- unambiguous positive
+ *     evidence. (A paste placeholder also reads 'busy' in detectPaneState, but
+ *     shouldRetrySubmit caught it upstream, so a 'busy' here is a real turn,
+ *     never a placeholder.)
+ *   - clean idle box -> 'landed' iff the payload echoed into the transcript
+ *     above the box, else 'clean-quiet' (box provably empty, but nothing proves
+ *     the turn ran yet -- resolved by the caller across samples).
+ *   - anything else ('typing' = parked non-hint text, i.e. the 1105 mutated
+ *     preamble; 'unknown' = unreadable surface; 'error' = wedged) ->
+ *     'unexplained': no positive evidence, and a non-empty box means the payload
+ *     may still be parked. Never 'landed'.
+ */
+export function classifyLandingEvidence(pane: string, payloadHint: string): LandingEvidence {
+  const state = detectPaneState(pane)
+  if (state === 'busy') return 'landed'
+  if (state === 'idle') {
+    return payloadEchoedAboveBox(pane, payloadHint) ? 'landed' : 'clean-quiet'
+  }
+  return 'unexplained'
+}
+
+/**
+ * A submit verdict enriched with the positive-landing decision. Supersets the
+ * SubmitFollowupAction actions: 'done' becomes an explicit evidence-gated
+ * 'landed', plus a 'resample' step for the ambiguous clean-but-quiet box.
+ */
+export type SubmitVerdict =
+  | 'retry-enter'       // verbatim stuck: a plain Enter submits it
+  | 'clear-and-resend'  // paste placeholder: clear the buffer + re-send the chunks
+  | 'resample'          // clean-but-quiet / unexplained parked: poll again, no action
+  | 'landed'            // POSITIVE evidence, or clean across the whole budget
+  | 'gave-up'           // budget spent with the box never provably landed
+
+export interface SubmitVerdictState {
+  /** Poll iterations already decided (0 before the first sample). Bounds the
+   *  loop against maxAttempts exactly as the old attempt counter did. */
+  attempt: number
+  /** True once ANY sample held unexplained parked/unreadable box content, so a
+   *  later clean-but-quiet box at the budget resolves to 'gave-up' (something was
+   *  parked and never seen to land) rather than a false 'landed'. */
+  sawUnexplained: boolean
+}
+
+export interface SubmitVerdictDecision {
+  verdict: SubmitVerdict
+  next: SubmitVerdictState
+}
+
+/**
+ * Pure post-send verdict with POSITIVE-evidence landing (incident 4fddd480).
+ * Layers on decideSubmitFollowup: the recognised-stuck actions (retry-enter /
+ * clear-and-resend), the null-capture give-up, and the stuck-at-budget give-up
+ * all pass through unchanged. Only decideSubmitFollowup's 'done' -- which means
+ * merely "no recognised stuck signature" and was the false-landed site -- is
+ * re-decided here against classifyLandingEvidence:
+ *
+ *   - positive evidence (busy turn, or clean box + transcript echo) -> 'landed'.
+ *   - clean-but-quiet or unexplained parked box -> 'resample' while the budget
+ *     lasts; at the budget, 'landed' ONLY if the box stayed clean across every
+ *     sample (accepted-but-scrolled fast turn), else 'gave-up'.
+ *
+ * Dependency-free + returns {verdict, next} (the codebase's decision-state
+ * convention, cf. decideStuckInputRecovery / decidePaneErrorAlert) so the
+ * I/O-bound loop in agent-process.ts stays trivially testable: feed snapshot
+ * strings + the persisted state in, assert the verdict + next state out.
+ *
+ * @param pane        The latest capture-pane snapshot, or null on capture fail.
+ * @param payloadHint Substring of the just-sent prompt (verbatim + echo paths).
+ * @param prev        Persisted per-loop state (attempt counter + sawUnexplained).
+ * @param maxAttempts Retry/resample budget; the terminal decision is made once
+ *                    prev.attempt >= maxAttempts.
+ */
+export function decideSubmitVerdict(
+  pane: string | null,
+  payloadHint: string,
+  prev: SubmitVerdictState,
+  maxAttempts: number,
+): SubmitVerdictDecision {
+  const { attempt, sawUnexplained: prevSaw } = prev
+  const nextAttempt = attempt + 1
+  const base = decideSubmitFollowup(pane, payloadHint, attempt, maxAttempts)
+
+  // Recognised-stuck actions pass through unchanged -- decideSubmitFollowup
+  // already owns them. (retry-enter / clear-and-resend keep their names.)
+  if (base === 'retry-enter' || base === 'clear-and-resend') {
+    return { verdict: base, next: { attempt: nextAttempt, sawUnexplained: prevSaw } }
+  }
+  // Null-capture give-up and stuck-at-budget give-up. decideSubmitFollowup spells
+  // it 'give-up'; SendResult / this verdict spell it 'gave-up' -- map across.
+  if (base === 'give-up') {
+    return { verdict: 'gave-up', next: { attempt: nextAttempt, sawUnexplained: prevSaw } }
+  }
+
+  // base === 'done': the false-landed site. 'done' only means "no recognised
+  // stuck signature", which is ALSO true of the 1105 mutated-preamble parked
+  // box. Gate 'landed' on positive evidence. (base === 'done' implies pane !=
+  // null -- decideSubmitFollowup gives up on a null capture -- but classify
+  // defensively anyway.)
+  const evidence: LandingEvidence = pane == null ? 'unexplained' : classifyLandingEvidence(pane, payloadHint)
+  if (evidence === 'landed') {
+    return { verdict: 'landed', next: { attempt: nextAttempt, sawUnexplained: prevSaw } }
+  }
+  const sawUnexplained = prevSaw || evidence === 'unexplained'
+  if (attempt < maxAttempts) {
+    // Ambiguous (clean-but-quiet or unexplained parked): poll again. The
+    // terminal decision is made once the budget is spent.
+    return { verdict: 'resample', next: { attempt: nextAttempt, sawUnexplained } }
+  }
+  // Budget spent. Land ONLY if every sample stayed clean (accepted-but-scrolled
+  // fast turn); if any sample held unexplained parked content, give up so the
+  // never-confirmed send is re-delivered rather than falsely marked delivered.
+  return { verdict: sawUnexplained ? 'gave-up' : 'landed', next: { attempt: nextAttempt, sawUnexplained } }
 }
 
 export interface PaneErrorAlertState {

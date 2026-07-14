@@ -8,7 +8,8 @@ import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
 import {
   paneLooksIdle,
-  decideSubmitFollowup,
+  decideSubmitVerdict,
+  type SubmitVerdictState,
   shouldClearTruncatedPreamble,
   detectsPastePlaceholder,
   detectPaneState,
@@ -1298,7 +1299,7 @@ const SUBMIT_RETRY_POLL_MS = '0.3'
 // completion and the input box settling, while still bounding the wait so a
 // genuinely long-running turn does not block the 5s router / 60s scheduler tick
 // indefinitely. On timeout we proceed best-effort: the existing post-send
-// retry loop (decideSubmitFollowup) remains the backstop, and a hard-busy
+// verdict loop (decideSubmitVerdict) remains the backstop, and a hard-busy
 // session that never idles must still receive its prompt eventually.
 const PANE_IDLE_WAIT_TIMEOUT_MS = 12_000
 const PANE_IDLE_POLL_MS = 300
@@ -1380,12 +1381,18 @@ function discardPlaceholderBuffer(session: string, host: string | null = null): 
 
 // Outcome of a sendPromptToSession call, so a caller can tell a real delivery
 // from a give-up:
-//   - 'landed'  -- the post-send retry loop saw the pane clean OR busy-
-//                  processing (decideSubmitFollowup 'done'), i.e. the text was
-//                  conservatively submitted/accepted.
-//   - 'gave-up' -- the submit-retry budget was spent (or a recovery send-keys
-//                  itself failed) with the text STILL parked in the input box;
-//                  the caller must NOT treat this as delivered.
+//   - 'landed'  -- the post-send verdict loop saw POSITIVE evidence the prompt
+//                  landed (decideSubmitVerdict 'landed'): a real turn started
+//                  (busy) OR the submitted payload echoed into the transcript
+//                  above a clean input box OR the box stayed provably clean
+//                  across the whole retry budget (an accepted-but-scrolled fast
+//                  turn). "The stuck-detector stopped matching" alone is NO
+//                  longer enough (the 4fddd480 false-landed fix).
+//   - 'gave-up' -- the retry budget was spent without that positive evidence:
+//                  the text is still parked, or the box holds unexplained
+//                  content (a bracketed-paste-mutated payload), or a recovery
+//                  send-keys itself failed. The caller must NOT treat this as
+//                  delivered.
 // Every existing caller invokes sendPromptToSession in statement (void)
 // position and simply ignores the return -- only the message router reads it,
 // to gate markMessageDelivered (the delivered!=landed fix, 2026-07-08 incident).
@@ -1406,10 +1413,16 @@ export type SendResult = 'landed' | 'gave-up'
 // Claude Code TUI occasionally swallow the trailing Enter, leaving the
 // fully written prompt parked in the input box (either as a [Pasted
 // text #N] placeholder or as verbatim text under an idle footer). We
-// re-sample the pane after the initial Enter and, if shouldRetrySubmit
-// still reports stuck, send up to SUBMIT_RETRY_MAX_ATTEMPTS extra
-// Enters. The retry budget bounds the loop so a pathologically stuck
-// pane gives up rather than spinning.
+// re-sample the pane after the initial Enter and, per decideSubmitVerdict,
+// either recover a recognised stuck signature (retry-Enter / clear-and-
+// resend) or -- and this is the 4fddd480 fix -- withhold the 'landed'
+// verdict until POSITIVE evidence appears (a real turn started, the payload
+// echoed into the transcript, or the box stayed provably clean across the
+// whole budget). Bracketed-paste can mutate the box so the verbatim match
+// breaks WITHOUT the text having submitted; reporting landed on that
+// negative signal was the incident (msg 1105 sat parked 20+ min while the
+// router read it delivered). The retry budget bounds the loop so a
+// pathologically stuck pane gives up rather than spinning.
 export function sendPromptToSession(
   session: string,
   text: string,
@@ -1499,7 +1512,7 @@ export function sendPromptToSession(
   // recognisable to substring-match against without leaking the whole
   // prompt body into log lines should the give-up branch fire.
   //
-  // Two stuck modes, two recoveries (see decideSubmitFollowup):
+  // Two stuck modes, two recoveries (see decideSubmitVerdict / decideSubmitFollowup):
   //   - VERBATIM text parked under an idle footer -> a plain Enter submits it
   //     ('retry-enter').
   //   - A `[Pasted text #N]` placeholder -> a plain Enter does NOT submit it
@@ -1512,22 +1525,41 @@ export function sendPromptToSession(
   //     ('clear-and-resend'). The same Ctrl-C path also clears an expanded
   //     multi-row verbatim buffer that a plain Enter cannot submit, so a
   //     resend that itself parks is re-cleared and retried until it lands.
+  // Beyond those, the loop withholds 'landed' until POSITIVE evidence (a real
+  // turn / transcript echo / clean-across-budget); a 'resample' just polls
+  // again within the budget. verdictState threads the attempt counter + the
+  // "saw unexplained parked content" flag through decideSubmitVerdict.
   const payloadHint = oneLine.slice(0, Math.min(oneLine.length, 96))
-  for (let attempt = 0; ; attempt++) {
+  let verdictState: SubmitVerdictState = { attempt: 0, sawUnexplained: false }
+  for (;;) {
     try { execFileSync('/bin/sleep', [SUBMIT_RETRY_POLL_MS], { timeout: 2000 }) } catch { /* best effort */ }
     const pane = capturePane(session, host)
-    const action = decideSubmitFollowup(pane, payloadHint, attempt, SUBMIT_RETRY_MAX_ATTEMPTS)
-    // 'done' = pane clean OR busy-processing -> the text was conservatively
-    // submitted/accepted. Report landed.
-    if (action === 'done') return 'landed'
-    if (action === 'give-up') {
-      // Retry budget spent with the text STILL parked in the box. Report
-      // gave-up so the router leaves the message pending (retry next tick)
-      // instead of marking it delivered -- the delivered!=landed gap.
-      logger.warn({ session, attempt }, 'sendPromptToSession: prompt still parked after retries')
+    const attempt = verdictState.attempt
+    const decision = decideSubmitVerdict(pane, payloadHint, verdictState, SUBMIT_RETRY_MAX_ATTEMPTS)
+    verdictState = decision.next
+    // 'landed' = POSITIVE evidence (busy turn, or clean box + transcript echo),
+    // or the box stayed provably clean across the whole budget (accepted-but-
+    // scrolled fast turn). Only then is the text conservatively delivered.
+    if (decision.verdict === 'landed') return 'landed'
+    if (decision.verdict === 'gave-up') {
+      // Budget spent without positive evidence: still parked, unexplained
+      // (bracketed-paste-mutated) content, or clean-but-quiet after an earlier
+      // unexplained sample. Report gave-up so the router leaves the message
+      // pending (retry next tick) instead of a false delivered -- the 4fddd480
+      // false-landed fix (msg 1105 read delivered while parked 20+ min).
+      logger.warn({ session, attempt }, 'sendPromptToSession: prompt not confirmed landed after retries')
       return 'gave-up'
     }
-    if (action === 'clear-and-resend') {
+    if (decision.verdict === 'resample') {
+      // Clean-but-quiet or unexplained-parked box with no positive landing
+      // evidence yet: poll again (no keystroke). The terminal decision -- landed
+      // if it stayed clean, else gave-up -- is made by decideSubmitVerdict once
+      // the budget is spent. Deliberately NO blind Enter here: firing Enter into
+      // an unexplained parked box could submit an unrelated draft or corrupt a
+      // multi-row buffer (the router's "no re-send until verifiably clean" rule).
+      continue
+    }
+    if (decision.verdict === 'clear-and-resend') {
       // Placeholder confirmed in the pane (box non-empty, not busy), so the
       // Ctrl-C in discardPlaceholderBuffer is safe. Clear it, then replay the
       // chunk stream. The loop re-samples on the next iteration and will keep
@@ -1546,7 +1578,7 @@ export function sendPromptToSession(
       }
       continue
     }
-    // action === 'retry-enter'
+    // decision.verdict === 'retry-enter'
     try {
       runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
     } catch (err) {

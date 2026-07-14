@@ -21,6 +21,7 @@
 
 import { describe, it, expect } from 'vitest'
 import { decideDeliveryOutcome, shouldAbandonGaveUp } from '../web/message-router.js'
+import { decideSubmitVerdict, type SubmitVerdict, type SubmitVerdictState } from '../pane-state.js'
 
 const WINDOW_MS = 60 * 60 * 1000 // 1 hour, same as MESSAGE_ABANDON_WINDOW_MS
 
@@ -67,5 +68,63 @@ describe('shouldAbandonGaveUp: a gave-up message cannot stay pending forever', (
     // session past the window still abandons.
     expect(shouldAbandonGaveUp.length).toBe(2) // (ageMs, windowMs) -- no sessionExists
     expect(shouldAbandonGaveUp(WINDOW_MS + 1, WINDOW_MS)).toBe(true)
+  })
+})
+
+// End-to-end at the PURE level: the 4fddd480 false-landed shape must flow
+// decideSubmitVerdict -> SendResult -> decideDeliveryOutcome to 'retry' (leave
+// pending), NEVER 'delivered'. This is the exact chain that broke on 2026-07-13:
+// the send loop reported landed on a parked-but-mutated box and the router
+// marked msg 1105 delivered while it sat unsubmitted in charlie's input box.
+describe('4fddd480: false-landed 1105 shape resolves to retry, not delivered', () => {
+  const SUBMIT_MAX = 4
+  // The just-sent payload hint (the send loop truncates to 96 chars).
+  const HINT =
+    '[Uzenet @mr-wolfe-tol -- trusted team member]: <trusted-peer source="agent:mr-wolfe"> TEAM MEMBER'
+  const SEP = '─'.repeat(80)
+  // Idle footer + a box holding the wrapped preamble whose hard wrap splits
+  // `agent:mr-wolfe` (`...mr-w` / `olfe">...`), so the verbatim stuck-match
+  // breaks (the exact bracketed-paste mutation from the incident).
+  const PARKED_MUTATED = [
+    SEP,
+    '❯ [Uzenet @mr-wolfe-tol -- trusted team member]: <trusted-peer source="agent:mr-w',
+    '  olfe"> TEAM MEMBER NOTICE preamble and body still parked, never submitted',
+    SEP,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ].join('\n')
+
+  // Drive the pure verdict machine to its terminal, mirroring the send loop, and
+  // map the resulting SendResult through the router's decision.
+  function runToDelivery(pane: string): { verdict: SubmitVerdict; outcome: 'delivered' | 'retry' } {
+    let st: SubmitVerdictState = { attempt: 0, sawUnexplained: false }
+    for (let i = 0; i < SUBMIT_MAX + 6; i++) {
+      const d = decideSubmitVerdict(pane, HINT, st, SUBMIT_MAX)
+      st = d.next
+      if (d.verdict === 'landed' || d.verdict === 'gave-up') {
+        // sendPromptToSession returns exactly these two as its SendResult.
+        return { verdict: d.verdict, outcome: decideDeliveryOutcome(d.verdict) }
+      }
+    }
+    throw new Error('verdict did not terminate')
+  }
+
+  it("gives up on the parked-mutated box and the router leaves it pending ('retry')", () => {
+    const { verdict, outcome } = runToDelivery(PARKED_MUTATED)
+    expect(verdict).toBe('gave-up')
+    expect(outcome).toBe('retry') // NOT 'delivered' -- the message stays pending
+  })
+
+  it("a real busy turn lands and the router marks it delivered", () => {
+    const busy = [
+      '✢ Combobulating… (3s · ↓ 120 tokens · esc to interrupt)',
+      '',
+      SEP,
+      '❯ ',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n')
+    const { verdict, outcome } = runToDelivery(busy)
+    expect(verdict).toBe('landed')
+    expect(outcome).toBe('delivered')
   })
 })
