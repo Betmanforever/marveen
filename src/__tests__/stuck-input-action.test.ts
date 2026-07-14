@@ -101,11 +101,45 @@ describe('decideStuckInputAction (recovery-decision unit)', () => {
   })
 })
 
-describe('submitLanded (post-submit verification)', () => {
-  it('verified-landed -> stop: the parked signature cleared after submit', () => {
+// Positive-evidence model (incident 4fddd480 / card 5e5cfefc): a submit only
+// "lands" on positive evidence -- a real turn started (busy) or the submitted
+// text echoed as a turn above a now-clean box. A box that merely cleared to
+// idle, or holds different text, is NOT proof on its own.
+const SUBMIT_BUSY = [
+  '✢ Combobulating… (3s · ↓ 120 tokens · esc to interrupt)',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+].join('\n')
+
+// The parked single-row channel block rendered as a turn (`>` marker, not the
+// `❯` input glyph) above a now-empty box.
+const SUBMIT_ECHO = [
+  '> <channel source="plugin:telegram" chat_id="123">rovid uzenet</channel>',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  FOOTER,
+].join('\n')
+
+describe('submitLanded (post-submit verification, positive-evidence model)', () => {
+  it('landed when the pane went busy (a real turn started)', () => {
     const prev = stuckInputSignature(PARKED_CHANNEL_SINGLEROW)
     expect(prev).not.toBeNull()
-    expect(submitLanded(prev!, IDLE)).toBe(true)
+    expect(submitLanded(prev!, SUBMIT_BUSY)).toBe(true)
+  })
+
+  it('landed when the submitted block echoed as a turn above a now-clean box', () => {
+    const prev = stuckInputSignature(PARKED_CHANNEL_SINGLEROW)
+    expect(submitLanded(prev!, SUBMIT_ECHO)).toBe(true)
+  })
+
+  it('NOT landed when the box merely cleared to idle with no turn echo (was landed pre-fix)', () => {
+    const prev = stuckInputSignature(PARKED_CHANNEL_SINGLEROW)
+    expect(submitLanded(prev!, IDLE)).toBe(false)
   })
 
   it('not-landed -> escalate: the same text is still parked after the attempt', () => {

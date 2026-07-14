@@ -1351,6 +1351,49 @@ export function parkedInputText(pane: string): string | null {
   return flat.length > 0 ? flat : null
 }
 
+// A scheduled prompt (heartbeat / task) whose closing Enter was swallowed sits
+// PARKED in the live input box, pinning the pane 'typing' so every later task
+// defers. The schedule-runner resubmit ladder must recognise that reliably --
+// but the old whole-pane `pane.includes(marker)` check had two false-landed
+// defects (incident class 4fddd480, card 5e5cfefc):
+//   (a) a terminal hard wrap splits the marker mid-word (`[Utemezett fela` /
+//       `dat: name]`), so the contiguous marker is no longer a substring: the
+//       parked prompt reads as delivered and is silently dropped (stuck=false
+//       -> action 'none'); and
+//   (b) scanning the WHOLE pane let a marker echoed in the TRANSCRIPT from an
+//       already-landed earlier run count as "stuck", firing a spurious Enter
+//       into an innocent (possibly human) draft parked in the box.
+//
+// Positive-evidence rule, scoped strictly to the LIVE input box (liveInputBox,
+// never scrollback): the pane must be 'typing' (something IS parked) AND the
+// box must be provably OUR prompt -- EITHER it contains the marker OR the whole
+// box is a contiguous fragment of the sent prompt (the marker scrolled out of
+// the visible box). Whitespace is STRIPPED (not collapsed) on both sides so a
+// mid-word hard wrap still matches (the (a) fix, mirroring payloadEchoedAboveBox);
+// the leading `❯` prompt glyph is dropped so a box fragment can substring-match
+// against the caret-free prompt body. The fragment path reuses the transcript-
+// echo floor (ECHO_MIN_HINT_CHARS) so a trivially short box cannot coincidentally
+// match the long prompt. Scoping to the box (not the pane) is the (b) fix.
+//
+// KNOWN LIMIT: a prompt so tall that even its first `❯` row has scrolled out of
+// the visible box reads 'idle' (PARKED_INPUT_RX needs the caret), so this
+// returns false -- no worse than the old whole-pane check, whose marker had
+// likewise scrolled out of the capture. Pure + dependency-free.
+export function scheduledPromptParked(pane: string, marker: string, fullPrompt: string): boolean {
+  if (detectPaneState(pane) !== 'typing') return false
+  const box = liveInputBox(pane)
+  if (box == null) return false
+  const strippedBox = box.replace(/\s+/g, '').replace(/^❯/, '')
+  if (strippedBox.length === 0) return false
+  const strippedMarker = marker.replace(/\s+/g, '')
+  if (strippedMarker.length > 0 && strippedBox.includes(strippedMarker)) return true
+  // Marker scrolled out of the visible box: the box then shows only a contiguous
+  // slice of the parked prompt. Gate on a minimum length so a short box cannot
+  // coincidentally substring-match the prompt body.
+  if (strippedBox.length < ECHO_MIN_HINT_CHARS) return false
+  return fullPrompt.replace(/\s+/g, '').includes(strippedBox)
+}
+
 // How many VISUAL rows the live input box content occupies, ignoring the
 // bare prompt glyph and blank padding. The caller uses this to choose the
 // right submit keystroke: a MULTI-row parked input must NOT be submitted with
@@ -1370,20 +1413,40 @@ export function parkedInputRowCount(pane: string): number {
     .filter((row) => row.length > 0).length
 }
 
-// Post-submit verification: did the parked input actually leave the box?
+// Post-submit verification with POSITIVE-evidence landing (incident class
+// 4fddd480, card 5e5cfefc). `prevSig` is stuckInputSignature(pane) captured
+// BEFORE the submit attempt (the exact text that was parked). `paneAfter` is a
+// fresh capture taken AFTER it. Returns true ONLY on positive evidence that the
+// parked text actually became a turn -- NOT merely that the old signature
+// stopped matching:
+//   - paneAfter null (capture failed)             -> false: cannot confirm.
+//   - pane is busy                                 -> true: a real turn started.
+//   - the IDENTICAL signature is still parked      -> false: Enter was swallowed.
+//   - otherwise (box cleared, or DIFFERENT text now parked) -> true ONLY if the
+//     previously-parked text is echoed as a rendered turn in the transcript
+//     ABOVE the box; else false.
 //
-// `prevSig` is stuckInputSignature(pane) captured BEFORE the submit attempt
-// (the exact text that was parked). `paneAfter` is a fresh capture taken
-// AFTER the submit. Returns true when the submit LANDED -- the same parked
-// signature is no longer 'typing' in the box: it cleared (pane went idle),
-// the agent started processing it (pane went busy), or different text is now
-// parked. Returns false when the IDENTICAL signature is still parked (the
-// Enter was swallowed -> the caller should retry / escalate), or when
-// paneAfter is null (no capture -> cannot confirm, treat as not-landed).
-// Pure: builds on stuckInputSignature() (which gates on detectPaneState).
+// The former rule ("any signature change == landed") treated a cleared-but-
+// never-ran box and a different-draft-now-parked box as landed -- negative
+// evidence that hid a genuinely lost message. A box that merely went empty
+// proves nothing (the text could have been cleared without ever running), and
+// different parked text proves nothing about OUR text; both now require the
+// transcript echo before landing.
+//
+// The leading `❯` input-prompt glyph is stripped from prevSig before the echo
+// check: it is an input-box artifact and never appears in the rendered
+// transcript (a submitted turn renders under a `>` marker, not `❯`), so leaving
+// it in would defeat every echo match. payloadEchoedAboveBox additionally
+// requires the stripped hint to clear ECHO_MIN_HINT_CHARS, so a very short
+// prevSig can no longer prove landing -- accepted as conservative: this is a
+// LOG-ONLY consumer (performStuckInputAction), where a false negative costs one
+// warn line but a false positive would hide a lost message.
+// Pure: builds on detectPaneState / stuckInputSignature / payloadEchoedAboveBox.
 export function submitLanded(prevSig: string, paneAfter: string | null): boolean {
   if (paneAfter == null) return false
-  return stuckInputSignature(paneAfter) !== prevSig
+  if (detectPaneState(paneAfter) === 'busy') return true
+  if (stuckInputSignature(paneAfter) === prevSig) return false
+  return payloadEchoedAboveBox(paneAfter, prevSig.replace(/^❯\s*/, ''))
 }
 
 // Per-session bookkeeping for the stuck-input recovery watcher. A "spell"

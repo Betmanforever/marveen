@@ -39,6 +39,7 @@ import {
   sendEnterToSession,
   clearStaleParkedInput,
 } from './agent-process.js'
+import { scheduledPromptParked } from '../pane-state.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { sendTelegramMessage } from './telegram.js'
 import { runCommandTask } from './command-task.js'
@@ -245,7 +246,12 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
         // Host-aware so a remote agent's post-send stuck-check + recovery Enter
         // hit the laptop session, not a (nonexistent) local one.
         const pane = capturePane(session, host)
-        const stuck = pane != null && /❯\s+\S/.test(pane) && pane.includes(marker)
+        // Positive-evidence parked check (SITE 1, card 5e5cfefc): the marker
+        // matched whitespace-stripped inside the LIVE box (survives a mid-word
+        // hard wrap), or the box is a contiguous slice of the sent prompt with
+        // the marker scrolled out. Scoped to the box, so a marker echoed in the
+        // transcript from an already-landed run no longer reads as stuck.
+        const stuck = pane != null && scheduledPromptParked(pane, marker, fullPrompt)
         const action = decideScheduledResubmitAction(attempt, stuck)
         if (action === 'none') return
         if (action === 'giveup') {

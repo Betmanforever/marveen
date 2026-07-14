@@ -22,6 +22,7 @@ import {
   parkedInputText,
   parkedInputRowCount,
   submitLanded,
+  scheduledPromptParked,
   paneShowsContextSaturation,
   paneShowsContextLow,
   decideContextBudgetEscalation,
@@ -2113,32 +2114,191 @@ describe('parkedInputRowCount', () => {
   })
 })
 
-describe('submitLanded', () => {
-  // The exact text parked before the submit attempt.
-  const parkedSig = stuckInputSignature(TYPING_PARKED) as string
+// A parked single-row channel message (the pre-submit state). Its signature is
+// the `prevSig` the watcher captures before pressing Enter (WITH the ❯ glyph,
+// exactly as stuckInputSignature yields it in production).
+const SUBMIT_PARKED = [
+  '',
+  SEP,
+  '❯ <channel source="plugin:telegram" chat_id="55">szia mi ujsag ezen a szep napon</channel>',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// The SAME message, submitted: it rendered as a user turn ABOVE a now-empty
+// box. The rendered turn is prefixed with `>` (not the `❯` input glyph) -- which
+// is why submitLanded strips the caret from prevSig before the echo check.
+const SUBMIT_LANDED_ECHO = [
+  '> <channel source="plugin:telegram" chat_id="55">szia mi ujsag ezen a szep napon</channel>',
+  '● Elolvasom es valaszolok a kerdesre',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// A DIFFERENT message now parked (not our prevSig), with no echo of prevSig in
+// the transcript above -- proves nothing about whether OUR text landed.
+const SUBMIT_DIFFERENT_PARKED = [
+  '',
+  SEP,
+  '❯ <channel source="plugin:telegram" chat_id="55">egy teljesen masik uzenet parkolt be kesobb</channel>',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+describe('submitLanded (positive-evidence model, incident 4fddd480 / card 5e5cfefc)', () => {
+  const parkedSig = stuckInputSignature(SUBMIT_PARKED) as string
 
   it('captures a non-empty signature from the parked fixture', () => {
     expect(parkedSig).toBeTruthy()
   })
 
-  it('is false when the identical signature is still parked', () => {
-    expect(submitLanded(parkedSig, TYPING_PARKED)).toBe(false)
+  it('is false when there is no after-capture (null)', () => {
+    expect(submitLanded(parkedSig, null)).toBe(false)
   })
 
-  it('is true when the box cleared (pane went idle)', () => {
-    expect(submitLanded(parkedSig, IDLE_BYPASS)).toBe(true)
-  })
-
-  it('is true when the agent started processing (pane went busy)', () => {
+  it('is true when the pane went busy (a real turn started)', () => {
     expect(submitLanded(parkedSig, BUSY_FULL_FOOTER)).toBe(true)
   })
 
-  it('is true when different text is now parked', () => {
-    expect(submitLanded(parkedSig, PENDING_PASTE)).toBe(true)
+  it('is false when the identical signature is still parked (Enter swallowed)', () => {
+    expect(submitLanded(parkedSig, SUBMIT_PARKED)).toBe(false)
   })
 
-  it('is false when there is no after-capture (null)', () => {
-    expect(submitLanded(parkedSig, null)).toBe(false)
+  it('is true when the submitted text echoed as a turn above a now-clean box', () => {
+    // The ❯ input glyph is stripped from prevSig first; the rendered turn uses a
+    // `>` marker, so an un-stripped caret would defeat every echo match.
+    expect(submitLanded(parkedSig, SUBMIT_LANDED_ECHO)).toBe(true)
+  })
+
+  it('is FALSE when the box merely cleared to idle with no turn echo (was true pre-fix)', () => {
+    // Positive-evidence: a cleared box alone proves nothing -- the text could
+    // have been cleared without ever running.
+    expect(submitLanded(parkedSig, IDLE_BYPASS)).toBe(false)
+  })
+
+  it('is FALSE when DIFFERENT text is now parked and prevSig is not echoed (was true pre-fix)', () => {
+    expect(submitLanded(parkedSig, SUBMIT_DIFFERENT_PARKED)).toBe(false)
+  })
+})
+
+// ===========================================================================
+// scheduledPromptParked -- SITE 1 false-landed fix (card 5e5cfefc)
+// ===========================================================================
+// A scheduled prompt whose closing Enter was swallowed sits parked in the live
+// input box. `marker` is the task tag the runner's prefix carries; `fullPrompt`
+// is the whole body sendPromptToSession typed. Shapes mirror the schedule-runner
+// marker/prefix format.
+const SCHED_MARKER = '[Utemezett feladat: reggeli-brief]'
+const SCHED_FULL_PROMPT = [
+  'You are running a scheduled task. Execute it and escalate anything dangerous.',
+  '[Utemezett feladat: reggeli-brief] Az eredmenyt kuldd el Telegramon (chat_id: 0, reply tool).',
+  '',
+  '<scheduled-task name="scheduled-task:reggeli-brief">',
+  'Allitsd ossze a reggeli brief-et: email, naptar, AI-hirek. Roviden a vegen.',
+  '</scheduled-task>',
+].join('\n')
+
+// The marker sits intact in the box (Enter swallowed, whole prompt parked).
+const SCHED_PARKED_MARKER = [
+  '',
+  SEP,
+  '❯ You are running a scheduled task. Execute it and escalate anything dangerous.',
+  '  [Utemezett feladat: reggeli-brief] Az eredmenyt kuldd el Telegramon (chat_id:',
+  '  0, reply tool).',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// (1) The marker is HARD-WRAPPED mid-word in the box (`reggeli-br` / `ief]`).
+// The old `pane.includes(marker)` missed the contiguous break; whitespace-strip
+// rejoins it.
+const SCHED_PARKED_MARKER_WRAPPED = [
+  '',
+  SEP,
+  '❯ You are running a scheduled task. Execute it and escalate anything danger',
+  '  ous. [Utemezett feladat: reggeli-br',
+  '  ief] Az eredmenyt kuldd el Telegramon (chat_id: 0, reply tool).',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// (3) The box shows only a contiguous slice of the prompt HEAD; the marker (on
+// the prompt's 2nd line) has scrolled below the visible box. Matches via the
+// fullPrompt disjunct, not the marker. (A genuine no-caret tail reads 'idle' --
+// the documented limit -- so the realizable fragment still carries the ❯.)
+const SCHED_PARKED_TAIL = [
+  '',
+  SEP,
+  '❯ You are running a scheduled task. Execute it and escalate anything danger',
+  '  ous.',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// (2) FALSE-POSITIVE guard: the marker is echoed in the TRANSCRIPT from an
+// already-landed earlier run, and the live box is idle-empty. The old whole-pane
+// check read this as stuck and fired a spurious Enter.
+const SCHED_MARKER_IN_TRANSCRIPT_IDLE = [
+  '> [Utemezett feladat: reggeli-brief] Az eredmenyt kuldd el Telegramon (chat_id: 0, reply tool).',
+  '● Kesz, a reggeli brief elkuldve.',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// FALSE-POSITIVE guard, harder: the marker is in the transcript AND an unrelated
+// draft is parked in the box. Must be false -- the box is not our prompt.
+const SCHED_MARKER_TRANSCRIPT_UNRELATED_DRAFT = [
+  '> [Utemezett feladat: reggeli-brief] earlier run, already delivered',
+  '● Kesz.',
+  '',
+  SEP,
+  '❯ egy teljesen mas emberi piszkozat amit valaki most gepel ide kezzel',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+describe('scheduledPromptParked (SITE 1 false-landed fix, card 5e5cfefc)', () => {
+  it('true when the marker sits intact in the live box', () => {
+    expect(scheduledPromptParked(SCHED_PARKED_MARKER, SCHED_MARKER, SCHED_FULL_PROMPT)).toBe(true)
+  })
+
+  it('(1) true when a hard wrap splits the marker mid-word (whitespace-strip robust)', () => {
+    // Defect (a): the contiguous marker is not a pane substring, but stripping
+    // all whitespace rejoins `reggeli-br` + `ief]`.
+    expect(SCHED_PARKED_MARKER_WRAPPED.includes(SCHED_MARKER)).toBe(false)
+    expect(scheduledPromptParked(SCHED_PARKED_MARKER_WRAPPED, SCHED_MARKER, SCHED_FULL_PROMPT)).toBe(true)
+  })
+
+  it('(3) true when the box is a contiguous slice of the prompt with the marker scrolled out', () => {
+    expect(SCHED_PARKED_TAIL.includes(SCHED_MARKER)).toBe(false)
+    expect(scheduledPromptParked(SCHED_PARKED_TAIL, SCHED_MARKER, SCHED_FULL_PROMPT)).toBe(true)
+  })
+
+  it('(2) false when the marker is only echoed in the transcript and the box is idle-empty', () => {
+    // Defect (b): an already-landed run must not read as stuck.
+    expect(scheduledPromptParked(SCHED_MARKER_IN_TRANSCRIPT_IDLE, SCHED_MARKER, SCHED_FULL_PROMPT)).toBe(false)
+  })
+
+  it('false when the marker is echoed in the transcript but an unrelated draft is parked', () => {
+    // The box is 'typing' but it is NOT our prompt: neither the marker nor a
+    // prompt fragment is in the box, only in scrollback.
+    expect(scheduledPromptParked(SCHED_MARKER_TRANSCRIPT_UNRELATED_DRAFT, SCHED_MARKER, SCHED_FULL_PROMPT)).toBe(false)
+  })
+
+  it('false on an idle empty box (nothing parked)', () => {
+    expect(scheduledPromptParked(IDLE_BYPASS, SCHED_MARKER, SCHED_FULL_PROMPT)).toBe(false)
+  })
+
+  it('false when a too-short parked fragment cannot prove it is our prompt', () => {
+    // Below ECHO_MIN_HINT_CHARS and no marker -> not enough to trust.
+    const shortDraft = ['', SEP, '❯ ok', SEP, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+    expect(scheduledPromptParked(shortDraft, SCHED_MARKER, SCHED_FULL_PROMPT)).toBe(false)
   })
 })
 
@@ -2190,14 +2350,17 @@ describe('footer-less welcome-screen parked input', () => {
     expect(parkedInputRowCount(WELCOME_STUCK)).toBeGreaterThan(1)
   })
 
-  it('submitLanded fires once the welcome wedge clears to an idle pane', () => {
+  it('submitLanded requires positive evidence once the welcome wedge submits (new model)', () => {
     // Full P1 -> P2 chain on the real wedge: detection sees the footer-less
-    // parked box (sig != null), and after the message submits the pane is no
-    // longer that signature -> submitLanded true. This is what tells the
-    // recovery ladder the resubmit actually landed.
+    // parked box (sig != null). Under the positive-evidence model (4fddd480 /
+    // card 5e5cfefc) the resubmit only counts as landed on a real turn (busy) or
+    // a transcript echo -- a box that merely cleared to an idle pane is NOT proof.
     const sig = stuckInputSignature(WELCOME_STUCK)
     expect(sig).not.toBeNull()
-    expect(submitLanded(sig as string, IDLE_BYPASS)).toBe(true)
+    // A real turn started -> landed.
+    expect(submitLanded(sig as string, BUSY_FULL_FOOTER)).toBe(true)
+    // Cleared to a bare idle pane with no turn echo -> NOT landed.
+    expect(submitLanded(sig as string, IDLE_BYPASS)).toBe(false)
   })
 
   it('does NOT mistake a scrollback ──── pair without a ❯ box for input', () => {
