@@ -6,8 +6,10 @@ import {
   type AgentMessage,
 } from '../../db.js'
 import { logger } from '../../logger.js'
+import { MAIN_AGENT_ID } from '../../config.js'
 import { COORDINATOR_AGENT_ID } from '../../channel-coordinator/ingest.js'
 import { sanitizeAgentIdent } from '../../prompt-safety.js'
+import { listAgentNames } from '../agent-config.js'
 import { readBody, json } from '../http-helpers.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
 import type { RouteContext } from './types.js'
@@ -42,13 +44,29 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       json(res, { error: 'from is reserved for the in-process channel coordinator' }, 403)
       return true
     }
+    // Recipient must be a real dashboard agent (card ba546346, root cause of
+    // d7f42223): a message addressed to a name with no tmux session EVER (a
+    // subagent-type like "auditor", or a typo) can never be delivered -- it
+    // sat pending until the abandon window and meanwhile fed the queue-depth
+    // watchdog false alerts. Reject at creation with the valid roster so the
+    // sender can correct immediately. The roster is MAIN_AGENT_ID + the
+    // agents/ dirs (listAgentNames); a STOPPED-but-real agent stays valid --
+    // the router queues for it and the schedule/restart paths may revive it.
+    const recipient = to.trim()
+    if (recipient !== MAIN_AGENT_ID && !listAgentNames().includes(recipient)) {
+      logger.warn({ from: from.trim(), to: recipient }, 'Rejected /api/messages POST to unknown recipient')
+      json(res, {
+        error: `unknown recipient '${recipient}' -- not a dashboard agent. Valid: ${[MAIN_AGENT_ID, ...listAgentNames()].join(', ')}`,
+      }, 400)
+      return true
+    }
     // Code-side enforcement of the kanban-ref convention: rewrite any
     // `#<hex8>` token that maps to a real kanban_cards row into its
     // human-facing `#<seq>` form before persistence, so the dashboard and
     // every downstream consumer sees the canonical reference even when a
     // sub-agent forgets the CLAUDE.md rule (#75 Cuzcoo dispatch).
     const normalizedContent = normalizeKanbanRefs(content.trim(), getKanbanSeqByIdPrefix)
-    const msg = createAgentMessage(from.trim(), to.trim(), normalizedContent)
+    const msg = createAgentMessage(from.trim(), recipient, normalizedContent)
     logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
     json(res, msg)
     return true

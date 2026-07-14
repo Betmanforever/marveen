@@ -171,3 +171,45 @@ describe('contrast: untrusted wrap still adds the wrapper (non-coordinator uncha
     expect(out).toContain('status update')
   })
 })
+
+// Recipient-roster guard (card ba546346, root cause of d7f42223): a POST to a
+// name that is not a dashboard agent (a subagent-type like "auditor", or a
+// typo) can never be delivered -- it used to sit pending until the abandon
+// window while feeding queue-depth watchdog false alerts. The route now
+// rejects it with 400 BEFORE createAgentMessage, so no DB init is needed here.
+describe('/api/messages 400 guard -- unknown recipient (behavior)', () => {
+  async function postTo(to: string): Promise<{ status: number; body: any }> {
+    const payload = JSON.stringify({ from: 'neo', to, content: 'hello' })
+    const req = Readable.from([Buffer.from(payload)]) as any
+    let status = 0
+    let body = ''
+    const res = {
+      writeHead(s: number) { status = s },
+      end(b?: string) { body = b ?? '' },
+    } as any
+    const handled = await tryHandleMessages({
+      req, res, path: '/api/messages', method: 'POST', url: new URL('http://x/api/messages'),
+    } as any)
+    expect(handled).toBe(true)
+    return { status, body: body ? JSON.parse(body) : null }
+  }
+
+  it('rejects a subagent-type recipient (the d7f42223 shape) with 400 + the valid roster', async () => {
+    const { status, body } = await postTo('auditor')
+    expect(status).toBe(400)
+    expect(body.error).toContain("unknown recipient 'auditor'")
+  })
+
+  it('rejects a typo recipient with 400', async () => {
+    const { status } = await postTo('mr-wolf')
+    expect(status).toBe(400)
+  })
+
+  it('the guard runs BEFORE createAgentMessage (source order)', () => {
+    const guardIdx = MESSAGES_ROUTE_SRC.indexOf('listAgentNames().includes(recipient)')
+    const createIdx = MESSAGES_ROUTE_SRC.indexOf('createAgentMessage(from.trim()')
+    expect(guardIdx).toBeGreaterThan(0)
+    expect(createIdx).toBeGreaterThan(0)
+    expect(guardIdx).toBeLessThan(createIdx)
+  })
+})
