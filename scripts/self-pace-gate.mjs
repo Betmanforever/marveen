@@ -63,7 +63,13 @@ const SELF_PACE_BASH_PATTERNS = [
 // "netstat" / "crontab-helper.sh"; (?!\s*=) so a bare NAME=value assignment
 // (`at=$(...)`) is not mistaken for the `at` binary.
 const SCHED_PREFIX = String.raw`(?:(?:[A-Za-z_]\w*=\S*|sudo|env|command|exec|nice|builtin|time)\s+)*(?:\S*/)?`
-const SCHEDULER_RX = new RegExp(String.raw`(^|[;&|(]\s*)${SCHED_PREFIX}(crontab|launchctl|systemd-run|batch|at)\b(?!-)(?!\s*=)`, 'i')
+// The `at` branch requires an argument shaped like real at(1) usage (a
+// timespec word, a number, or an option) -- a bare `at\b` matched every `at`
+// substring that landed at a fake segment start after an escaped-\| split
+// (grep alternations like `at\|be`, regex tails like `at\b`), 3 false denies
+// on 2026-07-13 (card 41b8741f). crontab/launchctl/systemd-run/batch keep the
+// original bare-word form: they have no such substring collisions in practice.
+const SCHEDULER_RX = new RegExp(String.raw`(^|[;&|(]\s*)${SCHED_PREFIX}(?:(?:crontab|launchctl|systemd-run|batch)\b(?!-)(?!\s*=)|at\s+(?:-[A-Za-z]|\d|now\b|noon\b|midnight\b|teatime\b|next\b|today\b|tomorrow\b))`, 'i')
 // ...but allow a pure READ-listing of one's own schedule (parity with the store /
 // schedule-API read exemptions): crontab -l, launchctl list/print, atq.
 const SCHEDULER_READ_RX = new RegExp(String.raw`(^|[;&|(]\s*)${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
@@ -97,6 +103,13 @@ const HTTP_WRITE_RX = /(-X\s*(POST|PUT|PATCH|DELETE)|--request\s+(POST|PUT|PATCH
 export function splitSegments(command) {
   return String(command ?? '')
     .replace(/\\\r?\n/g, ' ')
+    // A separator escaped by exactly ONE backslash (`\|` `\;` `\&`) is a
+    // literal character to the shell (grep alternation, find -exec \;), never
+    // a command boundary -- neutralise it so the tail does not become a fake
+    // segment start (card 41b8741f). The lookbehind keeps `\\|` (escaped
+    // backslash followed by a REAL pipe, e.g. `echo x\\| crontab -`) splitting
+    // as before.
+    .replace(/(?<!\\)\\[|;&]/g, '\x01\x01')
     .split(/&&|\|\||[;&|]|\r?\n/)
     // trim so a leading-separator segment (" at now") anchors at ^ correctly
     .map((s) => s.trim())

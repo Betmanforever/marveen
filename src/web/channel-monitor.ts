@@ -1777,6 +1777,21 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           logger.info({ agent: t.agentName, provider: t.provider, claudePid }, 'Channel plugin probe reports down but plugin init is still pending (no bun, no .in_use marker) -- deferring')
           continue
         }
+        // Intentional-stop guard (5e67f632): /api/agents/<name>/stop removes
+        // the agent from agents-desired.json precisely so it stays down, but
+        // this down-path used to resurrect it anyway (fresh:true, context
+        // lost) because the plugin's disappearance looked like a crash. Honor
+        // the desired state here. An empty desired set means the feature is
+        // not in use (mirrors reconcileDesiredAgents), so only guard when the
+        // operator has an explicit desired list.
+        {
+          const desired = getDesiredAgents()
+          if (desired.size > 0 && !desired.has(t.agentName!)) {
+            logger.info({ agent: t.agentName, provider: t.provider }, 'Channel down but agent was intentionally stopped (not in desired state) -- not restarting')
+            agentDownSince.delete(t.session)
+            continue
+          }
+        }
         if (!agentDownSince.has(t.session)) agentDownSince.set(t.session, Date.now())
         const lastRestart = agentLastRestart.get(t.agentName!)
         const failures = agentRestartFailures.get(t.agentName!) ?? 0

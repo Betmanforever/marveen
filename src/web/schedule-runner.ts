@@ -421,9 +421,22 @@ export function startScheduleRunner(): NodeJS.Timeout {
 
       const view = toPendingRetryView(row, now)
       const result = attemptFireTask(taskDef, row.agent_name, now)
-      if (result === 'fired' || result === 'missing') {
+      if (result === 'fired') {
         deletePendingTaskRetry(row.task_name, row.agent_name)
         continue
+      }
+      // 'missing' used to DELETE the retry row here -- a silent abandonment
+      // that contradicts the never-abandon policy above. The one real-world
+      // window where it bites: the target session vanishes during a main-agent
+      // restart, auto-start fails once, and a queued daily task (e.g. the
+      // 2026-07-13 reggeli-napindito, card c3157583) is dropped with only a
+      // debug log. Keep the row instead; the alertDue path below surfaces a
+      // long-stuck one to the operator, and the run-log records the state.
+      if (result === 'missing' && row.last_reason !== 'missing') {
+        // Log the TRANSITION into missing only (a stuck-missing task would
+        // otherwise write a row per 60s tick); the pending row itself keeps
+        // the live state.
+        appendTaskRun(row.task_name, row.agent_name, 'missing-retrying')
       }
       // Still busy or errored: refresh the retry row and alert ONCE if
       // the age crossed the threshold. `updatePendingTaskRetry` returns
@@ -469,6 +482,12 @@ export function startScheduleRunner(): NodeJS.Timeout {
         // the retry handler -- don't re-queue or double-fire.
         if (pendingKeys.has(key)) continue
         const result = attemptFireTask(task, agentName, now)
+        // Run-log every non-fired decision too (fired/skipped/error were
+        // already logged): a missed day must be visible as an explicit row,
+        // not as an absent one (Auditor finding, card c3157583).
+        if ((result === 'busy' && !task.skipIfBusy) || result === 'starting' || result === 'missing') {
+          appendTaskRun(task.name, agentName, result === 'busy' ? 'queued-busy' : result === 'starting' ? 'queued-starting' : 'missing')
+        }
         if (result === 'starting') {
           // Agent was auto-started this tick. ALWAYS enqueue the retry that
           // delivers the prompt once the session is ready -- skipIfBusy must

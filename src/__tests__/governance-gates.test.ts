@@ -233,3 +233,31 @@ describe('governance gate scaffold wiring', () => {
     expect(pre.some((e) => JSON.stringify(e).includes('operator-confirmation-gate.mjs'))).toBe(false)
   })
 })
+
+// --- 41b8741f: escaped-pipe split + bare-word `at` false positives ---
+describe('self-pace-gate escaped-separator and at-branch false positives (41b8741f)', () => {
+  it('allows grep alternation with escaped pipe containing "at" (real 2026-07-13 false deny)', () => {
+    expect(selfPaceDecision('Bash', { command: String.raw`grep -c "at\|be" src/lib/country-data.ts` }).deny).toBe(false)
+  })
+  it('allows a grep pattern ending in an at word-boundary regex (live repro 2026-07-14)', () => {
+    expect(selfPaceDecision('Bash', { command: String.raw`grep -n "splitSegments\|SCHEDULER\|at\b" src/x.ts` }).deny).toBe(false)
+  })
+  it('allows find -exec with escaped semicolon', () => {
+    expect(selfPaceDecision('Bash', { command: String.raw`find . -name "*.tmp" -exec ls -l {} \;` }).deny).toBe(false)
+  })
+  it('allows filenames/domains with an at substring (at.json, IBANS.at)', () => {
+    expect(selfPaceDecision('Bash', { command: 'cat data/at.json; echo IBANS.at' }).deny).toBe(false)
+  })
+  it('still denies real at usage: timespec, option and numeric forms', () => {
+    expect(selfPaceDecision('Bash', { command: 'at now + 1 minute -f job.sh' }).deny).toBe(true)
+    expect(selfPaceDecision('Bash', { command: 'echo x; at 22:15' }).deny).toBe(true)
+    expect(selfPaceDecision('Bash', { command: '/usr/bin/at -f run.sh midnight' }).deny).toBe(true)
+    expect(selfPaceDecision('Bash', { command: 'at tomorrow' }).deny).toBe(true)
+  })
+  it('still denies a REAL pipe after an escaped backslash', () => {
+    expect(selfPaceDecision('Bash', { command: 'echo "* * * * * x"\\\\| crontab -' }).deny).toBe(true)
+  })
+  it('still denies crontab install via plain pipe', () => {
+    expect(selfPaceDecision('Bash', { command: 'echo "*/5 * * * * claude -p poll" | crontab -' }).deny).toBe(true)
+  })
+})
