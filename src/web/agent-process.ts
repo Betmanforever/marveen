@@ -12,6 +12,7 @@ import {
   type SubmitVerdictState,
   shouldClearTruncatedPreamble,
   detectsPastePlaceholder,
+  detectsPermissionDialog,
   detectPaneState,
   parkedInputText,
   stripGhostSuggestion,
@@ -1606,6 +1607,19 @@ export function sendPromptToSession(
   // worse than the pre-fix status quo.
   try {
     const preCapture = captureTmux(host, ['capture-pane', '-t', session, '-p'])
+    // HARD GUARD: never type into a permission/tool-approval dialog. The
+    // chunk stream ends with a submitting Enter, and Enter on the dialog
+    // confirms the HIGHLIGHTED option (default "Yes") -- i.e. a blind
+    // best-effort/forceSend here can self-approve an outward-facing action
+    // (2026-07-15 ive Artifact-publish incident, card 17de383f). Applies to
+    // BOTH the waitForIdle fall-through and the forceSend path: return
+    // 'gave-up' so the router keeps the message pending and retries after a
+    // human resolves the dialog (channel-monitor's dialog escalation already
+    // flags the coordinator).
+    if (detectsPermissionDialog(preCapture)) {
+      logger.warn({ session }, 'sendPromptToSession: pane is parked in a permission dialog -- refusing to type into it (Enter would approve); leaving message pending')
+      return 'gave-up'
+    }
     if (shouldClearTruncatedPreamble(preCapture)) {
       logger.info({ session }, 'Cleared stale preamble from input buffer before sending prompt')
       clearInputBuffer(session, host)
