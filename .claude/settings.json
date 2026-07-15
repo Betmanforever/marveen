@@ -20,7 +20,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/inbox-drain.py\"",
-            "timeout": 15
+            "timeout": 12
           }
         ]
       }

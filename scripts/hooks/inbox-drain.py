@@ -20,8 +20,34 @@ import os
 import json
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import ledger_lib  # noqa: E402
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+# scripts/hooks/ -> the install dir, independent of ledger_lib so _trace still
+# works when the ledger_lib import itself fails (audit a2f27d28 point 1: an
+# import-time exception above the try/except was the one untraceable death).
+_INSTALL_DIR = os.path.dirname(os.path.dirname(_HOOKS_DIR))
+
+
+def _trace(line):
+    """Append a one-line trace to store/inbox-drain.log. The silent `except:
+    pass` below made a 2026-07-13 delivery outage undiagnosable (the hook
+    stopped claiming for hours with zero evidence of WHERE it died -- gate,
+    token, HTTP, or never invoked at all). Never raises; tracing must not
+    break the never-block-the-prompt contract."""
+    try:
+        import datetime
+        path = os.path.join(_INSTALL_DIR, "store", "inbox-drain.log")
+        with open(path, "a") as f:
+            f.write("%s %s\n" % (datetime.datetime.now().strftime("%m-%d %H:%M:%S"), line))
+    except Exception:
+        pass
+
+
+sys.path.insert(0, _HOOKS_DIR)
+try:
+    import ledger_lib  # noqa: E402
+except Exception as e:  # import-time death must leave a trace, then not block
+    _trace("EXIT ledger_lib-import-failed %s: %s" % (type(e).__name__, e))
+    sys.exit(0)
 
 
 def _web_port():
@@ -42,21 +68,6 @@ def _web_port():
     return "3420"
 
 
-def _trace(line):
-    """Append a one-line trace to store/inbox-drain.log. The silent `except:
-    pass` below made a 2026-07-13 delivery outage undiagnosable (the hook
-    stopped claiming for hours with zero evidence of WHERE it died -- gate,
-    token, HTTP, or never invoked at all). Never raises; tracing must not
-    break the never-block-the-prompt contract."""
-    try:
-        import datetime
-        path = os.path.join(ledger_lib._install_dir(), "store", "inbox-drain.log")
-        with open(path, "a") as f:
-            f.write("%s %s\n" % (datetime.datetime.now().strftime("%m-%d %H:%M:%S"), line))
-    except Exception:
-        pass
-
-
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -66,7 +77,11 @@ def main():
 
     agent_id = ledger_lib.agent_id_from_cwd(payload.get("cwd"))
     if agent_id != ledger_lib.main_agent_id():
-        sys.exit(0)  # sub-agents are delivered by the router push path
+        # Sub-agents are delivered by the router push path. Trace the exit so a
+        # cwd-DETECTION failure on the main agent (silently draining nothing,
+        # audit a2f27d28 point 2) is distinguishable from a genuine sub-agent.
+        _trace("EXIT non-main agent_id=%s cwd=%s" % (agent_id, payload.get("cwd")))
+        sys.exit(0)
 
     try:
         token_path = os.path.join(ledger_lib._install_dir(), "store", ".dashboard-token")
