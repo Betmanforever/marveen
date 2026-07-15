@@ -1249,7 +1249,12 @@ WorkingDirectory=$INSTALL_DIR
 # load for the current Node ABI before starting (2026-07-03 crash-loop fix).
 ExecStartPre=$INSTALL_DIR/scripts/ensure-native-modules.sh
 ExecStart=$INSTALL_DIR/scripts/channels.sh
-Restart=on-failure
+# Restart=always (not on-failure): channels.sh's liveness watchdog breaks out
+# of its loop and exits 0 when the plugin dies ("exiting for service-manager
+# restart"), and on-failure ignores a clean exit -- the bridge stayed dead
+# until a manual respawn (2026-07-15: 07:26->09:56 window). The StartLimit
+# throttle above + channels.sh's own rapid-fail backoff prevent a tight loop.
+Restart=always
 RestartSec=10
 StandardOutput=append:$INSTALL_DIR/store/channels.log
 StandardError=append:$INSTALL_DIR/store/channels.error.log
