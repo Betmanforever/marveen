@@ -307,9 +307,13 @@ OLD_VERSION_FULL=$(git rev-parse HEAD 2>/dev/null || echo "")
 
 # Ahead-detect: local commits not on upstream make ff-only refuse. Report it
 # actionably instead of dying silently under set -e (the dominant failure).
+# Ahead-but-containing is fine: after a local reconcile-merge the checkout is
+# ahead of @{u} yet already contains every upstream commit, so the pull below
+# is a guaranteed no-op ("Already up to date") -- only hard-error when the
+# upstream is NOT an ancestor (true divergence: ahead AND behind).
 RESULT_PHASE="pull"
 AHEAD=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
-if [ "${AHEAD:-0}" -gt 0 ]; then
+if [ "${AHEAD:-0}" -gt 0 ] && ! git merge-base --is-ancestor '@{u}' HEAD 2>/dev/null; then
   RESULT_MSG="A helyi checkout ${AHEAD} committal elore van az upstreamhez kepest; a fast-forward frissites nem lehetseges. Nezd meg: git log @{u}..HEAD"
   echo -e "${RED}HIBA:${NC} a helyi checkout ${AHEAD} committal elore van az upstreamhez kepest; fast-forward nem lehetseges. Nezd: git log @{u}..HEAD"
   restore_stash_before_exit
