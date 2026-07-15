@@ -53,4 +53,16 @@ describe('schedule-runner: resubmit wiring uses the real clear + re-inject', () 
   it('routes the resubmit action through the pure decision function', () => {
     expect(SRC).toMatch(/decideScheduledResubmitAction\(attempt, stuck\)/)
   })
+
+  it('compensates a giveup by enqueuing a pending retry (never silently abandons the task)', () => {
+    // attemptFireTask records 'fired' + stamps scheduleLastRun BEFORE this async
+    // resubmit chain runs, so a giveup would otherwise leave the task marked fired
+    // yet never delivered -- a silent fleet-wide loss (card f8de7b37, 152+131
+    // giveups in 13 days). The giveup branch must feed the never-abandon
+    // pending-retry machinery so the task re-fires + alerts.
+    const giveupIdx = SRC.indexOf("action === 'giveup'")
+    expect(giveupIdx, "giveup branch not found").toBeGreaterThan(0)
+    const giveupBranch = SRC.slice(giveupIdx, giveupIdx + 1400)
+    expect(giveupBranch).toMatch(/insertPendingTaskRetryIfNew\(task\.name, agentName, now, 'giveup'\)/)
+  })
 })

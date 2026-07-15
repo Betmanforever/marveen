@@ -370,6 +370,18 @@ function attemptFireTask(
         if (action === 'none') return
         if (action === 'giveup') {
           logger.warn({ task: task.name, session }, 'Scheduled prompt still stuck after Enter + re-inject retries -- giving up')
+          // The prompt is parked (never submitted), yet attemptFireTask already
+          // recorded the task 'fired' + stamped scheduleLastRun BEFORE this async
+          // resubmit chain ran. Do NOT move that write -- it guards the CRON path
+          // against a double-fire while the first injection is still resubmitting.
+          // Compensate instead: enqueue a pending retry so the never-abandon
+          // machinery re-fires the task once the session frees (isSessionReadyForPrompt
+          // gates it, so it never re-injects on top of the still-parked prompt) and
+          // alerts the owner if it stays stuck past the threshold. Without this a
+          // swallowed-Enter giveup is a SILENT lost task -- and this is a fleet-wide
+          // path (not agent-specific), so it is compensated for every agent (card
+          // f8de7b37). INSERT-OR-IGNORE keeps it idempotent if a row already exists.
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'giveup')
           return
         }
         if (action === 'reinject') {
