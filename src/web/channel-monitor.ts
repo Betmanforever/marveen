@@ -31,12 +31,12 @@ import {
   paneShowsContextLow, paneShowsContextSaturation,
   decideContextBudgetEscalation, type ContextBudgetState,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
-  parkedInputText, shouldClearTruncatedPreamble,
+  parkedInputText, shouldClearTruncatedPreamble, shouldEscalateFrozenPane,
   parkedInputRowCount, submitLanded, decideStuckInputAction,
   type StuckInputState, type StuckInputThresholds, type StuckInputAction,
   type StuckInputActionFacts,
 } from '../pane-state.js'
-import { decidePendingAgeAlert, shouldAlertStuckTarget } from './message-router.js'
+import { decidePendingAgeAlert, decidePendingAgeRealert, shouldAlertStuckTarget } from './message-router.js'
 // The plan limit modal wears the same navigable-modal footer as a genuine
 // menu; the limit-banner detector tells the two apart so the menu-recovery
 // alert can name the real cause (see the blocking-menu pass below).
@@ -560,6 +560,13 @@ const PENDING_AGE_ALERT_DEDUP_MS = 15 * 60 * 1000
 // Past this age even a busy-working target alerts: an endless turn starves
 // the queue just as dead as a wedge (busy-vs-wedged discrimination ceiling).
 const PENDING_AGE_ALERT_HARD_CEILING_MS = 15 * 60 * 1000
+// Ceiling RE-ARM: once the OLDEST pending row has out-waited this age (~3x the
+// routine dedup) the episode is not merely slow but wedged-and-worsening, so a
+// severity escalation re-alert fires INSIDE the routine dedup window
+// (decidePendingAgeRealert). Self-throttled to one per PENDING_AGE_REALERT_DEDUP_MS
+// via the shared pendingAgeLastAlertAt stamp, so it can never storm the tick.
+const PENDING_AGE_REALERT_CEILING_MS = 45 * 60 * 1000
+const PENDING_AGE_REALERT_DEDUP_MS = 5 * 60 * 1000
 
 // The plan usage-limit dialog is a recurring special case: model-fallback
 // respawns the limited session, the respawn re-hits the same plan-wide limit
@@ -964,6 +971,12 @@ function respawnMarveenSessionFresh(): boolean {
 // resume risks a false escalation, which still self-heals (fresh respawn).
 export const POST_RESUME_GUARD_DELAY_MS = 90_000
 
+// Gap (seconds) between the two liveness samples in the post-resume probe (see
+// shouldEscalateFrozenPane). Long enough that a pane still rendering / settling
+// differs between captures -- so a session merely slow to come up is NOT judged
+// frozen -- yet short enough to keep the already-delayed guard callback brief.
+const POST_RESUME_PROBE_GAP_S = 4
+
 // PURE decision for the post-resume guard: after a --continue resume, do we have
 // to escalate to a fresh respawn? Yes iff the resumed session is NOT serving the
 // channel plugin -- either the claude pid is gone, or the pid is alive but the
@@ -987,7 +1000,26 @@ function schedulePostResumePluginGuard(provider: ChannelProviderType): void {
       const claudePid = getClaudePidForSession(MAIN_CHANNELS_SESSION)
       const pluginAlive = claudePid != null && hasChannelPluginAlive(claudePid, provider)
       if (!shouldEscalateAfterResume({ claudePid, pluginAlive })) {
-        logger.info({ provider }, 'Post-resume guard: channel plugin attached after --continue -- context preserved, no escalation')
+        // Plugin attached -- but a live poller does NOT prove the resumed TUI can
+        // ACT on input (the 2026-06-02 stdio wedge: poller alive, render loop
+        // frozen). Confirm the pane is a live surface with a stdin-SAFE two-sample
+        // liveness read (no keystroke: a bare Enter would submit parked text and
+        // typing would answer a permission dialog). Escalate only if the pane is
+        // frozen (non-idle, non-busy, no dialog, no parked input, byte-identical
+        // across both samples). shouldEscalateFrozenPane fails open on a capture
+        // miss, so a transient tmux hiccup never triggers a needless respawn.
+        const sampleA = capturePane(MAIN_CHANNELS_SESSION)
+        try {
+          execFileSync('/bin/sleep', [String(POST_RESUME_PROBE_GAP_S)], { timeout: (POST_RESUME_PROBE_GAP_S + 2) * 1000 })
+        } catch { /* best effort: fall through to the second capture */ }
+        const sampleB = capturePane(MAIN_CHANNELS_SESSION)
+        if (shouldEscalateFrozenPane(sampleA, sampleB)) {
+          logger.warn({ provider }, 'Post-resume guard: plugin attached but the resumed pane is FROZEN (non-idle/non-busy, unchanged across two samples) -- the --continue TUI is wedged; escalating to fresh respawn (context dropped, memory persists)')
+          sendAlert(`⚠️ A --continue resume utan a channel plugin felallt, de a TUI befagyott (ket mintavetel kozott valtozatlan, nem reagal). Fresh respawn most a ${MAIN_CHANNELS_SESSION} session-on (a beszelgetes elveszik, memoria marad).`)
+          respawnMarveenSessionFresh()
+          return
+        }
+        logger.info({ provider }, 'Post-resume guard: channel plugin attached after --continue AND the pane is a live surface -- context preserved, no escalation')
         return
       }
       logger.warn({ provider }, 'Post-resume guard: --continue resume came up WITHOUT the channels plugin (CC 2.1.193) -- escalating to fresh respawn (context dropped, memory persists)')
@@ -1917,7 +1949,14 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       if (!agesMs.some((a) => a > PENDING_AGE_ALERT_THRESHOLD_MS)) {
         // Backlog below threshold: re-arm so the next episode alerts promptly.
         pendingAgeLastAlertAt = null
-      } else if (decidePendingAgeAlert(agesMs, pendingAgeLastAlertAt, nowMs, PENDING_AGE_ALERT_THRESHOLD_MS, PENDING_AGE_ALERT_DEDUP_MS)) {
+      } else if (
+        decidePendingAgeAlert(agesMs, pendingAgeLastAlertAt, nowMs, PENDING_AGE_ALERT_THRESHOLD_MS, PENDING_AGE_ALERT_DEDUP_MS) ||
+        // Ceiling RE-ARM: once the OLDEST row out-waits the ceiling the episode is
+        // wedged-and-worsening, so escalate INSIDE the routine dedup window (at the
+        // faster PENDING_AGE_REALERT_DEDUP_MS cadence, self-throttled off the same
+        // pendingAgeLastAlertAt stamp so it never storms).
+        decidePendingAgeRealert(Math.max(...agesMs), pendingAgeLastAlertAt, nowMs, PENDING_AGE_REALERT_CEILING_MS, PENDING_AGE_REALERT_DEDUP_MS)
+      ) {
         // Busy-vs-wedged discrimination (2026-07-13 09:00 false alarm): a
         // target that is ACTIVELY WORKING holds its inbox until the turn ends
         // by design -- that is latency, not starvation. Classify each stuck
@@ -1959,8 +1998,15 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           // List up to the 5 oldest alert-worthy rows (id, from→to, minutes pending).
           const list = stuck.map((x) => `#${x.m.id} ${x.m.from_agent}→${x.m.to_agent} (${Math.floor(x.ageMs / 60000)}p)`).join(', ')
           const thresholdMin = Math.floor(PENDING_AGE_ALERT_THRESHOLD_MS / 60000)
-          logger.error({ stuck: stuck.length, oldestMin: Math.floor(stuck[0].ageMs / 60000) }, 'Inter-agent message queue starving -- pending rows past age threshold')
-          sendAlert(`⛔ Az inter-agent uzenetsor akad: ${stuck.length} uzenet ${thresholdMin}+ perce pending, es a cel-agent NEM dolgozik epp (vagy wedge-jelet mutat). Legidosebbek: ${list}. Nezd meg a dashboard uzenetsort.`)
+          const oldestMin = Math.floor(stuck[0].ageMs / 60000)
+          // Escalation wording is SEVERITY-driven (oldest past the ceiling), not
+          // cadence-driven: a routine-cadence re-alert on a 45+ min backlog is
+          // still an escalation. Past the ceiling this is a wedge, not latency.
+          const escalation = stuck[0].ageMs > PENDING_AGE_REALERT_CEILING_MS
+          logger.error({ stuck: stuck.length, oldestMin, escalation }, 'Inter-agent message queue starving -- pending rows past age threshold')
+          sendAlert(escalation
+            ? `⛔ ESZKALACIO -- az inter-agent uzenetsor MEG MINDIG akad: ${stuck.length} uzenet, a legregebbi ${oldestMin} perce pending (tullepte a ${Math.floor(PENDING_AGE_REALERT_CEILING_MS / 60000)} perces plafont). Legidosebbek: ${list}. Ez mar nem lassulas hanem beragadas -- nezd meg a dashboard uzenetsort / a cel-agens sessiont.`
+            : `⛔ Az inter-agent uzenetsor akad: ${stuck.length} uzenet ${thresholdMin}+ perce pending, es a cel-agent NEM dolgozik epp (vagy wedge-jelet mutat). Legidosebbek: ${list}. Nezd meg a dashboard uzenetsort.`)
         }
       }
     } catch (err) {

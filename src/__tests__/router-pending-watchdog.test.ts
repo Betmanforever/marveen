@@ -15,10 +15,12 @@
 // Both are pure, so unit-test them directly -- no tmux/db mocking needed.
 
 import { describe, it, expect } from 'vitest'
-import { decidePendingAgeAlert, decideCoordinatorNudge, shouldAlertStuckTarget } from '../web/message-router.js'
+import { decidePendingAgeAlert, decidePendingAgeRealert, decideCoordinatorNudge, shouldAlertStuckTarget } from '../web/message-router.js'
 
 const THRESHOLD_MS = 3 * 60 * 1000 // 3 min
 const DEDUP_MS = 15 * 60 * 1000 // 15 min
+const REALERT_CEILING_MS = 45 * 60 * 1000 // 45 min (~3x dedup)
+const REALERT_DEDUP_MS = 5 * 60 * 1000 // 5 min escalation cadence
 
 describe('decidePendingAgeAlert: one owner alert per stuck queue episode', () => {
   it('is false when no message is past the threshold', () => {
@@ -48,6 +50,47 @@ describe('decidePendingAgeAlert: one owner alert per stuck queue episode', () =>
     // A future lastAlertAt (NTP correction) would drive the delta negative; the
     // guard treats it as "alert now" instead of silently never alerting again.
     expect(decidePendingAgeAlert([THRESHOLD_MS + 1], 2_000_000, 1_000_000, THRESHOLD_MS, DEDUP_MS)).toBe(true)
+  })
+})
+
+describe('decidePendingAgeRealert: ceiling re-arm escalation inside the dedup window', () => {
+  it('does not escalate while the oldest row is under the ceiling', () => {
+    const lastAlert = 1_000_000
+    // Well past the routine threshold but under the ceiling, inside the dedup
+    // window: the routine path stays quiet and there is nothing to escalate.
+    expect(decidePendingAgeRealert(REALERT_CEILING_MS, lastAlert, lastAlert + 60_000, REALERT_CEILING_MS, REALERT_DEDUP_MS)).toBe(false)
+    // Boundary-strict: exactly at the ceiling is not yet an escalation.
+    expect(decidePendingAgeRealert(REALERT_CEILING_MS, lastAlert, lastAlert + REALERT_DEDUP_MS, REALERT_CEILING_MS, REALERT_DEDUP_MS)).toBe(false)
+  })
+
+  it('does not escalate before any routine alert has fired (lastAlertAt null)', () => {
+    // The routine path owns the first alert; there is no prior alert to escalate
+    // past, so a null stamp never escalates even past the ceiling.
+    expect(decidePendingAgeRealert(REALERT_CEILING_MS + 1, null, 10_000, REALERT_CEILING_MS, REALERT_DEDUP_MS)).toBe(false)
+  })
+
+  it('escalates once the oldest passes the ceiling AND the escalation cadence has elapsed', () => {
+    const lastAlert = 1_000_000
+    // Oldest over the ceiling, but the escalation dedup has NOT elapsed -> quiet.
+    expect(decidePendingAgeRealert(REALERT_CEILING_MS + 1, lastAlert, lastAlert + REALERT_DEDUP_MS - 1, REALERT_CEILING_MS, REALERT_DEDUP_MS)).toBe(false)
+    // Escalation dedup elapsed (inclusive) -> escalate, even though the far
+    // longer routine dedup window has NOT elapsed yet.
+    expect(decidePendingAgeRealert(REALERT_CEILING_MS + 1, lastAlert, lastAlert + REALERT_DEDUP_MS, REALERT_CEILING_MS, REALERT_DEDUP_MS)).toBe(true)
+    // The escalation cadence is strictly faster than the routine dedup, so it
+    // fires well inside the routine window.
+    expect(REALERT_DEDUP_MS).toBeLessThan(DEDUP_MS)
+  })
+
+  it('does not stall on backwards clock skew (escalates now)', () => {
+    expect(decidePendingAgeRealert(REALERT_CEILING_MS + 1, 2_000_000, 1_000_000, REALERT_CEILING_MS, REALERT_DEDUP_MS)).toBe(true)
+  })
+
+  it('self-throttles: the shared stamp caps escalations at one per cadence (no per-tick storm)', () => {
+    // A 60s monitor tick inside the escalation window must NOT re-fire: the
+    // caller bumps lastAlertAt on every alert, so an escalation 1 min after the
+    // last alert is suppressed until REALERT_DEDUP_MS has elapsed again.
+    const lastAlert = 1_000_000
+    expect(decidePendingAgeRealert(REALERT_CEILING_MS + 1, lastAlert, lastAlert + 60_000, REALERT_CEILING_MS, REALERT_DEDUP_MS)).toBe(false)
   })
 })
 

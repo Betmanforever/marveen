@@ -126,6 +126,40 @@ export function decidePendingAgeAlert(
 }
 
 /**
+ * Pure decision: past the routine dedup, should a SEVERITY-ESCALATION re-alert
+ * fire for a pending-age episode that is not merely slow but stuck? The routine
+ * decidePendingAgeAlert() suppresses every re-alert inside its dedup window --
+ * right for a queue that is just briefly busy, but wrong once the OLDEST row has
+ * out-waited `ceilingMs` (>> the routine threshold): that backlog is wedged and
+ * getting worse, and the owner should hear about it before the full dedup window
+ * elapses. This is the ceiling RE-ARM (2026-07: a starving queue re-alerted only
+ * on the slow routine cadence, so a worsening wedge read the same as a transient
+ * blip).
+ *
+ * True iff the oldest pending age is past the ceiling AND at least
+ * `realertDedupMs` has passed since the last alert. It reuses the SAME
+ * `lastAlertAt` stamp the routine path bumps, so escalations self-throttle to at
+ * most one per `realertDedupMs` and can never storm the monitor tick. A null
+ * `lastAlertAt` returns false: no routine alert has fired yet, so the routine
+ * path owns the first alert and there is nothing to escalate past. A future-dated
+ * `lastAlertAt` (clock skew) counts as "escalate now", mirroring
+ * decidePendingAgeAlert. Callers word the escalation distinctly ("meg mindig
+ * akad ... N perce").
+ */
+export function decidePendingAgeRealert(
+  oldestAgeMs: number,
+  lastAlertAt: number | null,
+  now: number,
+  ceilingMs: number,
+  realertDedupMs: number,
+): boolean {
+  if (oldestAgeMs <= ceilingMs) return false
+  if (lastAlertAt === null) return false
+  if (now < lastAlertAt) return true
+  return now - lastAlertAt >= realertDedupMs
+}
+
+/**
  * Pure decision: does a stuck pending message's TARGET state warrant an owner
  * alert, or is the delay benign? A pull-model/push target that is ACTIVELY
  * WORKING (busy pane, no wedge signals) holds its inbox until the turn ends by

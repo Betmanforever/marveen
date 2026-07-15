@@ -1351,6 +1351,41 @@ export function parkedInputText(pane: string): string | null {
   return flat.length > 0 ? flat : null
 }
 
+/**
+ * PURE decision for the post-resume LIVENESS probe (2026-07 audit, card
+ * f8de7b37). shouldEscalateAfterResume() only proves the process + channel
+ * plugin came back after a --continue resume; it CANNOT tell a resumed session
+ * whose TUI actually accepts input from one whose render loop is wedged (poller
+ * alive, TUI frozen -- the 2026-06-02 stdio-wedge shape). This backstops it with
+ * a stdin-SAFE liveness read: the caller captures the pane TWICE, a few seconds
+ * apart, WITHOUT sending any keystroke (a bare Enter would submit whatever is
+ * parked in an idle box; typing would answer a permission dialog -- the aa4c659
+ * precedent), then passes both samples here.
+ *
+ * Escalate to a fresh respawn ONLY when the pane is genuinely frozen:
+ *   - not a live idle footer (paneLooksIdle) -- a ready pane is healthy;
+ *   - not an active turn (detectPaneState === 'busy') -- a working pane is healthy;
+ *   - not a permission/approval dialog (detectsPermissionDialog) -- that is a
+ *     legitimate WAIT on operator input, never a wedge; respawning it would abort
+ *     the pending turn;
+ *   - no parked input text (parkedInputText) -- a stranded message is the
+ *     stuck-input-watcher's job (it can re-submit it), not a render freeze, and a
+ *     respawn would discard the parked message;
+ *   - AND the two samples are byte-identical -- a pane still rendering / mid-boot
+ *     differs between captures, so an evolving pane is given more time.
+ * Every guard errs toward NOT respawning (preserving conversation context).
+ * Fail-open: a null capture (tmux miss) does NOT escalate -- the pid/plugin guard
+ * already ran, and a lone capture miss is not evidence of a wedge.
+ */
+export function shouldEscalateFrozenPane(sampleA: string | null, sampleB: string | null): boolean {
+  if (sampleA == null || sampleB == null) return false
+  if (paneLooksIdle(sampleA) || paneLooksIdle(sampleB)) return false
+  if (detectPaneState(sampleA) === 'busy' || detectPaneState(sampleB) === 'busy') return false
+  if (detectsPermissionDialog(sampleA) || detectsPermissionDialog(sampleB)) return false
+  if (parkedInputText(sampleA) != null || parkedInputText(sampleB) != null) return false
+  return sampleA === sampleB
+}
+
 // A scheduled prompt (heartbeat / task) whose closing Enter was swallowed sits
 // PARKED in the live input box, pinning the pane 'typing' so every later task
 // defers. The schedule-runner resubmit ladder must recognise that reliably --

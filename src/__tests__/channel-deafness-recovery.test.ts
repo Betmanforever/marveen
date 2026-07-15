@@ -8,6 +8,7 @@ import {
   shouldEscalateAfterResume,
   POST_RESUME_GUARD_DELAY_MS,
 } from '../web/channel-monitor.js'
+import { shouldEscalateFrozenPane } from '../pane-state.js'
 
 // CONTRACT: the respawn command MUST carry the .bun/bin PATH export -- without
 // it the respawned bun telegram bridge can't be located and the session comes
@@ -70,6 +71,68 @@ describe('shouldEscalateAfterResume', () => {
     // first, and < the cascade grace so a genuinely-absent plugin escalates sooner.
     expect(POST_RESUME_GUARD_DELAY_MS).toBeGreaterThan(65_000)
     expect(POST_RESUME_GUARD_DELAY_MS).toBeLessThan(240_000)
+  })
+})
+
+// CONTRACT: after shouldEscalateAfterResume clears (pid + plugin back), the
+// post-resume LIVENESS probe still escalates a resumed pane whose TUI is frozen
+// (poller alive but render loop wedged -- the 2026-06-02 stdio wedge). Stdin-safe:
+// it only READS two captures, never sends a keystroke, and every guard errs
+// toward preserving conversation context.
+describe('shouldEscalateFrozenPane', () => {
+  const SEP = '─'.repeat(80)
+  // A live idle footer + empty box: healthy resume.
+  const IDLE = ['', SEP, '❯ ', SEP, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+  // An active turn (spinner + esc to interrupt): healthy resume.
+  const BUSY = ['✢ Combobulating… (12s · ↓ 1.2k tokens)', '', SEP, '❯ ', SEP, '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt'].join('\n')
+  // A tool-approval dialog: a legitimate WAIT on the operator, never a wedge.
+  const PERMISSION = [
+    '  Do you want to proceed?',
+    '  ❯ 1. Yes',
+    "  2. Yes, and don't ask again",
+    '  3. No, and tell Claude what to do differently (esc)',
+  ].join('\n')
+  // A stranded inbound message parked in the box (typing): the stuck-input
+  // watcher can re-submit it -- a respawn would DISCARD it, so do not escalate.
+  const PARKED = ['', SEP, '❯ egy be nem kuldott bejovo uzenet', SEP, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+  // Non-idle, non-busy, no dialog, no parked input: a wedged render surface.
+  const FROZEN = ['⏺ Resuming conversation…', '  (no idle footer, no box, render loop wedged)'].join('\n')
+
+  it('escalates only when both samples are frozen AND byte-identical', () => {
+    expect(shouldEscalateFrozenPane(FROZEN, FROZEN)).toBe(true)
+  })
+
+  it('does NOT escalate when the frozen-looking pane is still changing (mid-boot / rendering)', () => {
+    expect(shouldEscalateFrozenPane(FROZEN, FROZEN + '\n  another render line')).toBe(false)
+  })
+
+  it('does NOT escalate a live idle footer (healthy resume), even if unchanged', () => {
+    expect(shouldEscalateFrozenPane(IDLE, IDLE)).toBe(false)
+  })
+
+  it('does NOT escalate an active turn (busy indicators)', () => {
+    expect(shouldEscalateFrozenPane(BUSY, BUSY)).toBe(false)
+  })
+
+  it('does NOT escalate a permission/approval dialog (legitimate wait, aa4c659 precedent)', () => {
+    expect(shouldEscalateFrozenPane(PERMISSION, PERMISSION)).toBe(false)
+  })
+
+  it('does NOT escalate a pane with parked input (stuck-input-watcher owns it; respawn would discard the message)', () => {
+    expect(shouldEscalateFrozenPane(PARKED, PARKED)).toBe(false)
+  })
+
+  it('fails open on a capture miss (null) -- a tmux hiccup is not a wedge', () => {
+    expect(shouldEscalateFrozenPane(null, FROZEN)).toBe(false)
+    expect(shouldEscalateFrozenPane(FROZEN, null)).toBe(false)
+    expect(shouldEscalateFrozenPane(null, null)).toBe(false)
+  })
+
+  it('suppresses if EITHER sample shows a healthy/legitimate surface', () => {
+    // A pane that flips from frozen to idle within the probe window recovered on
+    // its own -- do not respawn it.
+    expect(shouldEscalateFrozenPane(FROZEN, IDLE)).toBe(false)
+    expect(shouldEscalateFrozenPane(IDLE, FROZEN)).toBe(false)
   })
 })
 
