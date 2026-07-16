@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync, writeFileSync, utimesSync } from 'node:fs'
-import { hostname } from 'node:os'
+import { hostname, loadavg, availableParallelism } from 'node:os'
 import { join } from 'node:path'
 import { execSync, execFileSync, spawn } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
@@ -137,6 +137,13 @@ function ensureAgentRestartFailuresInitialized(): void {
 // fleet-wide, so each fresh cold-boot completes in isolation.
 let lastChannelAgentRestartAt = 0
 const CHANNEL_RESTART_STAGGER_MS = 90_000
+// Above this 1-min load per core the host is thrashing and the spawn-based
+// liveness probes are unreliable (2026-07-16: ETIMEDOUT cascade at load ~11 on
+// 8 cores) -- the agent down-path defers instead of restarting.
+const HOST_OVERLOAD_LOAD1_PER_CORE = 2
+function hostOverloaded(): boolean {
+  return loadavg()[0] > availableParallelism() * HOST_OVERLOAD_LOAD1_PER_CORE
+}
 const AGENT_RESTART_GRACE_MS = 90_000
 // Floor frequency for the backed-off restart: even a long-down plugin is still
 // retried at least this often, in case an external fix brings it back.
@@ -1823,6 +1830,18 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       if (t.isMarveen) {
         if (shouldEscalateMarveenDown()) handleMarveenDown()
       } else {
+        // Host-overload guard (2026-07-16 incident): with 1-min load ~11 on 8
+        // cores every spawnSync in this process (the ps liveness probe, sleep,
+        // tmux) hit ETIMEDOUT, healthy plugins read as "down", and the
+        // resulting fresh restarts both wiped agent context and fed the load
+        // spiral (one restart attempt itself died on ETIMEDOUT). A "down"
+        // reading taken on a thrashing host is unreliable -- defer the whole
+        // down-path until load subsides; a genuinely dead plugin is picked up
+        // by the next calm sweep.
+        if (hostOverloaded()) {
+          logger.warn({ agent: t.agentName, provider: t.provider, load1: loadavg()[0], cores: availableParallelism() }, 'Channel plugin probe reports down but host is overloaded -- deferring (probe unreliable under load)')
+          continue
+        }
         // Marketplace-stall guard (2026-07-03 second incident): while the
         // plugin init is provably still in flight (no bun poller AND no
         // plugin-cache .in_use marker yet -- a stalled official-marketplace

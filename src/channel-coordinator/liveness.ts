@@ -152,8 +152,15 @@ export function hasChannelPluginAlive(claudePid: number, providerType: ChannelPr
       },
       debugLog: (event, fields) => logger.debug(fields, event),
     })
-  } catch {
-    return false
+  } catch (err) {
+    // A probe failure (the ps spawn hitting ETIMEDOUT/EAGAIN while the host is
+    // thrashing -- 2026-07-16: 1-min load ~11 on 8 cores timed out every
+    // spawnSync in the process) proves nothing about the plugin. Bias toward
+    // "alive": a false "down" reading triggers a fresh restart that costs the
+    // agent its whole session context, while a genuinely dead plugin is caught
+    // by the next successful probe.
+    logger.warn({ err, claudePid, providerType, agentName }, 'Channel plugin liveness probe failed to run -- treating as alive (probe gave no evidence)')
+    return true
   }
 }
 

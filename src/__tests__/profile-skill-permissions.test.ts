@@ -62,8 +62,12 @@ describe('Skill rules survive the settings.json render pipeline', () => {
 // ~/.claude/skills/.skill-index.md (2026-07-06). Probe-verified in ive's real
 // environment: the ** glob DOES cover the dot-named index file once the
 // render pipeline anchors the rule to // (absolutizeFsPermissionRule), so a
-// single rule suffices. Write stays scoped to the agent's OWN .claude/skills.
-describe('strict profiles with the Skill tool can read the global skills dir', () => {
+// single rule suffices. Since 2026-07-16 (Gabor-approved, auditor PASS) the
+// strict profiles also get Write+Edit on the SHARED skills dir: the
+// skill-writer subagent authors fleet skills there by design, and the missing
+// pair generated a per-edit approval dialog storm (29 prompts in one night)
+// that the every-spawn settings regeneration kept resurrecting.
+describe('strict profiles with the Skill tool can use the global skills dir', () => {
   for (const p of listProfileTemplates().filter(
     t => t.permissionMode === 'strict' && t.filesystem.allow.includes('Skill'),
   )) {
@@ -71,11 +75,16 @@ describe('strict profiles with the Skill tool can read the global skills dir', (
       expect(p.filesystem.allow).toContain('Read(${HOME}/.claude/skills/**)')
     })
 
-    it(`${p.id}: does NOT allow writing the global skills dir`, () => {
-      for (const rule of p.filesystem.allow) {
-        expect(rule).not.toMatch(/^(Write|Edit)\(\$\{HOME\}\/\.claude\/skills/)
-      }
-    })
+    // The Write+Edit pair is approved for the profiles that back the live
+    // fleet agents (alex/charlie/ive run marketer+researcher); the unused
+    // developer-junior sandbox profile keeps the narrower default until an
+    // agent on it actually needs the skill-writer lane.
+    if (p.id === 'marketer' || p.id === 'researcher') {
+      it(`${p.id}: allows writing/editing the shared skills dir (skill-writer lane)`, () => {
+        expect(p.filesystem.allow).toContain('Write(${HOME}/.claude/skills/**)')
+        expect(p.filesystem.allow).toContain('Edit(${HOME}/.claude/skills/**)')
+      })
+    }
   }
 })
 
