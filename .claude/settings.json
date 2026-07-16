@@ -1,5 +1,11 @@
 {
   "model": "claude-sonnet-5",
+  "permissions": {
+    "allow": [
+      "Write(//home/szabgabor/.claude/skills/**)",
+      "Edit(//home/szabgabor/.claude/skills/**)"
+    ]
+  },
   "enabledPlugins": {
     "slack-channel@marveen-marketplace": false,
     "telegram@claude-plugins-official": true
