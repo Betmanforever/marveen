@@ -13,6 +13,8 @@
       "Read(${HOME}/Downloads/**)",
       "Read(${HOME}/.claude/plugins/cache/claude-watch/**)",
       "Read(${HOME}/.claude/skills/**)",
+      "Write(${HOME}/.claude/skills/**)",
+      "Edit(${HOME}/.claude/skills/**)",
       "Bash(ls:*)",
       "Bash(date:*)",
       "Bash(mkdir:*)",
