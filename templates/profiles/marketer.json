@@ -23,6 +23,7 @@
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/daily-log.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/taskstate.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/memo-search.sh:*)",
+      "Bash(bash ${INSTALL_DIR}/scripts/skill-index.sh)",
       "WebFetch(*)",
       "WebSearch(*)",
       "mcp__plugin_telegram_telegram__reply",

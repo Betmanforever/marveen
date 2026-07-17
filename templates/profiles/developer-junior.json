@@ -19,6 +19,7 @@
       "Bash(cat:*)",
       "Bash(pwd:*)",
       "Bash(curl:*)",
+      "Bash(bash ${INSTALL_DIR}/scripts/skill-index.sh)",
       "WebFetch(*)",
       "WebSearch(*)",
       "Skill"

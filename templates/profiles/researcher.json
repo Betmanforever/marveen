@@ -24,6 +24,7 @@
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/daily-log.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/taskstate.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/memo-search.sh:*)",
+      "Bash(bash ${INSTALL_DIR}/scripts/skill-index.sh)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/watch.sh:*)",
       "Bash(python3 ${HOME}/.claude/plugins/cache/claude-watch/watch/0.2.0/scripts/watch.py:*)",
       "Bash(python3 ${HOME}/.claude/plugins/cache/claude-watch/watch/0.2.0/scripts/setup.py:*)",
