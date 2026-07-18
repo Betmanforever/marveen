@@ -441,13 +441,19 @@ function selfHealWorkerOnce(): boolean {
   return true
 }
 
-/** Loud, rate-limited operator signal: the worker never became ready. */
+/**
+ * Loud, rate-limited operator signal: the worker never became ready.
+ * Only called AFTER the central restart-and-retry in runViaWorker has also
+ * failed -- alerting from inside a single ensureWorkerReady pass fired during
+ * self-heal and made every successful recovery a false alarm (2026-07-18).
+ * The text must never direct the owner to a terminal (Telegram-only rule).
+ */
 function alertWorkerStuck(paneTail: string): void {
-  logger.error({ paneTail }, 'agent-worker: worker never became ready (agent-gen / capability-summary / heartbeat / digest consumers will fail)')
+  logger.error({ paneTail }, 'agent-worker: worker never became ready after restart+retry (agent-gen / capability-summary / heartbeat / digest consumers will fail)')
   if (Date.now() - lastWorkerStuckAlert < WORKER_STUCK_ALERT_COOLDOWN_MS) return
   lastWorkerStuckAlert = Date.now()
   void notifyChannel(
-    '\u26A0\uFE0F Marveen worker: a hatter-worker session nem all keszen (beragadt dialogus vagy ismeretlen kepernyo). Onjavitas lefutott (Escape + restart), de a keszenlet nem allt helyre. Erintett: agens-generalas, capability-osszefoglalo, heartbeat, digest. Nezz ra: tmux attach -t marveen-worker',
+    '\u26A0\uFE0F Marveen worker: a hatter-worker session az onjavitas (Escape + restart + ujraprobalkozas) utan SEM allt keszen. Erintett: agens-generalas, capability-osszefoglalo, heartbeat, digest. Szolj neo-nak vagy mr-wolfe-nak, ok megnezik.',
   ).catch(() => { /* notifyChannel logs internally */ })
 }
 
@@ -465,7 +471,7 @@ async function ensureWorkerReady(): Promise<boolean> {
     await sleepMs(2000)
   }
   const pane = capturePane(WORKER_SESSION)
-  alertWorkerStuck((pane ?? '').split('\n').slice(-12).join('\n'))
+  logger.warn({ paneTail: (pane ?? '').split('\n').slice(-12).join('\n') }, 'agent-worker: worker did not reach ready before deadline (caller decides retry/alert)')
   return false
 }
 
@@ -578,6 +584,12 @@ export async function runViaWorker(message: string, timeoutMs: number): Promise<
           logger.warn('agent-worker: worker not ready -- restarting once and retrying the request')
           restartWorkerSession()
           continue
+        }
+        // Terminal not-ready: the restart+retry above also failed, so this is
+        // a real outage, not a mid-recovery snapshot -- alert the operator now.
+        if (r.error === 'worker session not ready') {
+          const pane = capturePane(WORKER_SESSION)
+          alertWorkerStuck((pane ?? '').split('\n').slice(-12).join('\n'))
         }
         return { text: null, error: r.error }
       }
