@@ -13,6 +13,8 @@ import {
   writeAgentModel,
   readAgentAuthMode,
   resolveModelId,
+  readMainModel,
+  writeMainModel,
   DEFAULT_MODEL,
 } from './agent-config.js'
 import {
@@ -207,23 +209,9 @@ function announceSwitch(name: string, from: string, to: string, kind: string, de
   }
 }
 
-const MAIN_SETTINGS_PATH = join(PROJECT_ROOT, '.claude', 'settings.json')
-
-function readMainModel(): string {
-  try {
-    const cfg = JSON.parse(readFileSync(MAIN_SETTINGS_PATH, 'utf-8'))
-    return resolveModelId((cfg && typeof cfg.model === 'string' && cfg.model) || DEFAULT_MODEL)
-  } catch {
-    return DEFAULT_MODEL
-  }
-}
-
-function writeMainModel(model: string): void {
-  let cfg: Record<string, unknown> = {}
-  try { cfg = JSON.parse(readFileSync(MAIN_SETTINGS_PATH, 'utf-8')) } catch {}
-  cfg.model = model
-  atomicWriteFileSync(MAIN_SETTINGS_PATH, JSON.stringify(cfg, null, 2))
-}
+// readMainModel/writeMainModel moved to agent-config.ts so the PUT
+// /api/agents/:name handler shares the same main-agent settings.json path
+// (card: dashboard model edit was a silent no-op for the main agent).
 
 function readModelFor(name: string): string {
   return name === MAIN_AGENT_ID ? readMainModel() : readAgentModel(name)

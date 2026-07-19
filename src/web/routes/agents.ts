@@ -6,6 +6,7 @@ import { logger } from '../../logger.js'
 import { MAIN_AGENT_ID, BOT_NAME, PROJECT_ROOT } from '../../config.js'
 import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent } from '../../db.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../agent-message-wrap.js'
+import { getDeliveryMode, isPullModeAgent } from '../delivery-config.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
 import {
@@ -16,8 +17,9 @@ import {
   extractDescriptionFromClaudeMd,
   findAvatarForAgent,
   resolveModelId,
-  readAgentModel,
+  readModelFor,
   writeAgentModel,
+  writeModelFor,
   readAgentDisplayName,
   writeAgentDisplayName,
   readAgentSecurityProfile,
@@ -390,7 +392,7 @@ function getAgentSummary(name: string): AgentSummary {
     name,
     displayName: readAgentDisplayName(name),
     description: extractDescriptionFromClaudeMd(claudeMd),
-    model: readAgentModel(name),
+    model: readModelFor(name),
     activeModel: running ? readActiveModelFromProjectDir(dir, runningSince ?? undefined, resolveAgentConfigDir(name).configDir ?? undefined) : null,
     runningSince,
     authMode: readAgentAuthMode(name),
@@ -631,7 +633,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       const personaPath = join(PROJECT_ROOT, 'personas', `${name}.md`)
       const personaMd = existsSync(personaPath) ? readFileSync(personaPath, 'utf-8') : ''
       const personaText = [claudeMd, personaMd].filter(Boolean).join('\n')
-      const currentModel = readAgentModel(name)
+      const currentModel = readModelFor(name)
       const contextTokens = readContextTokensFromProjectDir(dir) ?? 0
 
       const kanban = kanbanMap.get(name)
@@ -1517,20 +1519,25 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     return true
   }
 
-  // Main-agent inbox PULL (drain-inbox): atomically CLAIM the main agent's
-  // pending inter-agent messages and return them already WRAPPED (single-source
-  // security framing via agent-message-wrap), for the UserPromptSubmit hook to
-  // print into the agent's context. The router skips main-agent tmux delivery,
-  // so this is the SOLE delivery path for the main agent -- which is why it is
-  // restricted to the main agent (serving a sub-agent here would double-deliver
-  // alongside the router's still-active tmux push). Auth is the global /api
-  // bearer gate. One quick claim+wrap per turn (NOT a hot loop -> not the #498
-  // self-HTTP event-loop hazard).
+  // Inbox PULL (drain-inbox): atomically CLAIM an agent's pending inter-agent
+  // messages and return them already WRAPPED (single-source security framing via
+  // agent-message-wrap), for the caller's UserPromptSubmit hook to print into
+  // the agent's context. This is the SOLE delivery path for a PULL-model agent:
+  // the router skips tmux-pushing to it, so serving a NON-pull (legacy) agent
+  // here would double-deliver alongside the router's still-active tmux push.
+  // Hence the gate accepts only pull-model agents -- the main agent (always
+  // pull) or an agent flipped to 'hook' delivery -- via isPullModeAgent, the
+  // SAME predicate the router uses to decide which agents to skip, so the two
+  // paths cannot drift into a double-deliver or a black hole. The trust
+  // CLASSIFICATION + wrap stays server-side here (never in the hook script), so
+  // moving an agent to pull delivery does not widen the trust surface. Auth is
+  // the global /api bearer gate. One quick claim+wrap per turn (NOT a hot loop
+  // -> not the #498 self-HTTP event-loop hazard).
   const drainMatch = path.match(/^\/api\/agents\/([^/]+)\/drain-inbox$/)
   if (drainMatch && method === 'POST') {
     const name = decodeURIComponent(drainMatch[1])
-    if (name !== MAIN_AGENT_ID) {
-      json(res, { error: 'drain-inbox is main-agent only (sub-agents use the router push path)' }, 400)
+    if (!isPullModeAgent(name, MAIN_AGENT_ID, getDeliveryMode)) {
+      json(res, { error: 'drain-inbox is for the main agent or a hook-delivery agent; this agent is not in hook delivery mode (the router push path delivers to it)' }, 400)
       return true
     }
     const claimed = claimPendingForAgent(name, INBOX_DRAIN_CAP)
@@ -1753,7 +1760,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     if (data.claudeMd !== undefined) atomicWriteFileSync(join(configRoot, 'CLAUDE.md'), data.claudeMd)
     if (data.soulMd !== undefined) atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), data.soulMd)
     if (data.mcpJson !== undefined) atomicWriteFileSync(join(agentDir(name), '.mcp.json'), data.mcpJson)
-    if (data.model !== undefined) writeAgentModel(name, data.model)
+    // writeModelFor: the MAIN agent's live model lives in the repo-root
+    // .claude/settings.json (read by channels.sh at launch), not in
+    // agents/<name>/agent-config.json -- writing the latter for the main
+    // agent was a silent no-op on the real session model.
+    if (data.model !== undefined) writeModelFor(name, data.model)
     if (data.authMode !== undefined) {
       writeAgentAuthMode(name, data.authMode)
       if (data.authMode === 'api' && typeof data.apiKey === 'string' && data.apiKey.trim()) {

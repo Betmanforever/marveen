@@ -77,6 +77,37 @@ export function writeAgentModel(name: string, model: string): void {
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
+// The MAIN agent's live model comes from the repo-root .claude/settings.json
+// `model` field (channels.sh passes it as --model at launch), NOT from
+// agents/<name>/agent-config.json like sub-agents. Writing the main agent's
+// model through writeAgentModel is a silent no-op on the real launch.
+const MAIN_SETTINGS_PATH = join(PROJECT_ROOT, '.claude', 'settings.json')
+
+export function readMainModel(): string {
+  try {
+    const cfg = JSON.parse(readFileSync(MAIN_SETTINGS_PATH, 'utf-8'))
+    return resolveModelId((cfg && typeof cfg.model === 'string' && cfg.model) || DEFAULT_MODEL)
+  } catch {
+    return DEFAULT_MODEL
+  }
+}
+
+export function writeMainModel(model: string): void {
+  let cfg: Record<string, unknown> = {}
+  try { cfg = JSON.parse(readFileSync(MAIN_SETTINGS_PATH, 'utf-8')) } catch {}
+  cfg.model = model
+  atomicWriteFileSync(MAIN_SETTINGS_PATH, JSON.stringify(cfg, null, 2))
+}
+
+export function readModelFor(name: string): string {
+  return name === MAIN_AGENT_ID ? readMainModel() : readAgentModel(name)
+}
+
+export function writeModelFor(name: string, model: string): void {
+  if (name === MAIN_AGENT_ID) writeMainModel(model)
+  else writeAgentModel(name, model)
+}
+
 export function readAgentDisplayName(name: string): string {
   const configPath = join(agentDir(name), 'agent-config.json')
   try {
