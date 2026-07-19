@@ -206,8 +206,15 @@ MCP_BATCH_ENV="export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false MCP_SERVER_CONN
 # built-in default, which can drift across versions. Passing the flag makes
 # the choice deterministic and visible in `ps`.
 MAIN_MODEL=""
-if [ -f "$INSTALL_DIR/.claude/settings.json" ] && command -v jq >/dev/null 2>&1; then
-  MAIN_MODEL="$(jq -r '.model // empty' "$INSTALL_DIR/.claude/settings.json" 2>/dev/null)"
+if [ -f "$INSTALL_DIR/.claude/settings.json" ]; then
+  # python3 fallback: jq is not guaranteed on the host (2026-07-19: missing on
+  # WSL install, so the flag silently never applied and the session ran on the
+  # built-in default). python3 is already a hard dependency of the hooks.
+  if command -v jq >/dev/null 2>&1; then
+    MAIN_MODEL="$(jq -r '.model // empty' "$INSTALL_DIR/.claude/settings.json" 2>/dev/null)"
+  else
+    MAIN_MODEL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model") or "")' "$INSTALL_DIR/.claude/settings.json" 2>/dev/null)"
+  fi
 fi
 MODEL_FLAG=""
 # Single-quote the model id so values like `claude-opus-4-8[1m]` survive the
