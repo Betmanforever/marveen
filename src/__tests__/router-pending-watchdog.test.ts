@@ -15,7 +15,7 @@
 // Both are pure, so unit-test them directly -- no tmux/db mocking needed.
 
 import { describe, it, expect } from 'vitest'
-import { decidePendingAgeAlert, decidePendingAgeRealert, decideCoordinatorNudge, shouldAlertStuckTarget } from '../web/message-router.js'
+import { decidePendingAgeAlert, decidePendingAgeRealert, decideCoordinatorNudge, shouldAlertStuckTarget, isTargetInBootGrace } from '../web/message-router.js'
 
 const THRESHOLD_MS = 3 * 60 * 1000 // 3 min
 const DEDUP_MS = 15 * 60 * 1000 // 15 min
@@ -151,5 +151,28 @@ describe('shouldAlertStuckTarget: busy-vs-wedged discrimination', () => {
     // Boundary-strict: exactly at the ceiling is still suppressed for busy.
     expect(shouldAlertStuckTarget('busy', false, CEILING_MS, CEILING_MS)).toBe(false)
     expect(shouldAlertStuckTarget('busy', false, CEILING_MS + 1, CEILING_MS)).toBe(true)
+  })
+})
+
+describe('isTargetInBootGrace: boot-window suppression (2026-07-22 14:59 false alarm)', () => {
+  const GRACE_MS = 5 * 60 * 1000
+
+  it('claims the grace for a freshly started target process', () => {
+    expect(isTargetInBootGrace(60_000, GRACE_MS)).toBe(true)
+    expect(isTargetInBootGrace(0, GRACE_MS)).toBe(true)
+  })
+
+  it('boundary-strict: exactly at the grace edge is out of grace', () => {
+    expect(isTargetInBootGrace(GRACE_MS, GRACE_MS)).toBe(false)
+    expect(isTargetInBootGrace(GRACE_MS - 1, GRACE_MS)).toBe(true)
+  })
+
+  it('an old process never claims the grace', () => {
+    expect(isTargetInBootGrace(60 * 60 * 1000, GRACE_MS)).toBe(false)
+  })
+
+  it('fail-open: unknown or negative process age never claims the grace', () => {
+    expect(isTargetInBootGrace(null, GRACE_MS)).toBe(false)
+    expect(isTargetInBootGrace(-1, GRACE_MS)).toBe(false)
   })
 })

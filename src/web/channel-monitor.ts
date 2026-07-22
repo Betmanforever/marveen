@@ -36,7 +36,7 @@ import {
   type StuckInputState, type StuckInputThresholds, type StuckInputAction,
   type StuckInputActionFacts,
 } from '../pane-state.js'
-import { decidePendingAgeAlert, decidePendingAgeRealert, shouldAlertStuckTarget } from './message-router.js'
+import { decidePendingAgeAlert, decidePendingAgeRealert, shouldAlertStuckTarget, isTargetInBootGrace } from './message-router.js'
 // The plan limit modal wears the same navigable-modal footer as a genuine
 // menu; the limit-banner detector tells the two apart so the menu-recovery
 // alert can name the real cause (see the blocking-menu pass below).
@@ -574,6 +574,26 @@ const PENDING_AGE_ALERT_HARD_CEILING_MS = 15 * 60 * 1000
 // via the shared pendingAgeLastAlertAt stamp, so it can never storm the tick.
 const PENDING_AGE_REALERT_CEILING_MS = 45 * 60 * 1000
 const PENDING_AGE_REALERT_DEDUP_MS = 5 * 60 * 1000
+// Boot-grace suppression (2026-07-22 14:59 false alarm, Gabor approval): a
+// target whose claude process started less than this long ago is booting, not
+// wedged -- its pending rows are normal recovery latency. Kept under the hard
+// ceiling so a boot that never completes still alerts.
+const PENDING_AGE_BOOT_GRACE_MS = 5 * 60 * 1000
+
+// Age of the session's pane-leader process (claude itself for agent panes).
+// null on any failure -- callers must fail-open (no boot-grace claimed).
+function paneProcessAgeMs(session: string): number | null {
+  try {
+    const panePid = execFileSync(TMUX, ['list-panes', '-t', session, '-F', '#{pane_pid}'], { timeout: 3000, encoding: 'utf-8' })
+      .split('\n')[0]?.trim()
+    if (!panePid || !/^\d+$/.test(panePid)) return null
+    const out = execFileSync('/bin/ps', ['-o', 'etimes=', '-p', panePid], { timeout: 3000, encoding: 'utf-8' }).trim()
+    const secs = parseInt(out, 10)
+    return Number.isFinite(secs) && secs >= 0 ? secs * 1000 : null
+  } catch {
+    return null
+  }
+}
 
 // The plan usage-limit dialog is a recurring special case: model-fallback
 // respawns the limited session, the respawn re-hits the same plan-wide limit
@@ -1987,23 +2007,29 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           .map((m) => ({ m, ageMs: nowMs - m.created_at * 1000 }))
           .filter((x) => x.ageMs > PENDING_AGE_ALERT_THRESHOLD_MS)
           .sort((a, b) => b.ageMs - a.ageMs)
-        const paneCache = new Map<string, { state: string | null; wedge: boolean }>()
-        const classifyTarget = (toAgent: string): { state: string | null; wedge: boolean } => {
+        const paneCache = new Map<string, { state: string | null; wedge: boolean; procAgeMs: number | null }>()
+        const classifyTarget = (toAgent: string): { state: string | null; wedge: boolean; procAgeMs: number | null } => {
           const session = toAgent === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(toAgent)
           const cached = paneCache.get(session)
           if (cached) return cached
           const pane = capturePane(session)
           const out = pane == null
-            ? { state: null, wedge: false } // unreadable -> fail-open (alerts)
+            ? { state: null, wedge: false, procAgeMs: null } // unreadable -> fail-open (alerts)
             : {
                 state: detectPaneState(pane),
                 wedge: parkedInputText(pane) != null || paneShowsContextLow(pane) || paneShowsContextSaturation(pane),
+                procAgeMs: paneProcessAgeMs(session),
               }
           paneCache.set(session, out)
           return out
         }
         const stuck = stuckAll.filter((x) => {
           const t = classifyTarget(x.m.to_agent)
+          // Boot-grace: a just-(re)started target holds its inbox while claude
+          // boots -- suppress like healthy-busy, but never past the hard
+          // ceiling and never over a wedge signal (2026-07-22 14:59 false alarm).
+          if (!t.wedge && x.ageMs <= PENDING_AGE_ALERT_HARD_CEILING_MS
+              && isTargetInBootGrace(t.procAgeMs, PENDING_AGE_BOOT_GRACE_MS)) return false
           return shouldAlertStuckTarget(t.state, t.wedge, x.ageMs, PENDING_AGE_ALERT_HARD_CEILING_MS)
         }).slice(0, 5)
         if (stuck.length === 0) {

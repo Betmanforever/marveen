@@ -5,6 +5,7 @@ import {
   getPendingMessages,
   markMessageDelivered,
   markMessageFailed,
+  expireStaleClaims,
 } from '../db.js'
 import { readAgentRemoteHost, readAgentVoiceConfig } from './agent-config.js'
 import {
@@ -19,6 +20,7 @@ import {
 } from './agent-process.js'
 import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
+import { getDeliveryMode, isPullModeAgent } from './delivery-config.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 
 // A message that cannot be delivered within this window (target session never
@@ -183,6 +185,22 @@ export function shouldAlertStuckTarget(
 }
 
 /**
+ * Pure decision: is the stuck message's TARGET inside its boot-grace window?
+ * A freshly (re)started agent legitimately holds its inbox for a few minutes
+ * while claude boots, MCP servers spawn and identity setup runs -- alerting on
+ * that pages the operator for normal recovery (2026-07-22 14:59: the 3-minute
+ * alert fired on #2039 while ive was mid-restart; the boot pane is neither
+ * 'busy' nor wedged, so busy-vs-wedged discrimination alone cannot save it).
+ * Suppression applies ONLY below the hard ceiling and without a wedge signal
+ * (the caller composes those); this owns only the process-age arithmetic.
+ * Fail-open: unknown process age (null) never claims the grace.
+ */
+export function isTargetInBootGrace(processAgeMs: number | null, graceMs: number): boolean {
+  if (processAgeMs === null) return false
+  return processAgeMs >= 0 && processAgeMs < graceMs
+}
+
+/**
  * Pure decision: should the router inject a self-poll nudge into the main
  * (coordinator) channels session? The main agent uses a PULL model -- it drains
  * its own inbox each turn -- so an IDLE coordinator can leave a message pending
@@ -208,6 +226,26 @@ export function decideCoordinatorNudge(
   return now - lastNudgeAt >= dedupMs
 }
 
+/**
+ * Pure decision: may the router send a WAKE nudge to a hook-mode sub-agent now?
+ * True iff no nudge has been sent to this agent yet (lastNudgeMs === null) OR at
+ * least `rateMs` has elapsed since the last one. This is the WHOLE rate limit --
+ * unlike decideCoordinatorNudge there is NO minimum message age: the point of a
+ * wake nudge is to start a turn on an IDLE hook agent promptly, so ANY pending
+ * message qualifies and the rate limit alone bounds how often we type.
+ *
+ * The per-agent-ness lives in the CALLER (a Map<agent, lastNudgeMs> keyed by the
+ * target), keeping this a trivially-testable scalar decision that mirrors the
+ * other decide* guards. A future-dated lastNudgeMs (clock skew / NTP correction)
+ * counts as "nudge now" rather than stalling on a negative delta, matching
+ * decideCoordinatorNudge et al.
+ */
+export function shouldNudge(lastNudgeMs: number | null, now: number, rateMs: number): boolean {
+  if (lastNudgeMs === null) return true
+  if (now < lastNudgeMs) return true
+  return now - lastNudgeMs >= rateMs
+}
+
 // Coordinator inbox self-poll (deliverable: pull-model backstop). The oldest
 // main-bound message must have waited this long before a nudge fires -- long
 // enough that a normal busy coordinator (which will drain on its next turn
@@ -231,6 +269,44 @@ const COORDINATOR_NUDGE_PROMPT =
 // Global (single main session) nudge throttle + reset flag. In-module so it
 // survives across ticks but resets on a dashboard restart.
 let lastCoordinatorNudgeMs: number | null = null
+
+// ---- hook-mode sub-agent wake nudge -----------------------------------------
+// An agent flipped to 'hook' delivery pulls its own inbox via a UserPromptSubmit
+// drain-hook that only fires at the START of a turn. An IDLE hook agent takes no
+// turns, so a pending message would starve until an organic turn (a scheduled
+// task, etc.). The router therefore WAKES it with a tiny content-free nudge: the
+// nudge starts a turn, and the drain-hook fires on that very prompt and prepends
+// the wrapped message into the same turn's context. The CONTENT never travels by
+// keystroke -- only this fixed nudge does -- so the parked-paste / wedge class
+// (large text via send-keys emulation) can never recur on the hook path.
+
+// At most one nudge per hook agent per this window while messages remain pending.
+// A nudge only has to START a turn (the drain-hook then claims the WHOLE inbox),
+// so one per minute bounds an idle agent's wake latency without keystroke-storming
+// a session. Shorter than the coordinator's 10min because a sub-agent wake is the
+// ONLY thing between a pending message and its drain -- the coordinator has other
+// organic turns that also drain it.
+export const HOOK_NUDGE_RATE_MS = 60 * 1000
+// Fixed, content-free one-line nudge. It MUST leak nothing if it lands in the
+// wrong pane: no message content, no sender, no ids -- only that "an inbox message
+// is waiting; the drain-hook will pull it". ASCII-only and short enough to render
+// as a SINGLE input row (~80 cols), for the same reason the coordinator nudge is
+// (a false-landed multi-row nudge parks and wedges; 2026-07-13 10:22 incident).
+export const HOOK_NUDGE_PROMPT =
+  '[inbox-nudge] Fuggo inter-agent uzenet var; a drain-hook behuzza.'
+// Per-hook-agent nudge throttle: last nudge time (ms) per target agent. In-module
+// so it survives across 5s ticks; the router is a SINGLETON loop (one interval,
+// re-entrancy-guarded) so a plain Map needs no locking. Forgetting it on a
+// dashboard restart is HARMLESS: worst case is ONE extra nudge just after restart
+// -- a content-free, idempotent prompt that only starts a turn -- never a lost or
+// doubled message, because the nudge never touches the agent_messages rows (the
+// drain claims them atomically).
+const hookNudgeLastMs: Map<string, number> = new Map()
+
+/** Test-only: clear the per-agent wake-nudge throttle so tests stay independent. */
+export function __resetHookNudgeStateForTest(): void {
+  hookNudgeLastMs.clear()
+}
 
 // Checks for pending messages every 5 seconds and injects them into target
 // agent tmux sessions.
@@ -258,6 +334,23 @@ export function startMessageRouter(): NodeJS.Timeout {
 // setInterval body so it can be exercised directly in unit tests (the
 // _tickRunning re-entrancy guard stays in startMessageRouter, around the call).
 export async function runMessageRouterTick(): Promise<void> {
+    // Expire stale inbox-drain claim leases FIRST, before this tick's pending
+    // scan: a message a lost drain left claimed-but-unacked is reset to 'pending'
+    // (delivered_at cleared, redeliveries++), so the normal path below (hook
+    // wake-nudge / legacy push) redelivers it this same tick -- no special
+    // redelivery code path. One UPDATE per tick; logged only when it resets rows.
+    // Epoch seconds (the lease unit), NOT the ms `now` used for ageMs below.
+    const staleExpired = expireStaleClaims(Math.floor(Date.now() / 1000))
+    if (staleExpired.length > 0) {
+      logger.warn(
+        {
+          ids: staleExpired.map((m) => m.id),
+          agents: [...new Set(staleExpired.map((m) => m.to_agent))],
+          redeliveries: staleExpired.map((m) => m.redeliveries),
+        },
+        'message-router: expired stale inbox-drain claim leases, redelivering',
+      )
+    }
     // Cap work per tick: process at most MAX_MESSAGES_PER_TICK messages, the
     // rest roll to the next 5s tick. Bounds a single tick's wall-time so a
     // backlog (e.g. after a delivery stall) can never make one tick run long
@@ -316,6 +409,96 @@ export async function runMessageRouterTick(): Promise<void> {
             }
           } catch (err) {
             logger.warn({ err, id: msg.id }, 'message-router: coordinator inbox nudge injection failed')
+          }
+        }
+        continue
+      }
+      // PULL MODEL for hook-delivery sub-agents -- the same contract as the main
+      // agent above. An agent flipped to 'hook' delivery CLAIMS its own inbox
+      // (POST /api/agents/:name/drain-inbox, driven by its UserPromptSubmit
+      // hook), so the router must NOT tmux-push the message CONTENT to it or the
+      // message DOUBLE-delivers -- exactly the race the main agent's pull model
+      // already avoids. The main agent was handled (and nudged) by the branch
+      // above, so every message reaching here targets a sub-agent; isPullModeAgent
+      // is therefore true iff that sub-agent is in 'hook' mode. It is the SINGLE
+      // SOURCE the drain-inbox route gate also calls, so the set the router does
+      // not content-push and the set drain ACCEPTS are provably identical -- no
+      // double-deliver, no black hole. FAIL-SAFE: getDeliveryMode is 'legacy' for
+      // every agent not explicitly flipped -- and for a missing/corrupt config --
+      // so for today's all-legacy fleet this branch never fires and delivery is
+      // byte-for-byte unchanged.
+      if (isPullModeAgent(msg.to_agent, MAIN_AGENT_ID, getDeliveryMode)) {
+        // WAKE NUDGE (not content delivery). The drain-hook fires only at the
+        // START of a turn, so an IDLE hook agent with no turns would leave this
+        // message pending until an organic turn -- unacceptable latency. Instead
+        // of pushing the CONTENT, send a tiny FIXED content-free nudge: it starts
+        // a turn, and the agent's UserPromptSubmit drain-hook then prepends the
+        // wrapped message into that same turn. This MIRRORS the main-agent
+        // coordinator nudge above (same sendPromptToSession primitive, same
+        // readiness gates), with three DELIBERATE differences documented inline:
+        //   (1) NO min-age gate -- the whole point is to wake a sleeping agent
+        //       promptly, so any pending message is enough; the 60s rate limit is
+        //       the only throttle (contrast COORDINATOR_NUDGE_MIN_AGE_MS).
+        //   (2) The nudge NEVER touches the agent_messages row -- no
+        //       markMessageDelivered/markMessageFailed here; the drain claims it
+        //       atomically, so a nudge that never lands only DELAYS, never loses
+        //       or doubles.
+        //   (3) NO janitor -- we never clear a hook agent's parked box for a
+        //       nudge (it may hold a real reply it is about to submit, and there
+        //       is nothing to unwedge FOR since the drain, not this send,
+        //       delivers the content).
+        const lastNudgeMs = hookNudgeLastMs.get(msg.to_agent) ?? null
+        if (shouldNudge(lastNudgeMs, now, HOOK_NUDGE_RATE_MS)) {
+          const nudgeSession = agentSessionName(msg.to_agent)
+          // Resolve the remote host so a laptop-resident hook agent's pane is
+          // probed/typed over ssh, exactly like the push path below.
+          const nudgeHost = readAgentRemoteHost(msg.to_agent)
+          // Cold-start hold is a LOCAL channel-plugin concern (remote agents skip
+          // it), mirroring the push path's `!host && channelColdStartHoldActive`.
+          const nudgeColdStart = !nudgeHost && channelColdStartHoldActive(msg.to_agent)
+          // Same readiness gates as the push path, in the same order, MINUS the
+          // janitor: never type into a busy/parked session (isSessionReadyForPrompt
+          // false -> skip, retry next window). A hook agent that is BUSY is already
+          // taking a turn, on which its drain-hook fires and claims the inbox --
+          // so a skipped nudge here is not a starved message.
+          if (
+            sessionExistsOnHost(nudgeHost, nudgeSession) &&
+            !nudgeColdStart &&
+            isSessionReadyForPrompt(nudgeSession, nudgeHost)
+          ) {
+            // Stamp the rate limiter NOW, before the send -- so the 60s window
+            // holds whether the send lands, gives up, or throws, AND a second
+            // pending message to this SAME agent later in THIS tick sees the fresh
+            // stamp and does not re-nudge. At most one nudge per agent per window.
+            hookNudgeLastMs.set(msg.to_agent, now)
+            try {
+              // waitForIdle:false mirrors the coordinator nudge: the readiness
+              // gate already confirmed idle, and a nudge must never block the tick
+              // waiting on a pane.
+              const nudgeResult = sendPromptToSession(nudgeSession, HOOK_NUDGE_PROMPT, nudgeHost, { waitForIdle: false })
+              if (nudgeResult === 'landed') {
+                // This log's TIMESTAMP is the 'wake' event for the plan's
+                // created->wake->claim latency breakdown; the fixed msg string
+                // 'Hook-mode wake nudge sent' makes it greppable, and `pending` is
+                // the count of this tick's pending messages for this agent.
+                const pendingForAgent = pending.filter((m) => m.to_agent === msg.to_agent).length
+                logger.info({ agent: msg.to_agent, pending: pendingForAgent }, 'Hook-mode wake nudge sent')
+              } else {
+                // gave-up: the box was not clean (a busy race after the readiness
+                // check, a permission dialog, or a bracketed-paste mutation). Do
+                // NOTHING special -- unlike the coordinator nudge we do NOT
+                // un-stamp to retry next tick; the rate limiter simply retries in
+                // the next 60s window. Harmless: the row is untouched (the drain
+                // still claims it), and a session busy enough to park the nudge is
+                // itself taking a turn, on which the drain-hook fires anyway.
+                logger.warn({ agent: msg.to_agent }, 'Hook-mode wake nudge gave up (input not clean); rate limiter retries next window')
+              }
+            } catch (err) {
+              // Send threw (pane vanished mid-stream, etc.). The stamp is already
+              // set, so the rate limiter still governs the retry; no row touch, no
+              // input clear -- the drain owns the message.
+              logger.warn({ err, agent: msg.to_agent }, 'Hook-mode wake nudge injection failed')
+            }
           }
         }
         continue
@@ -448,7 +631,13 @@ export async function runMessageRouterTick(): Promise<void> {
             logger.warn({ id: msg.id }, 'markMessageDelivered affected 0 rows (deleted concurrently?)')
           }
           routerLoggedMisses.delete(msg.id)
-          logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, category: isChannelInbound ? 'channel-inbound' : trusted ? 'trusted-peer' : 'untrusted' }, 'Agent message delivered')
+          // Phase-0 delivery instrumentation: log the created_at -> delivered_at
+          // latency (seconds) on the existing structured delivered line. Derived
+          // the same way the DB / metrics endpoint does (floor(now_sec) minus
+          // created_at, clamped at 0) so the two agree. Observability only --
+          // no routing behaviour changes.
+          const latencySec = Math.max(0, Math.floor(Date.now() / 1000) - msg.created_at)
+          logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, category: isChannelInbound ? 'channel-inbound' : trusted ? 'trusted-peer' : 'untrusted', latencySec }, 'Agent message delivered')
         } else {
           // 'gave-up': the submit-retry budget was spent with the text STILL
           // parked in the target input box (a [Pasted text #N] placeholder or a
