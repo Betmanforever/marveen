@@ -33,8 +33,10 @@ for skill_dir in "$SKILLS_DIR"/*/; do
     name=$(basename "$skill_dir")
   fi
 
-  # Extract description from frontmatter
-  desc=$(grep -m1 "^description:" "$skill_md" 2>/dev/null | sed 's/^description: *//' | tr -d '"' | tr -d "'" | cut -c1-120)
+  # Extract description from frontmatter. Truncate at a WORD BOUNDARY within
+  # 120 chars (+ ellipsis) so no index row ends mid-word (Gabor, 2026-07-22).
+  desc=$(grep -m1 "^description:" "$skill_md" 2>/dev/null | sed 's/^description: *//' | tr -d '"' | tr -d "'" \
+    | awk '{ if (length($0) <= 120) print; else { s = substr($0, 1, 120); sub(/ [^ ]*$/, "", s); print s "..." } }')
   if [ -z "$desc" ]; then
     desc="(nincs leírás)"
   fi
