@@ -4,8 +4,9 @@ import { homedir, platform, tmpdir } from 'node:os'
 import { execSync } from 'node:child_process'
 import { logger } from '../../logger.js'
 import { MAIN_AGENT_ID, BOT_NAME, PROJECT_ROOT } from '../../config.js'
-import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent } from '../../db.js'
+import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent, ackClaimedMessages, markMessageFailed } from '../../db.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../agent-message-wrap.js'
+import { buildDrainResponse, parseAckIds } from '../inbox-drain-response.js'
 import { getDeliveryMode, isPullModeAgent } from '../delivery-config.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
@@ -1541,14 +1542,34 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       return true
     }
     const claimed = claimPendingForAgent(name, INBOX_DRAIN_CAP)
-    const blocks: string[] = []
-    for (const msg of claimed) {
-      const cls = classifyAgentMessage(msg.from_agent, msg.to_agent)
-      if (!cls) continue // empty/invalid from_agent -> cannot frame safely; drop
-      const { prefix, wrapped } = wrapAgentMessageForDelivery(cls.category, cls.safeFrom, msg.from_agent, msg.content, msg.id)
-      blocks.push(prefix + wrapped)
-    }
-    json(res, { count: blocks.length, text: blocks.join('\n\n') })
+    const { count, ids, text, unframeableIds } = buildDrainResponse(claimed, classifyAgentMessage, wrapAgentMessageForDelivery)
+    // A claimed message whose from_agent cannot be safely framed is not shown --
+    // FAIL it (like the router does) so its claim lease cannot later expire and
+    // redeliver an un-frameable row forever.
+    for (const id of unframeableIds) markMessageFailed(id, 'Invalid or empty from_agent')
+    // `ids` are the claimed-and-shown message ids: the hook prints `text` into
+    // context, then POSTs them to /drain-ack to clear their lease (delivery
+    // final). An unacked lease is expired + redelivered by the router, so a lost
+    // response (the 8s-timeout silent-loss incident) redelivers, not vanishes.
+    json(res, { count, ids, text })
+    return true
+  }
+
+  // Inbox drain ACK: clear the claim lease of messages the drain hook has now
+  // printed into the agent's context, marking their delivery FINAL. WITHOUT an
+  // ack the lease expires and the message redelivers (the silent-loss fix).
+  // Bearer-only (the global /api gate); DELIBERATELY not gated by isPullModeAgent
+  // -- a delivery-mode flip between the claim and the ack must never orphan a
+  // lease. Input is validated (array of <=ACK_IDS_CAP integers) and the DB ack is
+  // scoped to to_agent, so a bad/foreign/duplicate id is a harmless no-op.
+  const drainAckMatch = path.match(/^\/api\/agents\/([^/]+)\/drain-ack$/)
+  if (drainAckMatch && method === 'POST') {
+    const name = decodeURIComponent(drainAckMatch[1])
+    let body: unknown = null
+    try { body = JSON.parse((await readBody(req)).toString() || '{}') } catch { body = null }
+    const parsed = parseAckIds(body)
+    if (!parsed.ok) { json(res, { error: parsed.error }, 400); return true }
+    json(res, { acked: ackClaimedMessages(name, parsed.ids) })
     return true
   }
 

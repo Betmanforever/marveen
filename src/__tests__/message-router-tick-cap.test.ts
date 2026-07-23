@@ -22,14 +22,22 @@ vi.mock('../logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }))
 
+// STORE_DIR is needed because message-router now imports delivery-config (the
+// pull/push gate), which reads `join(STORE_DIR, 'agent-delivery-config.json')`
+// at module load. Point it at a sentinel path with no config file so the
+// fail-safe resolves 'dex' to 'legacy' -> NOT pull-mode -> it stays on the
+// tmux push path this test exercises (getDeliveryMode never sees a 'hook' flag).
 vi.mock('../config.js', () => ({
   MAIN_AGENT_ID: 'orin',
+  STORE_DIR: '/tmp/marveen-router-tick-cap-no-store',
 }))
 
 vi.mock('../db.js', () => ({
   getPendingMessages: () => mockGetPendingMessages(),
   markMessageDelivered: (...a: unknown[]) => mockMarkDelivered(...a),
   markMessageFailed: (...a: unknown[]) => mockMarkFailed(...a),
+  // The tick expires stale claim leases first; no lease exists in this suite.
+  expireStaleClaims: () => [],
 }))
 
 vi.mock('../web/voice-directive.js', () => ({

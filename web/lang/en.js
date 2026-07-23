@@ -89,6 +89,7 @@ window._i18n.en = {
   'nav.ideas':        'Ideas',
   'nav.updates':      'Updates',
   'nav.costs':        'Costs',
+  'nav.delivery':     'Delivery',
 
   // --- Overview ---
   'overview.card.team_meta':     'live status',
@@ -525,6 +526,21 @@ window._i18n.en = {
   'status.comp.partial_outage':  'partial outage',
   'status.comp.major_outage':    'major outage',
   'status.comp.maintenance':     'under maintenance',
+
+  // --- Delivery metrics (inter-agent reliability, Phase 0) ---
+  'delivery.page_title':         'Delivery',
+  'delivery.page_subtitle':      'Inter-agent delivery latency and mode (last 7 days)',
+  'delivery.loading':            'Loading...',
+  'delivery.load_failed':        'Failed to load delivery metrics.',
+  'delivery.empty':              'No delivery data in the selected window.',
+  'delivery.window_note':        'Deliveries over the last {days} days (created_at → delivered_at latency).',
+  'delivery.col.agent':          'Target agent',
+  'delivery.col.mode':           'Mode',
+  'delivery.col.count':          'Delivered',
+  'delivery.col.p50':            'p50',
+  'delivery.col.p95':            'p95',
+  'delivery.col.max':            'Max',
+  'delivery.col.pending':        'Pending',
 
   // --- Costs (CostOps v0.1, PR #524) ---
   'costs.page_title':            'Costs',

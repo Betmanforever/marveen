@@ -19,6 +19,7 @@
       "Bash(cat:*)",
       "Bash(pwd:*)",
       "Bash(curl:*)",
+      "Read(${INSTALL_DIR}/scripts/agent-wrappers/**)",
       "Bash(bash ${INSTALL_DIR}/scripts/skill-index.sh)",
       "WebFetch(*)",
       "WebSearch(*)",

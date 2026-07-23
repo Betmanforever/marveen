@@ -287,6 +287,7 @@ function switchPage(pageId) {
   if (pageId === 'messages') loadMessagesPage()
   if (pageId === 'tokenUsage') loadTokenUsage()
   if (pageId === 'costs') loadCosts()
+  if (pageId === 'delivery') loadDelivery()
   if (pageId === 'ideas') loadIdeasPage()
   if (pageId === 'archived') loadArchivedPage()
   if (pageId === 'naplo') loadNaplo()
@@ -333,6 +334,7 @@ const NAV_I18N = {
   docs: 'nav.docs', status: 'nav.status', autonomy: 'nav.autonomy',
   settings: 'nav.settings', vault: 'nav.vault', tokenUsage: 'nav.tokenUsage',
   ideas: 'nav.ideas', updates: 'nav.updates', costs: 'nav.costs',
+  delivery: 'nav.delivery',
 }
 
 function renderNav() {
@@ -376,6 +378,7 @@ const PAGE_HEADER_I18N = {
   updatesPage:    { title: 'updates.page_title',     sub: null },
   naploPage:      { title: 'naplo.page_title',       sub: 'naplo.page_subtitle' },
   costsPage:      { title: 'costs.page_title',       sub: 'costs.page_subtitle' },
+  deliveryPage:   { title: 'delivery.page_title',    sub: 'delivery.page_subtitle' },
 }
 
 function renderStaticI18n() {
@@ -8915,6 +8918,61 @@ async function loadCosts() {
     el.innerHTML = html
   } catch (err) {
     el.innerHTML = `<div style="${mutedStyle}">${t('costs.load_failed')}</div>`
+  }
+}
+
+// ============================================================
+// === Delivery metrics (inter-agent reliability, Phase 0) ===
+// ============================================================
+
+document.getElementById('refreshDeliveryBtn').addEventListener('click', loadDelivery)
+
+async function loadDelivery() {
+  const el = document.getElementById('deliveryContent')
+  const mutedStyle = 'color:var(--text-muted);font-size:13px'
+  el.innerHTML = `<div style="${mutedStyle}">${t('delivery.loading')}</div>`
+  try {
+    const res = await fetch('/api/metrics/delivery')
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.error || 'request failed')
+
+    const fmtLat = (n) => (n == null ? '—' : n.toLocaleString('hu-HU') + ' s')
+    const agents = Array.isArray(data.agents) ? data.agents : []
+
+    let html = `<p style="${mutedStyle};margin-bottom:12px">${t('delivery.window_note', { days: data.window_days ?? 7 })}</p>`
+
+    if (agents.length === 0) {
+      html += `<div style="${mutedStyle}">${t('delivery.empty')}</div>`
+    } else {
+      html += `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
+        <thead><tr style="text-align:left;border-bottom:1px solid var(--border,#333)">
+          <th style="padding:6px 8px">${t('delivery.col.agent')}</th>
+          <th style="padding:6px 8px">${t('delivery.col.mode')}</th>
+          <th style="padding:6px 8px">${t('delivery.col.count')}</th>
+          <th style="padding:6px 8px">${t('delivery.col.p50')}</th>
+          <th style="padding:6px 8px">${t('delivery.col.p95')}</th>
+          <th style="padding:6px 8px">${t('delivery.col.max')}</th>
+          <th style="padding:6px 8px">${t('delivery.col.pending')}</th>
+        </tr></thead>
+        <tbody>${agents.map((a) => {
+          const modeColor = a.delivery_mode === 'hook' ? 'var(--accent,#3b82f6)' : 'var(--text-muted)'
+          const pendColor = (a.pending_now > 0) ? 'var(--warn,#e0a800)' : 'var(--text-muted)'
+          return `<tr style="border-bottom:1px solid var(--border,#222)">
+            <td style="padding:6px 8px">${escapeHtml(a.to_agent)}</td>
+            <td style="padding:6px 8px;color:${modeColor}">${escapeHtml(a.delivery_mode)}</td>
+            <td style="padding:6px 8px">${a.count}</td>
+            <td style="padding:6px 8px">${fmtLat(a.p50_latency_sec)}</td>
+            <td style="padding:6px 8px">${fmtLat(a.p95_latency_sec)}</td>
+            <td style="padding:6px 8px">${fmtLat(a.max_latency_sec)}</td>
+            <td style="padding:6px 8px;color:${pendColor}">${a.pending_now}</td>
+          </tr>`
+        }).join('')}</tbody>
+      </table></div>`
+    }
+
+    el.innerHTML = html
+  } catch (err) {
+    el.innerHTML = `<div style="${mutedStyle}">${t('delivery.load_failed')}</div>`
   }
 }
 

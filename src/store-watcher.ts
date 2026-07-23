@@ -18,6 +18,7 @@ const SYSTEM_FILES = new Set([
   'config-overrides.json', 'dashboard-settings.json',
   // Fleet and agent management
   'agents-desired.json', 'auto-restart.json', 'autonomy-config.json',
+  'agent-delivery-config.json',
   // Auth and secrets
   '.dashboard-token', '.vault-key', 'vault.json', '.claude-oauth-token',
   // Usage and keepalive

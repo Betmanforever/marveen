@@ -443,6 +443,16 @@ export function initDatabase(dbPathOverride?: string): void {
     )
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_messages_status ON agent_messages(status, to_agent)`)
+  // Migration: claim-lease + redelivery bookkeeping (silent-loss fix, 2026-07-19
+  // incident msg#1791). A pull-model drain CLAIMS a message (status='delivered')
+  // BEFORE the HTTP response is written; when the client hook's 8s timeout
+  // expired mid-response the content never reached the agent but the row read
+  // delivered. claim_lease_until stamps a deadline the claim must be ACKed
+  // before; an unacked lease is expired back to 'pending' (redeliveries++) so a
+  // lost drain redelivers instead of vanishing. Both columns nullable/defaulted
+  // -> the ALTER is backward compatible with existing rows.
+  try { db.exec('ALTER TABLE agent_messages ADD COLUMN claim_lease_until INTEGER') } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE agent_messages ADD COLUMN redeliveries INTEGER NOT NULL DEFAULT 0') } catch { /* already exists */ }
 
   // --- Pending Channel Requests (Slack channel opt-in workflow) ---
   db.exec(`
@@ -1725,6 +1735,11 @@ export interface AgentMessage {
   created_at: number
   delivered_at: number | null
   completed_at: number | null
+  // Deadline (epoch sec) by which a claimed message must be ACKed; NULL means no
+  // outstanding claim (never claimed, ACKed, or delivered by the legacy router).
+  claim_lease_until: number | null
+  // How many times a claim lease expired unacked and the message was redelivered.
+  redeliveries: number
 }
 
 export function createAgentMessage(from: string, to: string, content: string): AgentMessage {
@@ -1736,6 +1751,7 @@ export function createAgentMessage(from: string, to: string, content: string): A
     id: Number(info.lastInsertRowid),
     from_agent: from, to_agent: to, content, status: 'pending',
     result: null, created_at: now, delivered_at: null, completed_at: null,
+    claim_lease_until: null, redeliveries: 0,
   }
 }
 
@@ -1753,6 +1769,12 @@ export function markMessageDelivered(id: number): boolean {
   return db.prepare("UPDATE agent_messages SET status = 'delivered', delivered_at = ? WHERE id = ?").run(now, id).changes > 0
 }
 
+// Claim lease: a claimed-but-unacked message is redelivered after this many
+// seconds. MUST comfortably exceed the drain hook's 8s client timeout so a
+// normal (successful but slow) drain+ack is never mistaken for a lost one; the
+// router's per-tick expiry then reclaims a genuinely lost claim within one lease.
+export const LEASE_SEC = 60
+
 // Atomically CLAIM (pending -> delivered) the oldest `limit` pending messages
 // for an agent, returning the claimed rows. A SINGLE `UPDATE ... WHERE
 // status='pending' RETURNING` (NOT a SELECT-then-UPDATE) so two concurrent
@@ -1760,21 +1782,60 @@ export function markMessageDelivered(id: number): boolean {
 // Backs the main-agent inbox PULL model: the main agent drains its own inbox at
 // each turn (via the drain-inbox endpoint + UserPromptSubmit hook) instead of
 // the router tmux-injecting into its perpetually-busy channel session.
+// The claim stamps claim_lease_until = now + LEASE_SEC: the delivery is only
+// FINAL once the hook ACKs (clearing the lease); an unacked lease is expired
+// back to 'pending' by expireStaleClaims, so a drain whose response was lost to
+// the hook's timeout redelivers instead of vanishing.
 export function claimPendingForAgent(toAgent: string, limit: number): AgentMessage[] {
   const now = Math.floor(Date.now() / 1000)
   const rows = db.prepare(
-    `UPDATE agent_messages SET status = 'delivered', delivered_at = ?
+    `UPDATE agent_messages SET status = 'delivered', delivered_at = ?, claim_lease_until = ?
        WHERE id IN (
          SELECT id FROM agent_messages
          WHERE to_agent = ? AND status = 'pending'
          ORDER BY created_at ASC, id ASC
          LIMIT ?
        )
-     RETURNING id, from_agent, to_agent, content, status, result, created_at, delivered_at, completed_at`,
-  ).all(now, toAgent, limit) as AgentMessage[]
+     RETURNING id, from_agent, to_agent, content, status, result, created_at, delivered_at, completed_at, claim_lease_until, redeliveries`,
+  ).all(now, now + LEASE_SEC, toAgent, limit) as AgentMessage[]
   // RETURNING row order is unspecified; restore FIFO (created_at, then id as the
   // tiebreaker for same-second inserts) for delivery.
   return rows.sort((a, b) => (a.created_at - b.created_at) || (a.id - b.id))
+}
+
+// ACK claimed messages: clear their lease so they are no longer redelivered.
+// The drain hook calls this AFTER it prints the claimed content into the agent's
+// context, marking the delivery FINAL. Scoped to to_agent + status='delivered'
+// so acking an already-acked, unknown, or ANOTHER agent's id is a no-op
+// (idempotent). Returns the number of rows whose lease was actually cleared.
+// The caller (the ack route) caps the id count; a bounded IN-list stays well
+// under SQLite's bound-parameter limit.
+export function ackClaimedMessages(toAgent: string, ids: number[]): number {
+  if (ids.length === 0) return 0
+  const placeholders = ids.map(() => '?').join(',')
+  return db.prepare(
+    `UPDATE agent_messages SET claim_lease_until = NULL
+       WHERE id IN (${placeholders}) AND to_agent = ? AND status = 'delivered'`,
+  ).run(...ids, toAgent).changes
+}
+
+// Expire stale claim leases: a claimed message whose lease deadline passed
+// WITHOUT an ack never reached the agent's context (the drain hook's timeout
+// expired mid-response, or the ack was lost). Reset it to 'pending' so the
+// normal delivery path redelivers it, NULL its delivered_at (so the eventual
+// successful delivery measures true latency, not the failed attempt's -- the
+// delivery metrics read delivered_at), clear the lease, and count the
+// redelivery. Only leased 'delivered' rows are touched: an ACKed row and a
+// legacy/router-delivered row both carry a NULL lease and are invisible here.
+// `now` (epoch sec) is injected so the caller owns the clock (testable). The
+// UPDATE ... RETURNING lets the caller log exactly what it redelivered.
+export function expireStaleClaims(now: number): AgentMessage[] {
+  return db.prepare(
+    `UPDATE agent_messages
+        SET status = 'pending', delivered_at = NULL, claim_lease_until = NULL, redeliveries = redeliveries + 1
+      WHERE status = 'delivered' AND claim_lease_until IS NOT NULL AND claim_lease_until < ?
+    RETURNING id, from_agent, to_agent, content, status, result, created_at, delivered_at, completed_at, claim_lease_until, redeliveries`,
+  ).all(now) as AgentMessage[]
 }
 
 export function markMessageDone(id: number, result?: string): boolean {
@@ -1789,6 +1850,41 @@ export function markMessageFailed(id: number, error?: string): boolean {
 
 export function listAgentMessages(limit = 50): AgentMessage[] {
   return db.prepare('SELECT * FROM agent_messages ORDER BY created_at DESC LIMIT ?').all(limit) as AgentMessage[]
+}
+
+// --- Inter-agent delivery metrics (reliability plan, Phase 0) ---
+// Read-only. Delivery latency is derived from the EXISTING created_at /
+// delivered_at columns (both integer epoch seconds) -- no schema change. A row
+// counts as delivered iff delivered_at IS NOT NULL, which correctly includes
+// rows later advanced to 'done' (they kept their delivered_at) and excludes
+// 'failed'/abandoned rows (which never got a delivered_at). Window is anchored
+// on delivered_at so a message that finally lands after a long stall shows up in
+// the recent stats it belongs to.
+export interface DeliveredLatencyRow {
+  to_agent: string
+  latency_sec: number
+}
+
+export function getDeliveredLatenciesSince(cutoffEpochSec: number): DeliveredLatencyRow[] {
+  return db.prepare(
+    `SELECT to_agent, (delivered_at - created_at) AS latency_sec
+       FROM agent_messages
+      WHERE delivered_at IS NOT NULL AND delivered_at >= ?`,
+  ).all(cutoffEpochSec) as DeliveredLatencyRow[]
+}
+
+export interface PendingCountRow {
+  to_agent: string
+  count: number
+}
+
+export function getPendingCountsByAgent(): PendingCountRow[] {
+  return db.prepare(
+    `SELECT to_agent, COUNT(*) AS count
+       FROM agent_messages
+      WHERE status = 'pending'
+      GROUP BY to_agent`,
+  ).all() as PendingCountRow[]
 }
 
 // System/automation participants that are not real conversation peers. They are

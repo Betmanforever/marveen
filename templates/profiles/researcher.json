@@ -18,6 +18,7 @@
       "Bash(ls:*)",
       "Bash(date:*)",
       "Bash(mkdir:*)",
+      "Read(${INSTALL_DIR}/scripts/agent-wrappers/**)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/check-allowlist.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/memo.sh:*)",
       "Bash(${INSTALL_DIR}/scripts/agent-wrappers/msg-wolfe.sh:*)",

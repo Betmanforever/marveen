@@ -89,6 +89,7 @@ window._i18n.hu = {
   'nav.ideas':        'Ötletláda',
   'nav.updates':      'Frissítések',
   'nav.costs':        'Költségek',
+  'nav.delivery':     'Delivery',
 
   // --- Overview ---
   'overview.card.team_meta':     'élő állapot',
@@ -787,6 +788,21 @@ window._i18n.hu = {
   'status.comp.partial_outage':  'részleges kimaradás',
   'status.comp.major_outage':    'kimaradás',
   'status.comp.maintenance':     'karbantartás',
+
+  // --- Delivery metrics (inter-agent reliability, Phase 0) ---
+  'delivery.page_title':         'Delivery',
+  'delivery.page_subtitle':      'Ágensek közti kézbesítési latencia és mód (elmúlt 7 nap)',
+  'delivery.loading':            'Betöltés...',
+  'delivery.load_failed':        'Nem sikerült betölteni a kézbesítési metrikákat.',
+  'delivery.empty':              'Nincs kézbesítési adat a kiválasztott időszakban.',
+  'delivery.window_note':        'Elmúlt {days} nap kézbesítései (created_at → delivered_at latencia).',
+  'delivery.col.agent':          'Célágens',
+  'delivery.col.mode':           'Mód',
+  'delivery.col.count':          'Kézbesítve',
+  'delivery.col.p50':            'p50',
+  'delivery.col.p95':            'p95',
+  'delivery.col.max':            'Max',
+  'delivery.col.pending':        'Függőben',
 
   // --- Costs (CostOps v0.1, PR #524) ---
   'costs.page_title':            'Költségek',
