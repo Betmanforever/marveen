@@ -1,5 +1,6 @@
 {
   "model": "claude-sonnet-5",
+  "effortLevel": "xhigh",
   "permissions": {
     "allow": [
       "Write(//home/szabgabor/.claude/skills/**)",

@@ -237,6 +237,22 @@ def fetch_git(monday: dt.date, sunday: dt.date) -> dict:
     return git
 
 
+def fetch_site_monitoring(week_id: str) -> dict:
+    """Uptime/latency/incident stats from site-monitor-stats.py (kanban #8fc05c73).
+
+    Additive section: any failure (missing script, no data yet) degrades to an
+    empty dict so the rest of the extraction is never blocked by monitoring.
+    """
+    try:
+        out = subprocess.run(
+            [sys.executable, f"{REPO}/scripts/site-monitor-stats.py", "--week", week_id, "--json"],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        return json.loads(out.stdout)
+    except Exception:
+        return {}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--week", help="ISO week like 2026-W27 (default: auto)")
@@ -248,6 +264,7 @@ def main() -> int:
     friction = friction_tracking(mems)
     fallback = model_fallback_events(monday, sunday)
     skool = fetch_skool_activity(monday, sunday)
+    site_monitoring = fetch_site_monitoring(week_id)
 
     result = {
         "week": week_id,
@@ -270,6 +287,7 @@ def main() -> int:
         "agent_friction": friction,
         "model_fallback": fallback,
         "skool_activity": skool,
+        "site_monitoring": site_monitoring,
     }
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
     return 0
