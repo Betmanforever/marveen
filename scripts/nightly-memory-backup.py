@@ -143,6 +143,23 @@ HARD_DENY_DIRS = (f"{REPO}/store", f"{HOME}/.gmail-mcp", f"{HOME}/.claude/channe
 
 PRUNE_DIRS = ("node_modules",)
 
+# Card ae9f746a: the projects/ tree (the fleet's deliverables) joins the
+# nightly export, minus everything regenerable. Only the exact names below are
+# dependency dirs -- "deploy-dist" is live zenom site output and MUST stay in.
+PROJECTS_ROOT = f"{REPO}/projects"
+PROJECTS_DEP_DIRS = ("node_modules", "venv", "dist", "build", ".next",
+                     "__pycache__", ".cache", ".parcel-cache")
+# Any directory named ".venv*" is also pruned (.venv, .venv-crossval, ...).
+
+# Pending Gabor decision (card ae9f746a): whether these three may go offsite
+# at all. Until he decides, they are EXCLUDED from discovery entirely. When
+# the decision lands, remove the entry here and run --update-baseline.
+PROJECTS_PENDING_GABOR = (
+    f"{PROJECTS_ROOT}/zenom/confidential",
+    f"{PROJECTS_ROOT}/zenom/szamlak",
+    f"{PROJECTS_ROOT}/legal-share-exit",
+)
+
 
 class BackupError(Exception):
     """Controlled failure: alert, exit non-zero, upload nothing."""
@@ -400,6 +417,25 @@ def d_self_script():
     ])
 
 
+def d_projects():
+    """Fleet deliverables (card ae9f746a): projects/ minus dependency trees,
+    minus the three directories pending Gabor's explicit decision. The
+    payload-wide secret scan and DENY_NAMES cover this tree like every other
+    category; the pre-wiring sweep (2026-07-30) found zero value-shaped hits."""
+    out = []
+    pending = tuple(os.path.realpath(p) for p in PROJECTS_PENDING_GABOR)
+    if not os.path.isdir(PROJECTS_ROOT):
+        return out
+    for dirpath, dirnames, filenames in os.walk(PROJECTS_ROOT, followlinks=False):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in PROJECTS_DEP_DIRS and not d.startswith(".venv")
+            and os.path.realpath(os.path.join(dirpath, d)) not in pending)
+        for name in sorted(filenames):
+            out.append(os.path.join(dirpath, name))
+    return out
+
+
 CATEGORIES = (
     ("identity", d_identity),
     ("neo_file_memory", d_neo_file_memory),
@@ -412,6 +448,7 @@ CATEGORIES = (
     ("slash_commands", d_slash_commands),
     ("scheduled_tasks", d_scheduled_tasks),
     ("mcp_config", d_mcp_config),
+    ("projects", d_projects),
     ("baseline_state", d_baseline_state),
     ("self_script", d_self_script),
 )

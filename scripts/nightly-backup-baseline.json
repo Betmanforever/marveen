@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "created_at": "2026-07-25T15:39:01",
+  "created_at": "2026-07-30T15:24:29",
   "created_by": "scripts/nightly-memory-backup.py --update-baseline",
-  "previous_created_at": "2026-07-25T15:32:05",
+  "previous_created_at": "2026-07-25T15:39:01",
   "note": "Kategoriankenti nem-ures assertion bazisvonala (plan C1/D4/23). A nightly script SOHA nem irja ezt a fajlt magatol: ha hianyzik, leall es riaszt. Csak tudatos, emberi/agent dontessel frissul. files>0 baseline mellett a 0 fajl hard stop; bytes>0 mellett a 0 bajt hard stop; a bytes==0 kategoriak ('0 is OK' placeholderek) novekedese figyelmeztetes, ami ezt a fajlt frissitendove teszi.",
   "categories": {
     "identity": {
@@ -10,52 +10,56 @@
       "bytes": 138236
     },
     "neo_file_memory": {
-      "files": 3,
-      "bytes": 2542
+      "files": 5,
+      "bytes": 5149
     },
     "agent_memory_placeholder": {
       "files": 3,
       "bytes": 0
     },
     "mrwolfe_home_memory": {
-      "files": 40,
-      "bytes": 121896
+      "files": 61,
+      "bytes": 178846
     },
     "repo_agent_memory": {
-      "files": 47,
-      "bytes": 144542
+      "files": 54,
+      "bytes": 185028
     },
     "scattered_memory_dirs": {
-      "files": 71,
-      "bytes": 184522
+      "files": 89,
+      "bytes": 247511
     },
     "skills": {
-      "files": 148,
-      "bytes": 1825112
+      "files": 182,
+      "bytes": 2574746
     },
     "subagent_defs": {
       "files": 4,
-      "bytes": 34371
+      "bytes": 34933
     },
     "slash_commands": {
       "files": 2,
       "bytes": 2226
     },
     "scheduled_tasks": {
-      "files": 45,
-      "bytes": 59690
+      "files": 52,
+      "bytes": 73404
     },
     "mcp_config": {
       "files": 5,
-      "bytes": 11680
+      "bytes": 11745
+    },
+    "projects": {
+      "files": 1217,
+      "bytes": 155915327
     },
     "baseline_state": {
       "files": 1,
-      "bytes": 2522
+      "bytes": 2593
     },
     "self_script": {
       "files": 3,
-      "bytes": 61496
+      "bytes": 64193
     }
   },
   "db_tables": [
@@ -96,12 +100,12 @@
     "vault_ssh_servers"
   ],
   "db_row_counts": {
-    "memories": 687,
-    "daily_logs": 335,
-    "kanban_cards": 136,
-    "kanban_comments": 510,
+    "memories": 900,
+    "daily_logs": 506,
+    "kanban_cards": 157,
+    "kanban_comments": 643,
     "kanban_card_labels": 0,
     "labels": 0,
-    "config_change_log": 41
+    "config_change_log": 43
   }
 }
