@@ -159,7 +159,15 @@ def model_log_entries(agent):
     """config_change_log rows that legitimize a model change for this agent.
     Key styles in the wild: agent_model:<a>, agent.<a>.model,
     agent_model_dialog:<a>; mr-wolfe's main model may also be logged as
-    agent_model:mr-wolfe."""
+    agent_model:mr-wolfe.
+
+    LOAD-BEARING CONVENTION -- do not "fix" it: for RECONSTRUCTED (backfilled)
+    entries the created_at is the MEASURED session-boundary time, NOT the time
+    the row was written (provenance lives in the value text instead; see
+    entries 45-47). This is what makes the grace-window match below work for
+    backfills. Rewriting created_at to the write time would silently re-open
+    every backfilled boundary as an "unlogged switch" and the detector would
+    re-alert on already-explained history."""
     rows = con.execute(
         "SELECT key, created_at FROM config_change_log WHERE key LIKE '%model%'",
     ).fetchall()
