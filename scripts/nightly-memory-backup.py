@@ -93,8 +93,12 @@ DRIVE_UPLOAD = f"{REPO}/scripts/google-mcp/drive-upload.py"
 # rule 2 ("never write to My Drive") for this single target (plan 3, v6).
 DRIVE_FOLDER_ID_DEFAULT = "1oNq21oKw7Bs6ww9Z0aUbS1FAqK9KlAez"
 
-KEEP_DAILY = 14
-KEEP_WEEKLY = 8
+# Retention (Gabor's rule, 2026-07-30, wolfe msg 3142): 7 daily saves PLUS
+# the 1st-of-month save of the previous 3 months = 10 snapshots covering the
+# running month plus 3 months. Replaces the old 14-daily + Monday-weekly
+# ladder; legacy weekly/ folders are left untouched (not pruned, not grown).
+KEEP_DAILY = 7
+KEEP_MONTHLY = 3
 QUOTA_MAX_USED_RATIO = 0.90
 QUOTA_HEADROOM = 30 * 1024 * 1024
 
@@ -151,12 +155,15 @@ PROJECTS_DEP_DIRS = ("node_modules", "venv", "dist", "build", ".next",
                      "__pycache__", ".cache", ".parcel-cache")
 # Any directory named ".venv*" is also pruned (.venv, .venv-crossval, ...).
 
-# Pending Gabor decision (card ae9f746a): whether these three may go offsite
-# at all. Until he decides, they are EXCLUDED from discovery entirely. When
-# the decision lands, remove the entry here and run --update-baseline.
+# Pending Gabor decision (card ae9f746a): whether these may go offsite at
+# all. Until he decides, they are EXCLUDED from discovery entirely. When a
+# decision lands, remove the entry here and run --update-baseline.
+# 2026-07-30 (wolfe msg 3142): zenom/szamlak REMOVED from this list on
+# Gabor's explicit decision -- invoices are ORIGINALS he is legally required
+# to keep available for tax audit, so they are backed up. confidential and
+# legal-share-exit remain excluded, he has not ruled on those.
 PROJECTS_PENDING_GABOR = (
     f"{PROJECTS_ROOT}/zenom/confidential",
-    f"{PROJECTS_ROOT}/zenom/szamlak",
     f"{PROJECTS_ROOT}/legal-share-exit",
 )
 
@@ -195,14 +202,14 @@ def drive_folder_id():
             or DRIVE_FOLDER_ID_DEFAULT)
 
 
-def is_weekly_run(when):
-    """Monday promotes the night to weekly/ -- `date +%u` == 1, nothing else.
+def is_monthly_run(when):
+    """The 1st of the month promotes the night to monthly/ -- day == 1,
+    nothing else.
 
-    Deterministic on purpose (plan 4): "the week's first run" would silently
-    slide to Tuesday after a Monday outage and quietly break the retention
-    ladder.
+    Deterministic on purpose (plan 4): "the month's first run" would silently
+    slide to the 2nd after an outage and quietly break the retention ladder.
     """
-    return when.isoweekday() == 1
+    return when.day == 1
 
 
 def under(path, parent):
@@ -849,8 +856,9 @@ def prune_drive_tier(token, root_folder_id, tier, keep, expected_stamp):
         refuses to prune unless expected_stamp (tonight's / the tier's newest
         expected folder) is PRESENT in the listing -- if the listing cannot
         see the fresh folder, deleting by that same listing is not safe;
-      - tiers are pruned independently inside their own daily/ and weekly/
-        folders, so the daily rule can never touch a weekly promotion;
+      - tiers are pruned independently inside their own daily/ and monthly/
+        folders, so the daily rule can never touch a monthly promotion
+        (legacy weekly/ folders are ignored entirely);
       - only folders whose name matches the STAMP pattern are candidates --
         anything hand-created in the backup tree is left alone;
       - sorted newest-first and only entries beyond `keep` are removed, so a
@@ -912,7 +920,7 @@ def prune_tier(tier, keep):
 def run_nightly(dry_run):
     started = datetime.now()
     stamp = started.strftime("%Y%m%d-%H%M%S")
-    tier = "weekly" if is_weekly_run(started) else "daily"
+    tier = "monthly" if is_monthly_run(started) else "daily"
     archive_name = f"marveen-memory-{stamp}.tar.gz"
     folder_id = drive_folder_id()
 
@@ -1053,15 +1061,15 @@ def run_nightly(dry_run):
     shutil.move(night_dir, final_dir)
     shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
     pruned_daily = prune_tier("daily", KEEP_DAILY)
-    pruned_weekly = prune_tier("weekly", KEEP_WEEKLY)
+    pruned_monthly = prune_tier("monthly", KEEP_MONTHLY)
     shutil.rmtree(WORK_DIR, ignore_errors=True)
-    log(f"lokalis prune: daily -{len(pruned_daily)}, weekly -{len(pruned_weekly)}")
+    log(f"lokalis prune: daily -{len(pruned_daily)}, monthly -{len(pruned_monthly)}")
 
     # Drive-side retention (card b2daf2c8): only the tier we just uploaded to,
     # so the presence guard (tonight's stamp must be visible) always applies.
     drive_prune_note = prune_drive_tier(
         drive_access_token(), folder_id, tier,
-        KEEP_DAILY if tier == "daily" else KEEP_WEEKLY, stamp)
+        KEEP_DAILY if tier == "daily" else KEEP_MONTHLY, stamp)
     log(f"Drive prune: {drive_prune_note}")
 
     # 11. manifest + checksum out, archive stays put
@@ -1073,7 +1081,7 @@ def run_nightly(dry_run):
                f"Tablak: " + ", ".join(f"{t} {n}" for t, n in row_counts.items()) + "\n"
                f"Nyers fajlok: {staged} ({len(CATEGORIES)} kategoria)\n"
                f"Karanten (kulcsszo-emlites, emberi atnezesre): {soft_total}\n"
-               f"Lokalis prune: daily -{len(pruned_daily)}, weekly -{len(pruned_weekly)}\n"
+               f"Lokalis prune: daily -{len(pruned_daily)}, monthly -{len(pruned_monthly)}\n"
                f"Drive prune: {drive_prune_note}")
     if table_drift:
         summary += f"\nFIGYELEM tabla-drift a baseline ota: {', '.join(table_drift)}"
@@ -1154,7 +1162,7 @@ def render_manifest(info, archive_name, archive_size, digest, member_count, stag
 
 def newest_archive():
     candidates = []
-    for tier in ("daily", "weekly"):
+    for tier in ("daily", "monthly", "weekly"):  # weekly = legacy archives, still restorable
         for d in glob.glob(f"{STAGING_ROOT}/{tier}/*/*.tar.gz"):
             candidates.append(d)
     for d in glob.glob(f"{UPLOAD_DIR}/*/*/*.tar.gz"):
