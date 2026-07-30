@@ -24,7 +24,13 @@ Ha a config hiányzik vagy a kulcs nincs benne → default level 3 (régi viselk
 
 2. **Tisztítás**: 7+ napos done kártyák archiválása:
    ```bash
-   sqlite3 {{INSTALL_DIR}}/store/claudeclaw.db "UPDATE kanban_cards SET archived_at=unixepoch() WHERE status='done' AND archived_at IS NULL AND updated_at < strftime('%s','now','-7 days')"
+   # KÖTELEZŐ KAPU tömeges UPDATE előtt: először SELECT-tel mérd a találati halmazt.
+   # Ha a találat == a TELJES "done + archived_at IS NULL" halmaz, az NEM "minden elavult",
+   # hanem hibás predikátum -- NE futtasd az UPDATE-et.
+   # Egész-aritmetika kötelező: a strftime('%s',...) TEXT-et ad vissza, és literál/kifejezés
+   # bal oldallal a összehasonlítás típus-rendezéssé fajul (mindig-igaz / mindig-hamis).
+   sqlite3 {{INSTALL_DIR}}/store/claudeclaw.db "SELECT COUNT(*) FROM kanban_cards WHERE status='done' AND archived_at IS NULL AND updated_at < unixepoch()-7*86400"
+   sqlite3 {{INSTALL_DIR}}/store/claudeclaw.db "UPDATE kanban_cards SET archived_at=unixepoch() WHERE status='done' AND archived_at IS NULL AND updated_at < unixepoch()-7*86400"
    ```
 
 3. **Beakadt task detection** (előző audit óta nem mozdult): in_progress kártyák amik `updated_at < last_audit_at`:

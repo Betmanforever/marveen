@@ -19,7 +19,7 @@ Nézz végig MINDEN agent (a fő-ágens és az összes sub-agent) tegnapi (24h) 
 
 SQL minta:
 ```bash
-sqlite3 {{INSTALL_DIR}}/store/claudeclaw.db "SELECT agent_id, content, keywords FROM memories WHERE created_at > strftime('%s', 'now', '-24 hours') AND category IN ('hot','warm') ORDER BY agent_id, created_at"
+sqlite3 {{INSTALL_DIR}}/store/claudeclaw.db "SELECT agent_id, content, keywords FROM memories WHERE created_at > unixepoch()-86400 AND category IN ('hot','warm') ORDER BY agent_id, created_at"
 ```
 
 Output: 0-2 konkrét skill-javaslat. Mindegyikhez: cím + 1 mondat indoklás + "flotta-szintű" vagy "agent: <név>".
@@ -33,7 +33,11 @@ sqlite3 {{INSTALL_DIR}}/store/claudeclaw.db "SELECT COUNT(*) as total, COUNT(emb
 curl -s -X POST http://localhost:{{WEB_PORT}}/api/memories/backfill -H "Authorization: Bearer $(cat {{INSTALL_DIR}}/store/.dashboard-token)"
 
 # Antikvált hot-tier (>7 napos hot, nem hivatkozott a memories_fts-en az elmúlt 24h-ban)
-sqlite3 {{INSTALL_DIR}}/store/claudeclaw.db "SELECT id, content, accessed_at FROM memories WHERE category='hot' AND accessed_at < strftime('%s', 'now', '-7 days')"
+# ⚠️ EGÉSZ-ARITMETIKA KÖTELEZŐ: a strftime('%s',...) TEXT-et ad vissza, és SQLite-ban
+# az integer<->text összehasonlítás típus-rendezés szerint dől el (INTEGER < TEXT mindig),
+# nem érték szerint -- a `created_at > strftime(...)` alak MINDIG 0 sort ad, a
+# `... < strftime(...)` alak MINDEN sorra igaz (2026-07-29 memória-kár, 128 sor).
+sqlite3 {{INSTALL_DIR}}/store/claudeclaw.db "SELECT id, content, accessed_at FROM memories WHERE category='hot' AND accessed_at < unixepoch()-7*86400"
 ```
 
 Műveletek:
