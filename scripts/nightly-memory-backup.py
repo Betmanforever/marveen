@@ -811,8 +811,85 @@ def upload(upload_root, folder_id):
 
 
 # --------------------------------------------------------------------------
-# retention (plan 4)
+# retention (plan 4) -- local AND Drive side (card b2daf2c8)
 # --------------------------------------------------------------------------
+
+STAMP_RE = re.compile(r"^\d{8}-\d{6}$")
+
+
+def drive_list_child_folders(token, parent_id):
+    """All non-trashed child folders of parent_id as {name: id}, paged."""
+    out, page_token = {}, None
+    q = urllib.parse.quote(
+        f"'{parent_id}' in parents and "
+        "mimeType = 'application/vnd.google-apps.folder' and trashed = false")
+    while True:
+        url = (f"https://www.googleapis.com/drive/v3/files?q={q}"
+               "&fields=nextPageToken,files(id,name)&pageSize=1000"
+               "&supportsAllDrives=true&includeItemsFromAllDrives=true")
+        if page_token:
+            url += f"&pageToken={urllib.parse.quote(page_token)}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+        for f in data.get("files", []):
+            out[f["name"]] = f["id"]
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            return out
+
+
+def prune_drive_tier(token, root_folder_id, tier, keep, expected_stamp):
+    """Apply the same retention ladder to the Drive copy that prune_tier
+    applies locally (card b2daf2c8: without this, ~110 MB/night fills the
+    30 GB quota in ~9 months and the backup then stops at the quota check).
+
+    Safety properties, in order of importance:
+      - runs only AFTER a successful upload (call site), and additionally
+        refuses to prune unless expected_stamp (tonight's / the tier's newest
+        expected folder) is PRESENT in the listing -- if the listing cannot
+        see the fresh folder, deleting by that same listing is not safe;
+      - tiers are pruned independently inside their own daily/ and weekly/
+        folders, so the daily rule can never touch a weekly promotion;
+      - only folders whose name matches the STAMP pattern are candidates --
+        anything hand-created in the backup tree is left alone;
+      - sorted newest-first and only entries beyond `keep` are removed, so a
+        removed night always has `keep` fresher siblings on Drive;
+      - removal is TRASH (files.update trashed=true), not hard delete: a bad
+        prune is recoverable for 30 days. Trashed files keep counting against
+        the quota until Google auto-purges them (~30 days), which is an
+        accepted lag at this volume (~3.3 GB floating worst case).
+
+    Returns a human-readable result line; raises nothing -- a prune failure
+    must never fail a backup whose archive is already safely offsite (the
+    caller puts the line in the Telegram summary either way).
+    """
+    try:
+        tiers = drive_list_child_folders(token, root_folder_id)
+        tier_id = tiers.get(tier)
+        if tier_id is None:
+            return f"{tier}: nincs ilyen Drive-mappa, nincs mit nyesni"
+        children = drive_list_child_folders(token, tier_id)
+        stamps = sorted((n for n in children if STAMP_RE.match(n)), reverse=True)
+        if expected_stamp is not None and expected_stamp not in stamps:
+            return (f"{tier}: PRUNE KIHAGYVA -- a vart legfrissebb mappa "
+                    f"({expected_stamp}) nem latszik a Drive-listazasban, "
+                    "ilyen alapon torolni nem biztonsagos")
+        doomed = stamps[keep:]
+        for name in doomed:
+            req = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files/{children[name]}"
+                "?supportsAllDrives=true",
+                data=json.dumps({"trashed": True}).encode(), method="PATCH",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                r.read()
+        return (f"{tier}: {len(stamps)} mappa, kukaba: {len(doomed)}"
+                + (f" ({', '.join(doomed)})" if doomed else ""))
+    except Exception as e:  # noqa: BLE001 -- see docstring
+        return f"{tier}: PRUNE HIBA ({type(e).__name__}: {e}) -- a mentes maga sikeres"
+
 
 def prune_tier(tier, keep):
     """Timestamped directory names sort chronologically, so no mtime games."""
@@ -980,6 +1057,13 @@ def run_nightly(dry_run):
     shutil.rmtree(WORK_DIR, ignore_errors=True)
     log(f"lokalis prune: daily -{len(pruned_daily)}, weekly -{len(pruned_weekly)}")
 
+    # Drive-side retention (card b2daf2c8): only the tier we just uploaded to,
+    # so the presence guard (tonight's stamp must be visible) always applies.
+    drive_prune_note = prune_drive_tier(
+        drive_access_token(), folder_id, tier,
+        KEEP_DAILY if tier == "daily" else KEEP_WEEKLY, stamp)
+    log(f"Drive prune: {drive_prune_note}")
+
     # 11. manifest + checksum out, archive stays put
     summary = (f"[nightly-memory-backup] OK {started:%Y-%m-%d %H:%M}\n"
                f"Archivum: {archive_name} ({human(archive_size)}, {member_count} fajl)\n"
@@ -989,7 +1073,8 @@ def run_nightly(dry_run):
                f"Tablak: " + ", ".join(f"{t} {n}" for t, n in row_counts.items()) + "\n"
                f"Nyers fajlok: {staged} ({len(CATEGORIES)} kategoria)\n"
                f"Karanten (kulcsszo-emlites, emberi atnezesre): {soft_total}\n"
-               f"Lokalis prune: daily -{len(pruned_daily)}, weekly -{len(pruned_weekly)}")
+               f"Lokalis prune: daily -{len(pruned_daily)}, weekly -{len(pruned_weekly)}\n"
+               f"Drive prune: {drive_prune_note}")
     if table_drift:
         summary += f"\nFIGYELEM tabla-drift a baseline ota: {', '.join(table_drift)}"
     if grown:
