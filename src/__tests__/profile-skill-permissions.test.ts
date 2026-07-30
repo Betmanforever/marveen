@@ -28,8 +28,15 @@ describe('every strict profile allowlists the Skill tool', () => {
   const strict = listProfileTemplates().filter(p => p.permissionMode === 'strict')
 
   it('there are strict profiles to check (guards the test itself)', () => {
+    // marketer + researcher moved to permissionMode "permissive" on 2026-07-27
+    // (Gabor: "Bypass authorised" -- alex/charlie/ive run with
+    // --dangerously-skip-permissions; the hard deny rules stayed). Only
+    // developer-junior remains strict, and this guard exists so the per-profile
+    // loop below can never go silently empty: if developer-junior also leaves
+    // strict mode one day, this fails and the whole describe must be revisited
+    // instead of vacuously passing.
     expect(strict.map(p => p.id)).toEqual(
-      expect.arrayContaining(['marketer', 'researcher', 'developer-junior']),
+      expect.arrayContaining(['developer-junior']),
     )
   })
 
@@ -112,10 +119,14 @@ describe('strict profiles with telegram reply allow the full plugin toolset', ()
       p.filesystem.allow.includes('mcp__plugin_telegram_telegram__reply'),
   )
 
-  it('there are telegram-enabled strict profiles to check (guards the test itself)', () => {
-    expect(telegramProfiles.map(p => p.id)).toEqual(
-      expect.arrayContaining(['marketer', 'researcher']),
-    )
+  it('the telegram-enabled strict profile inventory is the expected one (guards the test itself)', () => {
+    // Since the 2026-07-27 permissive switch (marketer + researcher) there is
+    // NO strict profile with telegram reply, so the per-profile loop below is
+    // expected to generate zero tests. This pin keeps that emptiness a
+    // DECISION instead of an accident: if a strict telegram-enabled profile is
+    // (re)introduced, this fails, the maintainer confirms the loop below now
+    // covers it, and updates this inventory.
+    expect(telegramProfiles.map(p => p.id)).toEqual([])
   })
 
   for (const p of telegramProfiles) {

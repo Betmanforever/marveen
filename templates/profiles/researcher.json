@@ -2,7 +2,7 @@
   "id": "researcher",
   "label": "Kutató",
   "description": "Piackutatás, versenytárs-elemzés, webes források olvasása. Prompt injection szempontból ugyanúgy kiemelt mint a marketinges. Draft-only: riportot ír a mappájába, nem küld magától kifelé.",
-  "permissionMode": "strict",
+  "permissionMode": "permissive",
   "filesystem": {
     "allow": [
       "Read(${AGENT_DIR}/**)",

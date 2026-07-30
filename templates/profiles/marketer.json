@@ -2,7 +2,7 @@
   "id": "marketer",
   "label": "Marketinges",
   "description": "Email-vázlat, hírlevél, social tartalom. Mivel webes tartalmat olvas (prompt injection felület), szigorúan korlátozott: csak a saját mappájába írhat, SSH/AWS/.env tiltva, semmilyen Bash-pusztító parancs.",
-  "permissionMode": "strict",
+  "permissionMode": "permissive",
   "filesystem": {
     "allow": [
       "Read(${AGENT_DIR}/**)",
