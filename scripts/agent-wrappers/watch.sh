@@ -86,7 +86,7 @@ set +e
 python3 "$SCRIPTS/watch.py" "$@" ${extra[@]+"${extra[@]}"} >"$LOG" 2>&1
 rc=$?
 set -e
-echo "watch.sh: exit=$rc | out-dir: $OUT | full log: $LOG"
+echo "watch.sh: exit=$rc | out-dir: $OUT | full log: $LOG" | tee -a "$LOG"
 echo "--- last 40 log lines ---"
 tail -n 40 "$LOG"
 exit $rc
