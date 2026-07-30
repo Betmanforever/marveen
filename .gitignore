@@ -95,3 +95,11 @@ scripts/support-mail/no-support-reply.html
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Deliverable workspaces (per-project working areas, own toolchains; the
+# zenom_legox export above predates this blanket rule). Never part of the
+# product repo -- kept local so git status stays readable.
+/projects/
+
+# Timestamped .mcp.json rollback snapshots written before launcher edits.
+.mcp.json.bak-*
