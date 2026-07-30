@@ -57,9 +57,17 @@ describe('normalizeContextGuardConfig', () => {
 })
 
 describe('contextLimitForModel / calibrateLimit', () => {
-  it('recognizes the 1M suffix, defaults 200k', () => {
+  it('recognizes the 1M suffix AND the suffixless 1M families, defaults 200k', () => {
     expect(contextLimitForModel('claude-opus-4-8[1m]')).toBe(1_000_000)
-    expect(contextLimitForModel('claude-fable-5')).toBe(200_000)
+    // Card 57f432d4: the fleet's plain model ids run 1M windows (measured
+    // peaks 975-995k); the suffix-only check forced a handoff at 18% real use.
+    expect(contextLimitForModel('claude-fable-5')).toBe(1_000_000)
+    expect(contextLimitForModel('claude-opus-5')).toBe(1_000_000)
+    expect(contextLimitForModel('claude-sonnet-5')).toBe(1_000_000)
+    // Dated release pins normalize before the lookup; haiku stays 200k.
+    expect(contextLimitForModel('claude-haiku-4-5-20251001')).toBe(200_000)
+    // Unknown/future ids stay conservative and rely on calibrateLimit.
+    expect(contextLimitForModel('claude-newmodel-9')).toBe(200_000)
     expect(contextLimitForModel(null)).toBe(200_000)
   })
 

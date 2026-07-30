@@ -70,9 +70,30 @@ export function normalizeContextGuardConfig(raw: unknown): ContextGuardConfig {
 // it up when the OBSERVED context proves the base wrong.
 export const CONTEXT_LIMIT_TIERS = [200_000, 500_000, 1_000_000] as const
 
+// Model families that run a 1M-token window WITHOUT the [1m] suffix. The
+// fleet's own telemetry proved the suffix-only check wrong (card 57f432d4,
+// 2026-07-30): 30k+ token_usage events above 200k context, observed peaks
+// 975-995k on plain claude-opus-5 / claude-fable-5 ids. Matched on the
+// normalized id (suffix + date pin stripped); anything NOT listed stays at the
+// conservative 200k base and relies on calibrateLimit stepping up.
+const MILLION_WINDOW_MODELS = new Set([
+  'claude-opus-5',
+  'claude-sonnet-5',
+  'claude-fable-5',
+  'claude-mythos-5',
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+])
+
 /** Base context window inferred from the model id. Conservative: unknown → 200k. */
 export function contextLimitForModel(model: string | null | undefined): number {
-  if (typeof model === 'string' && model.includes('[1m]')) return 1_000_000
+  if (typeof model !== 'string') return 200_000
+  if (model.includes('[1m]')) return 1_000_000
+  // Strip a dated release pin (claude-haiku-4-5-20251001 -> claude-haiku-4-5).
+  const base = model.trim().replace(/-\d{8}$/, '')
+  if (MILLION_WINDOW_MODELS.has(base)) return 1_000_000
   return 200_000
 }
 
