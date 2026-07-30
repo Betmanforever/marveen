@@ -710,9 +710,16 @@ def sha256_file(path):
 # --------------------------------------------------------------------------
 
 def drive_access_token():
-    sys.path.insert(0, f"{REPO}/scripts/google-mcp")
-    from gapi import fresh_access_token  # noqa: PLC0415 -- optional dependency path
-    return fresh_access_token(DRIVE_TOKEN)
+    # SA + domain-wide delegation (sa-drive-token.mjs, subject
+    # gabor.szabo@zenom.hu) -- the SAME auth path the drive-zenom MCP proves
+    # live daily. The old OAuth token files failed both ways (card 139f8f1c,
+    # 2026-07-30): drive-personal.json is the WRONG IDENTITY for the zenom
+    # target folder (HTTP 404), drive-zenom.json is invalid_grant-expired.
+    proc = subprocess.run(["node", f"{REPO}/scripts/google-mcp/sa-drive-token.mjs"],
+                          capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise BackupError(f"sa-drive-token.mjs exit {proc.returncode}: {(proc.stderr or '')[-400:]}")
+    return proc.stdout.strip()
 
 
 def check_quota(archive_size):
@@ -755,8 +762,9 @@ def upload(upload_root, folder_id):
     size-verified skip, the resumable path and the fields=id,name,size fix that
     only a live test surfaced.
     """
+    env = dict(os.environ, DRIVE_ACCESS_TOKEN=drive_access_token())
     proc = subprocess.run([sys.executable, DRIVE_UPLOAD, DRIVE_TOKEN, upload_root, folder_id],
-                          capture_output=True, text=True, timeout=1800)
+                          capture_output=True, text=True, timeout=1800, env=env)
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:

@@ -28,7 +28,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gapi import fresh_access_token  # noqa: E402
 
 TOKEN_PATH, LOCAL_DIR, PARENT_ID = sys.argv[1], sys.argv[2], sys.argv[3]
-AT = fresh_access_token(TOKEN_PATH)
+# DRIVE_ACCESS_TOKEN env wins over the token file: the nightly backup mints a
+# service-account+DWD token (sa-drive-token.mjs) because its old OAuth token
+# files were identity-mismatched or expired for the zenom target (card
+# 139f8f1c). Env keeps the token off the command line and out of logs.
+AT = os.environ.get('DRIVE_ACCESS_TOKEN') or fresh_access_token(TOKEN_PATH)
 HDR = {'Authorization': f'Bearer {AT}'}
 RESUMABLE_THRESHOLD = 4 * 1024 * 1024  # Google's multipart guidance tops out well under this
 CHUNK_SIZE = 8 * 1024 * 1024
