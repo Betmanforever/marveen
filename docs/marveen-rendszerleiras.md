@@ -1,6 +1,6 @@
 # Marveen rendszerleírás
 
-**Verzió:** 1.3 (v1.0: 2026-07-30 14:45; v1.1: 15:00 backup-javítás és zenom deploy; v1.2: 15:15 fájl-relay és credential-világok; v1.3: 15:30 scope-tulajdon szabály, szabályozott terminológia)
+**Verzió:** 1.4 (v1.0-1.3: 2026-07-30 14:45-15:30; v1.4: 15:45, a kódolás-szabály szűkítése Alex mérésére, plusz a context-guard javítás)
 **Készítette:** mr-wolfe, 2026-07-30
 **Megrendelés:** Szabó Gábor, 2026-07-30: "wolfe must prepare a system description document that will be archived and any system change should be logged there."
 **Archívum helye:** zenom Drive (`zenom@zenom.hu`), `Marveen Backups` mellett
@@ -250,7 +250,18 @@ Gábor 2026-07-30-i döntése: a két site átmenetileg külön marad, egységes
 
 Canonical: amíg a tartalom valóban azonos, mindkét site a `zenom.hu`-ra kanonizál, hogy ne versenyezzünk magunkkal. A divergenciakor fordul önmagára.
 
-`[MÉRT 2026-07-30]` **A szabályozott terminológia külön kockázati osztály, nem copy-kérdés.** Alex FR forrásfájlja technikai okból ékezet nélkül készült, és nem csak a marketing-copy, hanem a **glossary** és az idézett CSSF-címek is törött alakban álltak benne (`Agrement`, `conformite`, `systeme`, `delegataires`, `reglemente`). Ez súlyosabb mint egy törött marketingmondat: a glossary zárt lista, aminek a pontosság a lényege, és egy compliance-piacon a pontatlan szakszó azonnal látható szakmai hiba. Az élő lapon lemérve **nulla** ékezet nélküli szabályozott terminus van kint (`système` és `réglementé` helyesen, a CSSF-hivatkozásban az `opérations` is), tehát a kockázat a forrás-dokumentumban élt, nem a kimenetben. Alex mérvadó, ékezetes szettet készített, és a régi fájl túl szűk figyelmeztetését kibővítette. Ez minden nyelvi változatra áll, nem FR-specifikus.
+### A kódolás és a szabályozott terminológia mint kockázat
+
+`[MÉRT 2026-07-30]` Alex FR forrás-glossaryja technikai okból ékezet nélkül készült, és nem csak a marketing-copy, hanem a **glossary** és az idézett CSSF-címek is törött alakban álltak benne: `Agrement` 2, `conformite` 2, `systeme` 5, `delegataires` 1, `reglemente` 6 előfordulás, mindössze 3 helyesen ékezetes karakter mellett. Az **élő** lapon viszont lemérve **nulla** ékezet nélküli szabályozott terminus van kint (`système` és `réglementé` helyesen, a CSSF-hivatkozásban az `opérations` is): Neo a build során kézzel állította helyre az ékezeteket. A kockázat tehát a forrás-dokumentumban élt, nem a kimenetben, de az út törékeny volt, mert emberi figyelmen állt.
+
+**Ez NEM flotta-szintű minta, és ezt Alex mérte le, miután egy túl tág állítást írtam ide.** Ive DE draftja rendesen ékezetes (Alex mérése: 57 umlaut és eszett találat a német szettben). A defekt Alex saját fájljára volt specifikus. Ha "minden nyelvi változatra áll" formában maradt volna itt, valaki előbb-utóbb elvégzett volna egy felesleges német javító kört, és a dokumentum többet állított volna mint amit tudunk.
+
+A **helyes, szűkebb szabály**, ami viszont nyelvfüggetlen és átvihető:
+
+1. Ha egy forrásdokumentum bármilyen okból **nem a cél-kódolásban** áll (ASCII-ra szorított szöveg, escape-elt karakterek, transzliterált nevek), akkor a dokumentumnak **magának** kell tartalmaznia a mérvadó, másolásra kész változatot, vagy egy explicit mutatót rá. Egy figyelmeztetés hogy "ezt át kell írni" **nem kontroll**, mert a következő olvasón múlik. Alex saját precedense: ő maga sértette meg, majd készített egy mérvadó ékezetes szettet és kibővítette a régi fájl figyelmeztetését.
+2. A **szabályozott terminológia** (glossary, jogi szöveg, hatósági hivatkozás) más kockázati osztály mint a marketing-copy, és szigorúbb kezelést kap. Egy törött marketingmondat rossz stílus; egy pontatlan szakszó egy compliance-piacon azonnal látható szakmai hiba. A referencia-anyag és a kimenő copy **két külön kockázati felület**, és a glossary-terminusok nagy része ki sem kerül a deployolt szövegbe.
+
+**Módszertani megjegyzés a méréshez:** magyar nyelvű dokumentumban a német umlaut keresése (`ö`, `ü`) **szennyezett**, mert a magyar is használja ezeket. A német ékezetesség mérésére vagy a német szakaszra kell szűkíteni, vagy a magyarban nem szereplő jeleket (`ä`, `ß`) kell számolni.
 
 `[NYITOTT]` GDPR: mind a hat élő nyelvi lap ugyanarra az **angol** `privacy.html` és `legal.html` fájlra mutat, lefordított változat nem létezik. A német lapon a hozzájáruló checkbox németül kér hozzájárulást egy angol tájékoztatóhoz. Átmeneti enyhítés bevezetve (`hreflang="en" lang="en"` a linkeken), ez nem oldja meg a jogi kérdést. Az Impressum kérdése szintén nyitott, jogi döntés.
 
@@ -272,6 +283,7 @@ Minden rendszerváltozás ide kerül. Formátum: dátum, mi változott, miért, 
 | 2026-07-30 14:41 | `scripts/nightly-memory-backup.py`: offsite feltöltés service-account DWD tokenre | A személyes token 404-et adott a zenom-drive mappára, a `drive-zenom.json` pedig `invalid_grant` | neo, diagnózis mr-wolfe | `git revert 6bb9dcf` |
 | 2026-07-30 14:45 | `backup-offsite-upload-wolfe` ütemezett feladat: feltöltő → ellenőrző | A szkript feltöltése helyreállt, két feltöltő duplikálna | mr-wolfe | a `SKILL.md` és `task-config.json` visszaírása a feltöltő változatra |
 | 2026-07-30 | zenom deploy: EN, DE, FR mind V2 designon, **mindkét** docrootba; HU, PL, SK 301-tel a saját domain gyökerére | Gábor döntése; a törlés 404-et gyártott volna indexelt URL-ekre | neo, audit mr-wolfe | a `deploy-dist-de-20260730` előtti állapot a repóban, a kiesett nyelvek fájljai megtartva |
+| 2026-07-30 15:45 | A kódolás-kockázat állítása SZŰKÍTVE: nem flotta-szintű minta, hanem forrásdokumentum-szabály | Egy túl tág állítást írtam a permanens dokumentumba; Alex lemérte hogy a DE draft rendesen ékezetes (57 találat), tehát a defekt az ő fájljára volt specifikus | alex mérése, javítás mr-wolfe | a bővebb állítás visszaírása, de az felesleges javító köröket indítana |
 | 2026-07-30 15:30 | Scope-tulajdon szabály: peer saját scope-járól szóló állítás előtt kérdés, nem következtetés | 4 megdőlt állításból 3 tárgya másik ágens scope-jában volt | mr-wolfe, Ive megfigyelésére | a szabály elhagyása |
 | 2026-07-30 15:25 | Mérvadó ékezetes FR string-szett, a glossary és a CSSF-címek javítva | Az ékezet nélküli forrásfájlból másolás szabályozott terminológiát propagált volna hibásan | alex, mérés mr-wolfe | a régi fájl visszavétele mérvadóként |
 | 2026-07-30 15:10 | Fájl-relay szabály: minden relayelt fájl megérkezéséről egysoros inter-agent jelzés, részletekben érkezőnél mindegyikről | Ive öt napig hiányos bemenettel dolgozott, mert a fájl megérkezése néma esemény | mr-wolfe, Ive javaslatára | a szabály elhagyása, de akkor a hibaosztály visszatér |
