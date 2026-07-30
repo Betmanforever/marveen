@@ -1,6 +1,6 @@
 # Marveen rendszerleírás
 
-**Verzió:** 1.1 (v1.0: 2026-07-30 14:45; v1.1: 2026-07-30 15:00, backup-javítás és zenom deploy átvezetve)
+**Verzió:** 1.2 (v1.0: 2026-07-30 14:45; v1.1: 15:00 backup-javítás és zenom deploy; v1.2: 15:15 fájl-relay jelzés-szabály és a két credential-világ)
 **Készítette:** mr-wolfe, 2026-07-30
 **Megrendelés:** Szabó Gábor, 2026-07-30: "wolfe must prepare a system description document that will be archived and any system change should be logged there."
 **Archívum helye:** zenom Drive (`zenom@zenom.hu`), `Marveen Backups` mellett
@@ -142,6 +142,14 @@ SQLite üzenetsor (`agent_messages`), a dashboard `POST /api/messages` végpontj
 
 `[MÉRT]` A `conversation_log` **nem tartalmazza a turn közben küldött Telegram üzeneteket**, tehát a "nincs a naplóban" nem egyenlő azzal hogy "nem lett elküldve".
 
+### 5.3 Fájl-relay: a megérkezés néma esemény
+
+Az ágensek `agents/<név>/in/` és `qa-in/` mappáin keresztül kapnak fájlokat, jellemzően mr-wolfe relayeli őket. **Az ágens nem kap értesítést a fájl megérkezéséről**, és ha épp dolgozik, semmi nem indokolja hogy odanézzen.
+
+`[MÉRT 2026-07-30]` Ez öt napos hibát okozott: Ive 2026-07-25-én kért egy `styles.css`-t a copy-fit QA-hoz, a relay két részletben ment (`zenom-v2-index.html` 22:11:22, `zenom-v2-styles.css` 22:27:35), és ő a QA-t 22:27:30-kor zárta, **öt másodperccel a második részlet előtt**. Két kör futott hiányos bemenettel, és két felesleges copy-aggály született belőle.
+
+**Szabály innentől:** minden relayelt fájl megérkezéséről egysoros inter-agent jelzés megy (mi, hova, melyik kérésre válasz), és **részletekben érkező anyagnál minden részletről külön**. Az ágens oldali párja: kör lezárása előtt újra megnézni az `in/`-t, ha volt kért de meg nem kapott bemenet. A jelzés a hiba előtti kapu, az újraellenőrzés a hiba utáni háló.
+
 ---
 
 ## 6. Web dashboard és API
@@ -210,6 +218,8 @@ Ezzel a `backup-offsite-upload-wolfe` ütemezett feladat (08:15) **duplikálna**
 - Felhasználónév nem titok, sima üzenetben mehet.
 - Kredenciált nem próbálgatunk. Az ISPConfig hoston fail2ban lehet, és egy kizárás a deploy előtt a legdrágább kimenet.
 
+`[MÉRT 2026-07-30]` **Két független credential-világ, és ez a nap legdrágább félreértése volt.** Az MCP szerverek auth-útja és a szkriptek token-fájljai (`~/.gmail-mcp/*.json`) **külön rendszerek**: az egyik élete semmit nem mond a másikról. Konkrétan: mr-wolfe zenom MCP hozzáférése hibátlanul feltöltött a `Marveen Backups` mappába, miközben ugyanannak az identitásnak a *token-fájlja* (`drive-zenom.json`) `invalid_grant` volt. Ezért egy javítási javaslat, ami "ugyanaz az identitás, tehát működni fog" alapon áll, hamis. A token-fájl **létezése nem érvényesség**, és egy sikeres MCP-művelet nem verifikálja a fájl-alapú utat. Aki tokent cserél, azt méréssel kell igazolnia, apró teszt-fájllal, nem a végleges hasznos tartalommal.
+
 **Google identitások:** `zenom@zenom.hu` a Workspace fő fiókja, minden más `zenom.hu` cím **alias** rá, beleértve a `gabor.szabo@zenom.hu`-t. A személyes fiók (`szabgabor1@gmail.com`) Gábor Windows desktopján beállított fiókja, azt nem bántjuk.
 
 `[MÉRT 2026-07-30]` mr-wolfe-nak minden Google assethez van joga, tehát a zenom Drive-hoz is. Gábor döntése szerint **minden ágens rajta keresztül ér el Google erőforrást**, és ez egyben szűrő is.
@@ -250,6 +260,7 @@ Minden rendszerváltozás ide kerül. Formátum: dátum, mi változott, miért, 
 | 2026-07-30 14:41 | `scripts/nightly-memory-backup.py`: offsite feltöltés service-account DWD tokenre | A személyes token 404-et adott a zenom-drive mappára, a `drive-zenom.json` pedig `invalid_grant` | neo, diagnózis mr-wolfe | `git revert 6bb9dcf` |
 | 2026-07-30 14:45 | `backup-offsite-upload-wolfe` ütemezett feladat: feltöltő → ellenőrző | A szkript feltöltése helyreállt, két feltöltő duplikálna | mr-wolfe | a `SKILL.md` és `task-config.json` visszaírása a feltöltő változatra |
 | 2026-07-30 | zenom deploy: EN, DE, FR mind V2 designon, **mindkét** docrootba; HU, PL, SK 301-tel a saját domain gyökerére | Gábor döntése; a törlés 404-et gyártott volna indexelt URL-ekre | neo, audit mr-wolfe | a `deploy-dist-de-20260730` előtti állapot a repóban, a kiesett nyelvek fájljai megtartva |
+| 2026-07-30 15:10 | Fájl-relay szabály: minden relayelt fájl megérkezéséről egysoros inter-agent jelzés, részletekben érkezőnél mindegyikről | Ive öt napig hiányos bemenettel dolgozott, mert a fájl megérkezése néma esemény | mr-wolfe, Ive javaslatára | a szabály elhagyása, de akkor a hibaosztály visszatér |
 | 2026-07-30 | Német statement H2 második sora: `Scharf genug, es zu durchschlagen.` | Gábor választása (a `scharf` "clever" jelentése miatt); a `durchzuschlagen` alak nyelvtanilag hibás, ezt Ive és Gábor egymástól függetlenül állapította meg | Gábor dönt, neo épít | a `deploy-dist` korábbi sora |
 
 ### Nyitott tételek, amikre a napló következő bejegyzései épülnek
