@@ -55,6 +55,30 @@ describe('channel-plugin-unlock helper contract', () => {
     expect(helper).toMatch(/bypass permissions on/)
   })
 
+  it('refuses to send keystrokes if the MCP-server trust/onboarding checklist is open', () => {
+    // 2026-07-22 incident: the unlock watchdog typed into an open "N new MCP
+    // servers found in this project ... Enter to confirm · Esc to reject
+    // all" checklist, and its Escapes were read as "reject all" -- silently
+    // wiping enabledMcpjsonServers for every project MCP server. The gate
+    // must recognise this modal the same way it recognises Resume-from-
+    // summary, and refuse (defer/retry) rather than type into it.
+    expect(helper).toMatch(/new MCP servers found in this project/)
+    expect(helper).toMatch(/Esc to reject all/)
+    const gateStart = helper.indexOf('function isSessionReadyForUnlock')
+    expect(gateStart, 'isSessionReadyForUnlock not found').toBeGreaterThan(0)
+    const gateEnd = helper.indexOf('\n}\n', gateStart)
+    const gateBody = helper.slice(gateStart, gateEnd > gateStart ? gateEnd : undefined)
+    const checklistIdx = gateBody.indexOf('/new MCP servers found in this project/')
+    const rejectAllIdx = gateBody.indexOf('/Esc to reject all/')
+    expect(checklistIdx, 'checklist regex literal not found in code').toBeGreaterThan(0)
+    expect(rejectAllIdx, 'reject-all regex literal not found in code').toBeGreaterThan(0)
+    // Both refuse-checks must return false, same contract as the other guards.
+    const afterChecklist = gateBody.slice(checklistIdx, checklistIdx + 80)
+    const afterRejectAll = gateBody.slice(rejectAllIdx, rejectAllIdx + 80)
+    expect(afterChecklist).toMatch(/return false/)
+    expect(afterRejectAll).toMatch(/return false/)
+  })
+
   it('delivers /mcp, Up, Enter, Enter then Esc, Esc to back the pane out to idle', () => {
     // Pinning the full 6-key sequence:
     //   /mcp + Up + Enter + Enter   -> revive plugin (Enable / Reconnect)

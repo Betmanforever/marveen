@@ -5,7 +5,7 @@ import { execSync, execFileSync, spawn } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
-import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
+import { agentDir, listAgentNames, readAgentChannelProvider, readModelFor } from './agent-config.js'
 import { createAgentMessage, getPendingMessages } from '../db.js'
 import {
   agentHasChannel,
@@ -27,6 +27,7 @@ import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent, channelPluginInitPending } from './channel-plugin-unlock.js'
 import {
   detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, detectsPermissionDialog, type PaneErrorAlertState, type PaneState,
+  detectsModelCreditDialog, findModelCreditDialogOption,
   decideDialogEscalation, type DialogEscalationState,
   paneShowsContextLow, paneShowsContextSaturation,
   decideContextBudgetEscalation, type ContextBudgetState,
@@ -467,6 +468,39 @@ function buildDialogOwnerFallback(label: string): string {
   return (
     `⚠️ A(z) ${label} egy engedelyt igenylo lepesnel megallt es tobb perce dontesre var, ` +
     'a koordinator pedig nem oldotta fel. Ha raersz, nezd meg.'
+  )
+}
+
+// The model-credit dialog escalation pair. Same [AUTOMATIKUS DECISION-FLAG]
+// shape / triage contract as buildDialogCoordinatorFlag and the same two-phase
+// machine (decideDialogEscalation + paneDialogEscalation + the DIALOG_* timing),
+// but the situation and the resolution differ, so the wording must NOT be
+// reused: this is not a permission prompt, the watchdog withheld the Escape
+// because Escape here silently DOWNGRADES the model, and the fix is to pick the
+// right numbered option (or change the agent's configured model). Reached only
+// when the configured model cannot be matched to an option -- the ambiguous
+// case, where guessing would either spend usage credits or downgrade silently.
+// Deliberately NO `tmux attach` / raw session-id and no literal
+// [DONTESRE-VAR:...] marker (the Stop hook would false-detect it).
+function buildModelCreditCoordinatorFlag(label: string, configuredModel: string | null): string {
+  return (
+    `[AUTOMATIKUS DECISION-FLAG] A(z) ${label} sub-agent egy model-credit dialogusban ragadt: a ` +
+    'beallitott modell kimeritette az included keretet, es a folytatas fizetos usage-creditbol menne. ' +
+    'A watchdog NEM kuldott Escape-et (az neman a fallback modellre valtana, es se a dashboard, se a ' +
+    'pane nem mutatna meg), es explicit sem tudott navigalni: a beallitott modell ' +
+    `(${configuredModel ?? 'ismeretlen'}) egyik felkinalt opcioval sem parosithato egyertelmuen. ` +
+    'Dontsd el: melyik opciot valassza az agent (maradjon a beallitott modellen kreditbol, vagy valtson ' +
+    'a felkinalt fallbackre), vagy allitsd at az agent konfiguralt modelljet -- majd celzott send-keys-szel ' +
+    'oldd fel. A message-routeren NE kuldj nyers billentyut egy dialoguson allo agentnek.'
+  )
+}
+
+// Direct owner (Gabor) fallback for the model-credit dialog, after the
+// coordinator grace expires. Human-friendly: no tmux command, no session-id.
+function buildModelCreditOwnerFallback(label: string): string {
+  return (
+    `⚠️ A(z) ${label} megallt egy modell-valasztasnal: az eddigi modellje elfogyott a csomagbol, ` +
+    'a folytatas kulon fizetos keretbol menne, es a koordinator nem dontott. Ha raersz, nezd meg.'
   )
 }
 
@@ -1302,7 +1336,10 @@ function checkMainKeepaliveStaleness(): void {
 }
 
 export function sendAlert(text: string): void {
-  notifyChannel(text).catch(() => {})
+  // notifyChannel logs its own send failures (see notify.ts); this catch is
+  // defense-in-depth against a throw OUTSIDE its try/catches (getProvider,
+  // formatMessage, splitMessage) -- never swallow silently, same reasoning.
+  notifyChannel(text).catch((err) => logger.error({ err }, 'sendAlert: notifyChannel threw'))
 }
 
 function handleMarveenDown(): void {
@@ -1528,7 +1565,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
               // decision-flag.py hook convention so mr-wolfe receives it as a
               // trusted-peer "[Uzenet @<agent>-tol]" flag. t.agentName is a
               // listAgentNames() entry, so it survives sanitizeAgentIdent.
-              createAgentMessage(t.agentName, MAIN_AGENT_ID, buildThinkingBlockCoordinatorFlag(label))
+              const msg = createAgentMessage(t.agentName, MAIN_AGENT_ID, buildThinkingBlockCoordinatorFlag(label))
+              logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
             } catch (err) {
               // Router enqueue failed -- do not lose the escalation; fall
               // straight to the direct owner alert.
@@ -1594,7 +1632,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           try {
             // from = the ceiling-hit sub-agent, to = coordinator: matches the
             // decision-flag.py convention (mr-wolfe receives a trusted-peer flag).
-            createAgentMessage(t.agentName, MAIN_AGENT_ID, buildContextBudgetCoordinatorFlag(t.agentName))
+            const msg = createAgentMessage(t.agentName, MAIN_AGENT_ID, buildContextBudgetCoordinatorFlag(t.agentName))
+            logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
           } catch (err) {
             // Router enqueue failed -- do not lose the escalation; fall straight
             // to the direct owner alert.
@@ -1692,7 +1731,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
                 // trusted-peer "[Uzenet @<agent>-tol]" flag. t.agentName is a
                 // listAgentNames() entry (already used as an agent id by the
                 // menu-recovery nudge below), so it survives sanitizeAgentIdent.
-                createAgentMessage(t.agentName, MAIN_AGENT_ID, buildDialogCoordinatorFlag(label))
+                const msg = createAgentMessage(t.agentName, MAIN_AGENT_ID, buildDialogCoordinatorFlag(label))
+                logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
               } catch (err) {
                 // Router enqueue failed -- do not lose the escalation; fall
                 // straight to the direct owner alert so a stuck dialog is never
@@ -1715,6 +1755,92 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
               paneDialogEscalation.set(t.session, { wolfeFlaggedAt: Date.now(), gaborNotifiedAt: prevEsc.gaborNotifiedAt })
               logger.warn({ session: t.session, agent: label }, 'Main channels session parked in a permission dialog -- direct owner alert (no coordinator to delegate to)')
               sendAlert(buildDialogOwnerFallback(label))
+            }
+          }
+        } else if (pane != null && detectsModelCreditDialog(pane)) {
+          // D3 (2026-07-24): the model-credit consent dialog. Like D1 it wears
+          // the navigable-modal footer, but the Escape damage is different and
+          // WORSE: the CLI answers it as `cancelled`, and every non-consent
+          // answer makes the query loop swap the session onto the fallback
+          // model and continue. The modal then vanishes, the pane looks clean,
+          // and agent-config.json still names the configured model -- so the
+          // downgrade is invisible to /api/agents, to the pane scan, and to the
+          // operator. Observed live 2026-07-24 ~21:09-21:24: neo (configured
+          // claude-fable-5 with Gabor's 2026-07-20 accept-the-credits decision)
+          // silently ran ~15 minutes on Sonnet 5 after this pass Escaped the
+          // dialog; only the session JSONL's assistant.model exposed it.
+          //
+          // So: never Escape here. Navigate EXPLICITLY to the option matching
+          // the agent's configured model when there is an unambiguous one, and
+          // escalate exactly like D1 when there is not. Reusing the D1 machine
+          // (decideDialogEscalation + paneDialogEscalation + the DIALOG_*
+          // timing) rather than a parallel one is safe because these branches
+          // are mutually exclusive within a menu spell, and the spell-clear
+          // path already resets that map.
+          const agentIdForModel = t.isMarveen ? MAIN_AGENT_ID : (t.agentName ?? null)
+          const configuredModel = agentIdForModel ? readModelFor(agentIdForModel) : null
+          const optionNum = configuredModel ? findModelCreditDialogOption(pane, configuredModel) : null
+          if (optionNum != null) {
+            paneDialogEscalation.delete(t.session)
+            logger.warn({ session: t.session, agent: label, configuredModel, optionNum },
+              'Model-credit dialog detected -- navigating to the configured model option (NOT Escape)')
+            try {
+              // Digit + settle + Enter, the same select-modal sequence
+              // dismissResumeSummaryModalIfPresent uses (agent-process.ts). If
+              // the digit alone confirms, the trailing Enter lands on an empty
+              // prompt and is a no-op; if it only moves focus, the Enter
+              // confirms. Both orders resolve to the intended option.
+              execFileSync(TMUX, ['send-keys', '-t', t.session, String(optionNum)], { timeout: 5000 })
+              execFileSync('/bin/sleep', ['0.1'], { timeout: 2000 })
+              execFileSync(TMUX, ['send-keys', '-t', t.session, 'Enter'], { timeout: 5000 })
+            } catch (err) {
+              logger.warn({ err, session: t.session }, 'Model-credit dialog navigation failed')
+            }
+            // configuredModel comes from our own agent config and optionNum is
+            // a parsed integer, so neither interpolates untrusted pane text.
+            sendAlert(
+              `🔀 A(z) ${label} session model-credit dialogusban allt (a beallitott modell included kerete elfogyott). ` +
+              `Escape-et NEM kuldtunk (az neman a fallback modellre valtana) -- explicit a konfiguralt modell opciojara ` +
+              `navigaltunk: ${configuredModel} (${optionNum}. opcio). Innentol ez a session usage-creditet fogyaszt. ` +
+              'Ha ezt nem akarod, allitsd at az agent modelljet a dashboardon.',
+            )
+          } else {
+            // No unambiguous option for the configured model (unknown model id,
+            // or the dialog offers none that names it). Do NOT guess a
+            // "closest" model and do NOT fall through to the generic Escape --
+            // escalate two-phase, coordinator first, exactly like D1.
+            const prevEsc = paneDialogEscalation.get(t.session) ?? { wolfeFlaggedAt: null, gaborNotifiedAt: null }
+            if (!t.isMarveen && t.agentName) {
+              const esc = decideDialogEscalation(prevEsc, Date.now(), {
+                graceMs: DIALOG_WOLFE_GRACE_MS,
+                dedupMs: DIALOG_ESCALATE_DEDUP_MS,
+              })
+              paneDialogEscalation.set(t.session, esc.next)
+              if (esc.action === 'notify-wolfe') {
+                logger.warn({ session: t.session, agent: label, configuredModel },
+                  'Model-credit dialog with no matching option -- NOT sending Escape, flagging coordinator (mr-wolfe)')
+                try {
+                  const msg = createAgentMessage(t.agentName, MAIN_AGENT_ID, buildModelCreditCoordinatorFlag(label, configuredModel))
+                  logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
+                } catch (err) {
+                  logger.warn({ err, session: t.session }, 'Model-credit coordinator flag enqueue failed -- direct owner fallback')
+                  sendAlert(buildModelCreditOwnerFallback(label))
+                }
+              } else if (esc.action === 'fallback-gabor') {
+                logger.warn({ session: t.session, agent: label }, 'Model-credit dialog unresolved after coordinator grace -- direct owner fallback')
+                sendAlert(buildModelCreditOwnerFallback(label))
+              }
+            } else {
+              // Main channels session: the coordinator cannot delegate its own
+              // dialog to itself. Single throttled DIRECT owner alert, reusing
+              // wolfeFlaggedAt as the throttle stamp (same as the D1 fallback)
+              // so the spell-clear path still only has one map to clear.
+              if (prevEsc.wolfeFlaggedAt === null || Date.now() - prevEsc.wolfeFlaggedAt >= DIALOG_ESCALATE_DEDUP_MS) {
+                paneDialogEscalation.set(t.session, { wolfeFlaggedAt: Date.now(), gaborNotifiedAt: prevEsc.gaborNotifiedAt })
+                logger.warn({ session: t.session, agent: label, configuredModel },
+                  'Main channels session parked in a model-credit dialog with no matching option -- direct owner alert')
+                sendAlert(buildModelCreditOwnerFallback(label))
+              }
             }
           }
         } else {
@@ -1764,7 +1890,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
             // cannot act on it, so five per window were pure queue noise.
             if (!t.isMarveen && t.agentName) {
               try {
-                createAgentMessage(MAIN_AGENT_ID, t.agentName, MENU_RECOVER_NUDGE)
+                const msg = createAgentMessage(MAIN_AGENT_ID, t.agentName, MENU_RECOVER_NUDGE)
+                logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
               } catch (err) {
                 logger.warn({ err, session: t.session }, 'Menu-recovery nudge enqueue failed')
               }

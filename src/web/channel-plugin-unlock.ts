@@ -218,6 +218,25 @@ function isSessionReadyForUnlock(session: string): boolean {
     // Refuse if any modal is visible.
     if (/Resume from summary/.test(pane)) return false
     if (/Open System Settings/.test(pane)) return false
+    // Refuse if the Claude-Code-native MCP-server trust/onboarding checklist
+    // is open ("N new MCP servers found in this project ... Enter to
+    // confirm · Esc to reject all"). This modal renders on the first boot
+    // after a .mcp.json change or a project trust reset, and it can still be
+    // open when this probe fires post-respawn. Typing into it lands Up in
+    // the checklist and both Escapes are read as "Esc to reject all" -- a
+    // SILENT, DETERMINISTIC rejection that wipes enabledMcpjsonServers for
+    // every project MCP server (2026-07-22 incident, marveen-mcp-server-
+    // rollout-restart skill). Unlike the other two guards this is not a
+    // dead end: runUnlockProbe's non-idle branch retries up to
+    // UNLOCK_PROBE_MAX_RETRIES times, giving a human (or the reset-project-
+    // choices flow) a window to close the dialog with an intentional Enter
+    // before the probe gives up.
+    // Three independent phrases from the same checklist, so a future Claude
+    // Code UI-text change is unlikely to silently disable every guard at
+    // once (any one surviving phrase still refuses the keystrokes).
+    if (/new MCP servers found in this project/.test(pane)) return false
+    if (/Esc to reject all/.test(pane)) return false
+    if (/Space to select/.test(pane)) return false
     return true
   } catch (err) {
     logger.warn({ err, session }, 'channel-plugin-unlock: capture-pane failed')

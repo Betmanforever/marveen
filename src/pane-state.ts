@@ -466,6 +466,162 @@ export function detectsPermissionDialog(pane: string): boolean {
   return PERMISSION_QUESTION_RX.test(pane) && PERMISSION_YES_OPTION_RX.test(pane)
 }
 
+// The model-credit consent dialog is a THIRD special case of a blocking modal,
+// and the most dangerous one yet, because Escape here is neither "close the
+// modal, conversation untouched" (the /mcp menu) nor "reject the tool call"
+// (the permission dialog) -- it is a SILENT MODEL DOWNGRADE.
+//
+// Shape (verified against a real capture of neo's pane and against the Claude
+// Code 2.1.220 bundle, the `model_fable_consent` dialog):
+//
+//   ────────────────────────────────────────────────────────────────────────
+//     You've reached your Fable 5 limit
+//     You've used your included Fable 5 usage for this week. Continuing on
+//     Fable 5 uses usage credits, purchased separately from your plan.
+//     Learn more: https://support.claude.com/en/articles/12429409-extra-usage-...
+//     ❯ 1. Continue with Fable 5
+//       2. Switch to Sonnet 5 and continue
+//     Enter to confirm · Esc to cancel
+//
+// detectsBlockingMenu() is ALREADY true for it (same "Esc to cancel" footer),
+// and it is NOT a permission dialog, so before this detector existed it fell
+// straight into the generic menu-recovery Escape. In the CLI the dialog
+// resolves to one of three answers -- `consent` (option 1), `switch_default`
+// (option 2) and `cancelled` (Escape / onCancel) -- and the query loop treats
+// ANY answer other than `consent` identically: it swaps the session onto the
+// fallback model and continues. `switch_default` additionally persists that
+// model as the user default; `cancelled` does not. So the recovery Escape
+// silently moved the agent onto the fallback model MID-SESSION, the modal
+// disappeared, the pane looked healthy, and agent-config.json still claimed
+// the configured model -- nothing in the fleet could see the drift. Observed
+// live 2026-07-24 ~21:09-21:24: neo (configured claude-fable-5, Gabor's
+// 2026-07-20 decision to stay on Fable and accept usage credits) ran ~15
+// minutes on Sonnet 5; only the session JSONL's assistant.model field exposed
+// it.
+//
+// Guards, in order:
+//   (a) detectsBlockingMenu() must hold. This reuses the busy / idle-footer /
+//       footer-region discipline instead of re-inlining it AND makes the new
+//       branch a strict SUBSET of the panes the generic Escape would have
+//       handled -- it can never fire somewhere the old code did nothing.
+//   (b) The credit phrase must appear in the live bottom region. Matched on a
+//       whitespace-FLATTENED join of the region, not per line, because the TUI
+//       hard-wraps the body ("Continuing on Fable 5\n  uses usage credits").
+//   (c) At least two numbered option lines must be present in the same region.
+//       This is what separates the interactive consent MODAL from the various
+//       non-interactive "... requires usage credits" banners Claude Code also
+//       renders (fast-mode notice, model-policy error), and from the
+//       API-error-anchored credit detectors in model-fallback.ts, which are
+//       tuned for a completely different surface ("⎿ API Error: ...").
+const MODEL_CREDIT_PHRASE_RX = /\b(?:uses?|runs on|requires?) usage credits\b/i
+// A rendered select row: optional focus caret, the 1-based index, a dot, the
+// label. Same row shape PERMISSION_YES_OPTION_RX keys on.
+const MODEL_CREDIT_OPTION_RX = /^\s*❯?\s*(\d+)\.\s+(\S.*)$/
+// How many trailing lines the credit-dialog scan inspects. Counted against the
+// WIDEST variant the bundle can render: border + title + gap + wrapped body +
+// dialog note + "you don't have usage credits yet" + wrapped monthly-limit hint
+// + wrapped Help-Center consent line + gap + three options + footer + border
+// ~= 18 lines. 24 keeps margin for narrower panes (more wrapping) while staying
+// far short of the transcript that remains rendered above the modal. Sizing
+// this too small is the dangerous direction: the phrase sits at the TOP of the
+// modal, so an under-sized region silently drops back to the generic Escape.
+const MODEL_CREDIT_REGION_LINES = 24
+
+// Model id -> the SHORT name the dialog prints. Source of truth: the model
+// catalog embedded in the Claude Code bundle (`display_name` per model id),
+// cross-checked against a live capture. Limited to the ids an agent in this
+// fleet can actually be configured to: the /api/models/available list, the
+// model-fallback DEFAULT_MODEL_CHAIN, and the ids currently in
+// agents/*/agent-config.json. Unknown ids resolve to null and the caller
+// escalates rather than guessing a "closest" model.
+export const MODEL_CREDIT_DIALOG_LABELS: Record<string, string> = {
+  'claude-fable-5': 'Fable 5',
+  'claude-mythos-5': 'Mythos 5',
+  'claude-opus-5': 'Opus 5',
+  'claude-opus-4-8': 'Opus 4.8',
+  'claude-sonnet-5': 'Sonnet 5',
+  'claude-sonnet-4-6': 'Sonnet 4.6',
+  'claude-haiku-4-5': 'Haiku 4.5',
+}
+
+// Agent configs carry variant suffixes the catalog ids do not: the 1M-context
+// marker (`claude-opus-4-8[1m]`) and the dated release pin
+// (`claude-haiku-4-5-20251001`). Both name the SAME model in the dialog, so
+// strip them before the lookup.
+function baseModelId(modelId: string): string {
+  return modelId.trim().replace(/\[1m\]$/i, '').replace(/-\d{8}$/, '')
+}
+
+function escapeForRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+interface ModelCreditOption {
+  num: number
+  text: string
+}
+
+function parseModelCreditOptions(lines: string[]): ModelCreditOption[] {
+  const out: ModelCreditOption[] = []
+  for (const line of lines) {
+    const m = line.match(MODEL_CREDIT_OPTION_RX)
+    if (!m) continue
+    const num = Number.parseInt(m[1], 10)
+    if (!Number.isFinite(num) || num < 1) continue
+    out.push({ num, text: m[2].trim() })
+  }
+  return out
+}
+
+/**
+ * True when the pane is parked in the Claude Code model-credit consent dialog
+ * (the modal where the configured model has exhausted its included quota and
+ * continuing on it draws paid usage credits). Pure + dependency-free.
+ *
+ * Callers must treat this as "do NOT auto-Escape": Escape is answered as
+ * `cancelled`, which the CLI resolves by switching the session to the fallback
+ * model and continuing -- a silent, invisible downgrade. Navigate explicitly
+ * (findModelCreditDialogOption) or escalate instead.
+ */
+export function detectsModelCreditDialog(pane: string): boolean {
+  if (!detectsBlockingMenu(pane)) return false
+  const region = pane.split('\n').slice(-MODEL_CREDIT_REGION_LINES)
+  // Flatten before matching: the body wraps mid-phrase at pane width.
+  if (!MODEL_CREDIT_PHRASE_RX.test(region.join(' ').replace(/\s+/g, ' '))) return false
+  return parseModelCreditOptions(region).length >= 2
+}
+
+/**
+ * The 1-based option number in a model-credit dialog that selects `modelId`,
+ * or null when there is no UNAMBIGUOUS match.
+ *
+ * Only the two option shapes that actually name a model count -- "Continue
+ * with <label>" (stay on the credit-gated model) and "Switch to <label> and
+ * continue" (move to the fallback). The other labels the dialog can render
+ * ("Buy usage credits", "Yes, re-enable and continue", "Request usage credits
+ * from your admin", an upsell row) name no model and must never be selected by
+ * a watchdog.
+ *
+ * Returns null -- i.e. "escalate, do not act" -- when the model id is not in
+ * MODEL_CREDIT_DIALOG_LABELS, when no option names it (e.g. the agent is
+ * configured for Haiku but the dialog only offers Fable/Sonnet), or when more
+ * than one option would match. Guessing a "closest" model is deliberately not
+ * attempted: picking the wrong row here spends money or downgrades silently,
+ * exactly the failure this detector exists to prevent.
+ *
+ * Wrapped option labels are NOT reassembled across lines. A wrap yields null,
+ * which routes to escalation -- the safe direction.
+ */
+export function findModelCreditDialogOption(pane: string, modelId: string): number | null {
+  if (!pane || !modelId) return null
+  const label = MODEL_CREDIT_DIALOG_LABELS[baseModelId(modelId)]
+  if (label == null) return null
+  const rx = new RegExp(`^(?:Continue with|Switch to)\\s+${escapeForRegExp(label)}\\b`, 'i')
+  const matches = parseModelCreditOptions(pane.split('\n').slice(-MODEL_CREDIT_REGION_LINES))
+    .filter((o) => rx.test(o.text))
+  return matches.length === 1 ? matches[0].num : null
+}
+
 export interface DetectPaneStateOptions {
   /** If true, the 'typing' state (text parked in input box) is
    * merged into 'busy'. Default false -- callers that care about
