@@ -1,0 +1,9 @@
+{
+  "name": "marveen-gmail-sa-runtime",
+  "private": true,
+  "type": "module",
+  "description": "Pinned runtime for the zenom Gmail MCP server, launched via ../gmail-sa-launch.mjs with service-account (domain-wide delegation) auth. Pinned rather than `npx -y` so the launcher can resolve the server's own google-auth-library instance at a stable path.",
+  "dependencies": {
+    "@gongrzhe/server-gmail-autoauth-mcp": "1.1.11"
+  }
+}
