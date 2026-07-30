@@ -1,6 +1,6 @@
 # Marveen rendszerleírás
 
-**Verzió:** 1.2 (v1.0: 2026-07-30 14:45; v1.1: 15:00 backup-javítás és zenom deploy; v1.2: 15:15 fájl-relay jelzés-szabály és a két credential-világ)
+**Verzió:** 1.3 (v1.0: 2026-07-30 14:45; v1.1: 15:00 backup-javítás és zenom deploy; v1.2: 15:15 fájl-relay és credential-világok; v1.3: 15:30 scope-tulajdon szabály, szabályozott terminológia)
 **Készítette:** mr-wolfe, 2026-07-30
 **Megrendelés:** Szabó Gábor, 2026-07-30: "wolfe must prepare a system description document that will be archived and any system change should be logged there."
 **Archívum helye:** zenom Drive (`zenom@zenom.hu`), `Marveen Backups` mellett
@@ -152,6 +152,16 @@ Az ágensek `agents/<név>/in/` és `qa-in/` mappáin keresztül kapnak fájloka
 
 ---
 
+### 5.4 Ki mit tud mérni: a scope-tulajdon szabálya
+
+`[MÉRT 2026-07-30]` Koordinátorként a nap nagy részében más ágensek területéről kell állítani valamit, hogy egyáltalán lehessen routeolni. Erre a koordinátornak **nincs mérési felszíne**: nem látja bele a peer munkájába úgy ahogy a peer, és a fájl-időbélyegeit sem kérdezi le anélkül hogy szólna.
+
+Az aznapi mérleg: mr-wolfe négy állítása dőlt meg méréssel, egyet sem ő talált meg, és **háromnak a tárgya egy másik ágens saját scope-jában volt** (mi van az `in/` mappájában, mikor írt egy fájlt, melyik két jelöltje ugyanaz). Ive hét másodperc alatt futtatta le az `ls`-t a saját mappájában; ugyanaz a koordinátornak köröket és egy hibás konklúziót jelentett.
+
+**Szabály:** ha egy állítás tárgya egy másik ágens saját scope-jában van, a legolcsóbb verifikáció nem a következtetés, hanem **egy kérdés annak az ágensnek**. A mérés ott a legolcsóbb, ahol az adat lakik. Fordítva is áll: amiről a koordinátornál van az adat (Gábor korrekciói, a relay állapota, a flotta-topológia), azt ő adja tényként, ne hagyja hogy a peer következtessen rá.
+
+---
+
 ## 6. Web dashboard és API
 
 `http://localhost:3420`. Az `/api/*` végpontok Bearer tokennel védettek, a token a `store/.dashboard-token` fájlban van.
@@ -240,6 +250,8 @@ Gábor 2026-07-30-i döntése: a két site átmenetileg külön marad, egységes
 
 Canonical: amíg a tartalom valóban azonos, mindkét site a `zenom.hu`-ra kanonizál, hogy ne versenyezzünk magunkkal. A divergenciakor fordul önmagára.
 
+`[MÉRT 2026-07-30]` **A szabályozott terminológia külön kockázati osztály, nem copy-kérdés.** Alex FR forrásfájlja technikai okból ékezet nélkül készült, és nem csak a marketing-copy, hanem a **glossary** és az idézett CSSF-címek is törött alakban álltak benne (`Agrement`, `conformite`, `systeme`, `delegataires`, `reglemente`). Ez súlyosabb mint egy törött marketingmondat: a glossary zárt lista, aminek a pontosság a lényege, és egy compliance-piacon a pontatlan szakszó azonnal látható szakmai hiba. Az élő lapon lemérve **nulla** ékezet nélküli szabályozott terminus van kint (`système` és `réglementé` helyesen, a CSSF-hivatkozásban az `opérations` is), tehát a kockázat a forrás-dokumentumban élt, nem a kimenetben. Alex mérvadó, ékezetes szettet készített, és a régi fájl túl szűk figyelmeztetését kibővítette. Ez minden nyelvi változatra áll, nem FR-specifikus.
+
 `[NYITOTT]` GDPR: mind a hat élő nyelvi lap ugyanarra az **angol** `privacy.html` és `legal.html` fájlra mutat, lefordított változat nem létezik. A német lapon a hozzájáruló checkbox németül kér hozzájárulást egy angol tájékoztatóhoz. Átmeneti enyhítés bevezetve (`hreflang="en" lang="en"` a linkeken), ez nem oldja meg a jogi kérdést. Az Impressum kérdése szintén nyitott, jogi döntés.
 
 ---
@@ -260,6 +272,8 @@ Minden rendszerváltozás ide kerül. Formátum: dátum, mi változott, miért, 
 | 2026-07-30 14:41 | `scripts/nightly-memory-backup.py`: offsite feltöltés service-account DWD tokenre | A személyes token 404-et adott a zenom-drive mappára, a `drive-zenom.json` pedig `invalid_grant` | neo, diagnózis mr-wolfe | `git revert 6bb9dcf` |
 | 2026-07-30 14:45 | `backup-offsite-upload-wolfe` ütemezett feladat: feltöltő → ellenőrző | A szkript feltöltése helyreállt, két feltöltő duplikálna | mr-wolfe | a `SKILL.md` és `task-config.json` visszaírása a feltöltő változatra |
 | 2026-07-30 | zenom deploy: EN, DE, FR mind V2 designon, **mindkét** docrootba; HU, PL, SK 301-tel a saját domain gyökerére | Gábor döntése; a törlés 404-et gyártott volna indexelt URL-ekre | neo, audit mr-wolfe | a `deploy-dist-de-20260730` előtti állapot a repóban, a kiesett nyelvek fájljai megtartva |
+| 2026-07-30 15:30 | Scope-tulajdon szabály: peer saját scope-járól szóló állítás előtt kérdés, nem következtetés | 4 megdőlt állításból 3 tárgya másik ágens scope-jában volt | mr-wolfe, Ive megfigyelésére | a szabály elhagyása |
+| 2026-07-30 15:25 | Mérvadó ékezetes FR string-szett, a glossary és a CSSF-címek javítva | Az ékezet nélküli forrásfájlból másolás szabályozott terminológiát propagált volna hibásan | alex, mérés mr-wolfe | a régi fájl visszavétele mérvadóként |
 | 2026-07-30 15:10 | Fájl-relay szabály: minden relayelt fájl megérkezéséről egysoros inter-agent jelzés, részletekben érkezőnél mindegyikről | Ive öt napig hiányos bemenettel dolgozott, mert a fájl megérkezése néma esemény | mr-wolfe, Ive javaslatára | a szabály elhagyása, de akkor a hibaosztály visszatér |
 | 2026-07-30 | Német statement H2 második sora: `Scharf genug, es zu durchschlagen.` | Gábor választása (a `scharf` "clever" jelentése miatt); a `durchzuschlagen` alak nyelvtanilag hibás, ezt Ive és Gábor egymástól függetlenül állapította meg | Gábor dönt, neo épít | a `deploy-dist` korábbi sora |
 
