@@ -1,6 +1,6 @@
 # Marveen rendszerleírás
 
-**Verzió:** 1.4 (v1.0-1.3: 2026-07-30 14:45-15:30; v1.4: 15:45, a kódolás-szabály szűkítése Alex mérésére, plusz a context-guard javítás)
+**Verzió:** 1.5 (v1.0-1.4: 2026-07-30 14:45-15:45; v1.5: 16:00, modell-drift figyelő, projects/ a mentésben, a Fable-kredit dialógus mechanizmusa)
 **Készítette:** mr-wolfe, 2026-07-30
 **Megrendelés:** Szabó Gábor, 2026-07-30: "wolfe must prepare a system description document that will be archived and any system change should be logged there."
 **Archívum helye:** zenom Drive (`zenom@zenom.hu`), `Marveen Backups` mellett
@@ -57,6 +57,18 @@ Alárendelt szakágensek (a fő ágensek hívják be): `auditor`, `skill-writer`
 
 A kód ezt **rosszul tudja**: `src/context-guard.ts:74` csak `[1m]` suffix esetén ad 1M-et, a flotta viszont suffix nélküli ID-kkel fut. Következmény és javítás: kanban `57f432d4`. Jelenleg latens, mert a `store/context-guard.json` nem létezik, tehát a guard egyetlen ágensen sem aktív.
 
+### 2.4 A Fable-kredit dialógus és a modell-identitás figyelő
+
+`[MÉRT 2026-07-30]` Egy Fable-re konfigurált ágens újraindításánál blokkoló dialógus jelenik meg: *"Fable 5 runs on usage credits, purchased separately from your plan."* Két opció, és **a kurzor a másodikon áll: "Switch to Sonnet 5 and continue"**. Egy figyelmetlen Enter tehát lefokozza az ágenst arról a modellről, amit Gábor kiosztott.
+
+**Ez a mechanizmusa annak, amit korábban "néma modell-visszaesésnek" hívtunk.** Session-szintű mérés a `token_usage`-ből, `agent='neo'`: `353fed4d` Fable-5 500 esemény 07-23 00:00 → 16:24, majd `17694b85` és `436be58d` Sonnet-5 (utóbbi 841 esemény) 07-23 16:39 → 07-24 20:09, majd `2b473ea4` vissza Fable-re 07-24 21:24-től. Sorban következő session-ök, mindegyik **egyetlen** modellen, és a váltás pontosan **session-határon**, ami az újraindítás pillanata.
+
+**A naplózás nem következetes:** a `config_change_log` id 39 (07-22, "Continue with Fable 5, resolved via tmux Up+Enter") és id 41 (07-25, "Switch to Sonnet 5, resolved via tmux Enter on already-highlighted default") bejegyzést ismer, de a **07-23-i és 07-24-i két váltásról nincs semmi**. Öt előfordulásból három dokumentált.
+
+**Ezért a `marveen-model-drift.timer`** (óránként, `06..21:37:00`, `scripts/check-model-drift.sh`) nem a mechanizmust deríti fel, hanem a **naplózás hiányát pótolja**: a mért és a konfigurált modell egyezésén túl azt is figyeli, hogy minden modellváltó session-határhoz tartozik-e `config_change_log` bejegyzés. Ha van változás bejegyzés nélkül, az a jelzés. A riasztás a MÉRT és a KONFIGURÁLT modellt is tartalmazza. Fejlécében rögzítve, hogy a 07-23/24-i eset **képesség-probléma volt, nem költség**: kb. 322 USD-egyenértéket *spórolt*, tehát egy költség-alapú figyelésben láthatatlan lett volna.
+
+**Kezelési szabály:** ha egy Fable-re konfigurált ágens újraindítás után elhallgat, ez az első hipotézis, nem a wedge. **Gombot nem nyomunk nélküle:** a spend Gábor számláján van, és a tmux-kézbesítés véletlenül megnyomhatja a dialógust. A kredit-aggály önmagában nem indok a lefokozásra, lásd a 2.2 mérését és a 41 EUR egyenleg 20 napos érintetlenségét. Minden feloldást be kell írni a `config_change_log`-ba.
+
 ### 2.3 Profilok
 
 `[MÉRT 2026-07-30]` `templates/profiles/`: `applier`, `default`, `developer-senior`, `marketer`, `researcher`, `sub-dev` mind `permissive`; `developer-junior` `strict`. A `marketer` és `researcher` 2026-07-27-én került `strict`-ről `permissive`-re, Gábor kifejezett engedélyével ("Bypass authorised"). A kemény tiltó szabályok változatlanok.
@@ -76,6 +88,7 @@ A kód ezt **rosszul tudja**: `src/context-guard.ts:74` csak `[1m]` suffix eset�
 | `marveen-inbox-starvation.timer` | `06..21:0/10` | 10 percenként, nappal |
 | `marveen-site-monitor.timer` | `06..21:0/5` | 5 percenként, nappal |
 | `marveen-memory-backup.timer` | `21:30`, `Persistent=true` | lásd 9. szakasz |
+| `marveen-model-drift.timer` | `06..21:37:00` | modell-identitás figyelő, lásd 2.4 |
 
 ### 3.1 A `KillMode=process` szándékos
 
@@ -213,6 +226,20 @@ A megoldás: **service-account domain-wide delegation token**. `[MÉRT]` A javí
 
 Ezzel a `backup-offsite-upload-wolfe` ütemezett feladat (08:15) **duplikálna**, ezért 2026-07-30 14:45-kor **feltöltőről ellenőrzővé** alakult: a szkript exit-kódját, a lokális archívumot és a Drive-on lévő fájlok **méret-egyezését** hasonlítja, és csak hibánál jelez. Feltöltést csak mentőövként végez, ha a szkript bukott, de a lokális archívum ép. Az érték a függetlenségben van: két külön jel a lánc két végén.
 
+### 9.1 A `projects/` fa belépése, és ami hiányzott róla
+
+`[MÉRT 2026-07-30]` A `projects/` fa (a flotta MINDEN szállítmánya) 2026-07-30-ig **se verziókövetve, se mentve nem volt**: 1,1 GB, 22 395 fájl, ebből 10 tracked git-ben (`.gitignore:102` `/projects/`), és a mentő szkript egyáltalán nem nyúlt hozzá. Egyetlen példány, egyetlen WSL hoston. Benne az élő zenom site teljes forrása, a működő `kb.db` tudásbázis, 59 board-döntés rekord, a legal és share-exit anyag.
+
+A 945 MB-os rész túlnyomóan újratermelhető függőség (`node_modules`, `.venv`). **Egy saját becslési hibám itt: 93 MB-ot mondtam a pótolhatatlan rétegre, a valóság 149 MB**, mert az `ibanguardian` virtuális környezete `.venv-crossval` néven fut, és a kizárásom ezt nem fogta meg. Neo mérte le és prefix-mintával kezelte.
+
+**Megoldva** (commit `db49a7f`, a 2026-07-30 21:30-as futástól): a `projects/` fa új felderítési kategória, függőség-kizárással. Verifikáció: dry-run archívum 110,7 MB / 1633 fájl, secret-scan 0 érték-alakú találat, restore-rehearsal PASS, Drive kvóta 0,8 százalék a 30 GB-ból.
+
+`[NYITOTT]` Gábor döntése: a `zenom/confidential`, a `zenom/szamlak` és a `legal-share-exit` bekerüljön-e. Addig a felderítés szintjén kizárva, egy kommentelt `PROJECTS_PENDING_GABOR` konstansban (`scripts/nightly-memory-backup.py:157`); feloldás: bejegyzés törlése plusz `--update-baseline`. Kanban `ae9f746a`, `waiting`.
+
+`[NYITOTT]` **Drive-oldali retenció nincs nyesve.** A `prune_tier` csak lokálisan töröl. 110 MB/éjszaka mellett ez kb. 3,3 GB/hó, tehát a 30 GB kvóta kb. 9 hónap alatt betelik, és akkor a mentés a kvóta-ellenőrzésen áll meg. Nem sürgős, de a hiba jellege alattomos: nem romlást látunk, hanem egy nap hirtelen nincs mentés. Kanban `b2daf2c8`. A javításnál kritikus, hogy a Drive-prune soha ne töröljön olyat, aminek nincs frissebb párja, és a heti promóciót ne nyesse le a napi szabály.
+
+`[NYITOTT]` A három nagy projekt (`ibanguardian`, `epsom`, `whisperflow-local`) egyikének sincs saját git repója, tehát a **saját kódjuk** sincs verziózva. Külön döntés.
+
 Élő visszaállítási teszt 2026-07-30-án megtörtént.
 
 ---
@@ -283,6 +310,8 @@ Minden rendszerváltozás ide kerül. Formátum: dátum, mi változott, miért, 
 | 2026-07-30 14:41 | `scripts/nightly-memory-backup.py`: offsite feltöltés service-account DWD tokenre | A személyes token 404-et adott a zenom-drive mappára, a `drive-zenom.json` pedig `invalid_grant` | neo, diagnózis mr-wolfe | `git revert 6bb9dcf` |
 | 2026-07-30 14:45 | `backup-offsite-upload-wolfe` ütemezett feladat: feltöltő → ellenőrző | A szkript feltöltése helyreállt, két feltöltő duplikálna | mr-wolfe | a `SKILL.md` és `task-config.json` visszaírása a feltöltő változatra |
 | 2026-07-30 | zenom deploy: EN, DE, FR mind V2 designon, **mindkét** docrootba; HU, PL, SK 301-tel a saját domain gyökerére | Gábor döntése; a törlés 404-et gyártott volna indexelt URL-ekre | neo, audit mr-wolfe | a `deploy-dist-de-20260730` előtti állapot a repóban, a kiesett nyelvek fájljai megtartva |
+| 2026-07-30 15:22 | Modell-identitás drift figyelő: `scripts/check-model-drift.sh` plusz `marveen-model-drift.timer` (`06..21:37:00`) | A 07-23/24-i modellváltás naplózás nélkül történt; a mechanizmus ismert, a naplózás hiányos | neo, megkötések mr-wolfe | `git revert d947f7f` plusz a timer letiltása |
+| 2026-07-30 15:25 | `projects/` fa a nightly mentésbe, függőség-kizárással | 1,1 GB, 22 395 fájl, se verzió se mentés; egyetlen példány egyetlen hoston | neo, lelet mr-wolfe | `git revert db49a7f` |
 | 2026-07-30 15:45 | A kódolás-kockázat állítása SZŰKÍTVE: nem flotta-szintű minta, hanem forrásdokumentum-szabály | Egy túl tág állítást írtam a permanens dokumentumba; Alex lemérte hogy a DE draft rendesen ékezetes (57 találat), tehát a defekt az ő fájljára volt specifikus | alex mérése, javítás mr-wolfe | a bővebb állítás visszaírása, de az felesleges javító köröket indítana |
 | 2026-07-30 15:30 | Scope-tulajdon szabály: peer saját scope-járól szóló állítás előtt kérdés, nem következtetés | 4 megdőlt állításból 3 tárgya másik ágens scope-jában volt | mr-wolfe, Ive megfigyelésére | a szabály elhagyása |
 | 2026-07-30 15:25 | Mérvadó ékezetes FR string-szett, a glossary és a CSSF-címek javítva | Az ékezet nélküli forrásfájlból másolás szabályozott terminológiát propagált volna hibásan | alex, mérés mr-wolfe | a régi fájl visszavétele mérvadóként |
