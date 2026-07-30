@@ -1,6 +1,6 @@
 # Marveen rendszerleírás
 
-**Verzió:** 1.6 (v1.0-1.5: 2026-07-30 14:45-16:00; v1.6: 16:20, a pótolhatóság három kategóriája és a kockázat-inverzió)
+**Verzió:** 1.7 (v1.0-1.6: 2026-07-30 14:45-16:20; v1.7: 16:40, a session nem egy-modelles, három új naplózatlan váltás, megőrzési kötelezettség mint külön tengely)
 **Készítette:** mr-wolfe, 2026-07-30
 **Megrendelés:** Szabó Gábor, 2026-07-30: "wolfe must prepare a system description document that will be archived and any system change should be logged there."
 **Archívum helye:** zenom Drive (`zenom@zenom.hu`), `Marveen Backups` mellett
@@ -61,9 +61,13 @@ A kód ezt **rosszul tudja**: `src/context-guard.ts:74` csak `[1m]` suffix eset�
 
 `[MÉRT 2026-07-30]` Egy Fable-re konfigurált ágens újraindításánál blokkoló dialógus jelenik meg: *"Fable 5 runs on usage credits, purchased separately from your plan."* Két opció, és **a kurzor a másodikon áll: "Switch to Sonnet 5 and continue"**. Egy figyelmetlen Enter tehát lefokozza az ágenst arról a modellről, amit Gábor kiosztott.
 
-**Ez a mechanizmusa annak, amit korábban "néma modell-visszaesésnek" hívtunk.** Session-szintű mérés a `token_usage`-ből, `agent='neo'`: `353fed4d` Fable-5 500 esemény 07-23 00:00 → 16:24, majd `17694b85` és `436be58d` Sonnet-5 (utóbbi 841 esemény) 07-23 16:39 → 07-24 20:09, majd `2b473ea4` vissza Fable-re 07-24 21:24-től. Sorban következő session-ök, mindegyik **egyetlen** modellen, és a váltás pontosan **session-határon**, ami az újraindítás pillanata.
+**Ez a mechanizmusa annak, amit korábban "néma modell-visszaesésnek" hívtunk.** Session-szintű mérés a `token_usage`-ből, `agent='neo'`: `353fed4d` Fable-dominált 07-23 00:00 → 16:24, majd `17694b85` és `436be58d` Sonnet-5 (utóbbi 841 esemény) 07-23 16:39 → 07-24 20:09, majd `2b473ea4` vissza Fable-re 07-24 21:24-től. A **domináns modell** tehát session-határon váltott, ami az újraindítás pillanata.
 
-**A naplózás nem következetes:** a `config_change_log` id 39 (07-22, "Continue with Fable 5, resolved via tmux Up+Enter") és id 41 (07-25, "Switch to Sonnet 5, resolved via tmux Enter on already-highlighted default") bejegyzést ismer, de a **07-23-i és 07-24-i két váltásról nincs semmi**. Öt előfordulásból három dokumentált.
+**Egy saját hibám itt, Neo mérése javította:** azt írtam, hogy a session-ök "mindegyik egyetlen modellen" futott. Ez **nem igaz**. A `353fed4d` session Fable-5 (1242 esemény) *és* Opus-4-8 (24 esemény) forgalmat is tartalmaz, mert a **sub-ágensek ugyanazon `session_id` alatt naplózódnak**, és súlyban túl is nőhetnek a main loopon (`0ba2dcef`: Fable 30 473 token vs Opus-5 15 540). Az én lekérdezésem `HAVING ev>15` szűrővel futott, és a kis sorokat egy-modelles képként olvastam. A helyes eljárás, amit Neo a detektorba építette: a **main modellt a session első 7 sorának többségéből** kell venni, plusz egy 20k tokenes session-alsóhatár, hogy a model-fallback watcher egy-fordulós próbái ne látszódjanak váltásnak.
+
+**A naplózás nem következetes, és rosszabb mint hittük.** A `config_change_log` eredetileg csak id 39 (07-22, "Continue with Fable 5, resolved via tmux Up+Enter") és id 41 (07-25, "Switch to Sonnet 5, resolved via tmux Enter on already-highlighted default") bejegyzést tartalmazta.
+
+`[MÉRT 2026-07-30]` A detektor **első futása azonnal három további, naplózatlan váltást talált 48 órán belül**: 07-29 07:19 sonnet→fable (`7b5efd46`→`59fb9dcf`), 07-29 12:07 fable→sonnet (`0ba2dcef`→`cddaed63`), 07-30 07:26 sonnet→fable (`cddaed63`→`f752429f`). Vagyis egyetlen napon (07-29) **két** váltás is történt. Mindhárom backfillelve `REKONSTRUÁLT` jelzéssel (id 45-47, `created_at` = a mért session-határ, provenance a szövegben), plusz id 44 a 07-30 15:10-es előfordulásra. Az előfordulás-szám tehát jóval öt fölött van, és a detektor a saját létjogosultságát az első körben igazolta.
 
 **Ezért a `marveen-model-drift.timer`** (óránként, `06..21:37:00`, `scripts/check-model-drift.sh`) nem a mechanizmust deríti fel, hanem a **naplózás hiányát pótolja**: a mért és a konfigurált modell egyezésén túl azt is figyeli, hogy minden modellváltó session-határhoz tartozik-e `config_change_log` bejegyzés. Ha van változás bejegyzés nélkül, az a jelzés. A riasztás a MÉRT és a KONFIGURÁLT modellt is tartalmazza. Fejlécében rögzítve, hogy a 07-23/24-i eset **képesség-probléma volt, nem költség**: kb. 322 USD-egyenértéket *spórolt*, tehát egy költség-alapú figyelésben láthatatlan lett volna.
 
@@ -253,6 +257,10 @@ A negyedik más kategória: jogi anyagnál lehet egyetlen példány egy tárgyal
 
 **A kockázat-inverzió:** pontosan ez a `legal-share-exit` az egyike annak a három könyvtárnak, amit Gábor döntésére várva **kizárva** hagytunk. Vagyis a négy tétel közül a legkevésbé pótolható az egyetlen, ami nincs védve. `[MÉRT]` A `projects/legal-share-exit/work/` tartalma az `agreement-ORIGINAL.docx` (254,6 KB) plusz hat variáns, mind kb. 1 MB; git-ben trackelt fájl **nulla**, és a 20260730-152437-es mentés manifestjében `legal-share-exit` találat **nulla**. Semmilyen második példány nincs.
 
+**Egy negyedik dimenzió, amit a hármas bontás nem fed (Charlie, 2026-07-30):** a **pótolhatóság és a megőrzési kötelezettség két külön tengely**. Egy számla lehet könnyen újra beszerezhető (kibocsátótól, banki kivonatból, könyvelési rendszerből) **és** egyben olyan bizonylat, amit jogszabály szerint meghatározott ideig meg kell őrizni és felszólításra elő kell állítani. Ilyenkor nem az a kérdés, hogy vissza tudjuk-e állítani, hanem hogy **meg tudjuk-e mutatni amikor kérik**.
+
+`[NYITOTT]` Ebből következő kérdés Gáborhoz vagy a könyvelőjéhez, amit a flotta nem tud és nem is akar eldönteni: a `projects/zenom/szamlak` alatti számlák **másodpéldányok** egy rendes könyvelési rendszerből, vagy bármelyik közülük az egyetlen példány? Ha másodpéldányok, a kizárás rendben van és a pótolhatósági besorolás a döntő. Ha bármelyik csak itt létezik, akkor a kizárás nem pótolhatósági hanem **megfelelőségi** kérdés, és más döntés.
+
 **Módszertani tanulság, saját hibából:** én a `projects/` tartalmát **méret szerint** rangsoroltam (149 MB pótolhatatlan réteg), ami a legkevésbé informatív dimenzió. A helyreállítási sorrend a pótolhatóságból adódik, nem a méretből.
 
 `[NYITOTT]` A három nagy projekt (`ibanguardian`, `epsom`, `whisperflow-local`) egyikének sincs saját git repója, tehát a **saját kódjuk** sincs verziózva. Külön döntés.
@@ -327,6 +335,8 @@ Minden rendszerváltozás ide kerül. Formátum: dátum, mi változott, miért, 
 | 2026-07-30 14:41 | `scripts/nightly-memory-backup.py`: offsite feltöltés service-account DWD tokenre | A személyes token 404-et adott a zenom-drive mappára, a `drive-zenom.json` pedig `invalid_grant` | neo, diagnózis mr-wolfe | `git revert 6bb9dcf` |
 | 2026-07-30 14:45 | `backup-offsite-upload-wolfe` ütemezett feladat: feltöltő → ellenőrző | A szkript feltöltése helyreállt, két feltöltő duplikálna | mr-wolfe | a `SKILL.md` és `task-config.json` visszaírása a feltöltő változatra |
 | 2026-07-30 | zenom deploy: EN, DE, FR mind V2 designon, **mindkét** docrootba; HU, PL, SK 301-tel a saját domain gyökerére | Gábor döntése; a törlés 404-et gyártott volna indexelt URL-ekre | neo, audit mr-wolfe | a `deploy-dist-de-20260730` előtti állapot a repóban, a kiesett nyelvek fájljai megtartva |
+| 2026-07-30 16:40 | A "session egy-modelles" állítás JAVÍTVA: a sub-ágensek ugyanazon `session_id` alatt naplózódnak | Neo mérése: `353fed4d` Fable 1242 plusz Opus-4-8 24 esemény; az én `HAVING ev>15` lekérdezésem elrejtette | neo mérése, javítás mr-wolfe | a hibás állítás visszaírása, de az félrevezető |
+| 2026-07-30 16:35 | Drift-detektor v2 (`462bb4d`): B-detektor a naplózatlan session-határos váltásra, A-detektor a konfig-egyezésre | Az első futás azonnal 3 naplózatlan váltást talált 48h-n belül | neo | `git revert 462bb4d` |
 | 2026-07-30 16:20 | A mentési prioritás pótolhatóság szerint, nem méret szerint; a `legal-share-exit` bekerülése Gábor felé élesítve | A legkevésbé pótolható tétel volt az egyetlen kizárt: kockázat-inverzió | charlie bontása, mérés és eszkalálás mr-wolfe | a kizárás visszaállítása |
 | 2026-07-30 15:22 | Modell-identitás drift figyelő: `scripts/check-model-drift.sh` plusz `marveen-model-drift.timer` (`06..21:37:00`) | A 07-23/24-i modellváltás naplózás nélkül történt; a mechanizmus ismert, a naplózás hiányos | neo, megkötések mr-wolfe | `git revert d947f7f` plusz a timer letiltása |
 | 2026-07-30 15:25 | `projects/` fa a nightly mentésbe, függőség-kizárással | 1,1 GB, 22 395 fájl, se verzió se mentés; egyetlen példány egyetlen hoston | neo, lelet mr-wolfe | `git revert db49a7f` |
