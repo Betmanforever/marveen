@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline'
 import { getDb } from '../db.js'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
+import { listAgentNames, agentDir } from './agent-config.js'
 
 const PROJECTS_DIR = join(homedir(), '.claude', 'projects')
 
@@ -24,9 +25,8 @@ interface AgentTranscriptSource {
 
 function discoverAgentSources(): AgentTranscriptSource[] {
   const sources: AgentTranscriptSource[] = []
-  if (!existsSync(PROJECTS_DIR)) return sources
   const mainDirName = encodeProjectPath(PROJECT_ROOT)
-  for (const entry of readdirSync(PROJECTS_DIR)) {
+  for (const entry of existsSync(PROJECTS_DIR) ? readdirSync(PROJECTS_DIR) : []) {
     const full = join(PROJECTS_DIR, entry)
     let stat
     try { stat = statSync(full) } catch { continue }
@@ -37,6 +37,20 @@ function discoverAgentSources(): AgentTranscriptSource[] {
       sources.push({ agent: agentMatch[1], projectDir: full })
     } else if (entry === mainDirName) {
       sources.push({ agent: MAIN_AGENT_ID, projectDir: full })
+    }
+  }
+  // Scoped sub-agent configs. Since the per-agent CLAUDE_CONFIG_DIR migration
+  // (2026-07-08) sub-agent transcripts live under
+  // agents/<name>/.claude-config/projects/<encoded-agent-cwd>/, invisible to
+  // the HOME scan above -- that is why sub-agent token logging silently
+  // stopped on 07-08 (card 8310fcf2): the HOME -agents-* dirs' newest JSONLs
+  // are 07-08/07-09 while every live agent writes to its scoped dir. The HOME
+  // scan stays for the main agent and for the legacy backlog; per-file cursors
+  // make scanning both sides double-count-safe.
+  for (const name of listAgentNames()) {
+    const scopedDir = join(agentDir(name), '.claude-config', 'projects', encodeProjectPath(agentDir(name)))
+    if (existsSync(scopedDir)) {
+      sources.push({ agent: name, projectDir: scopedDir })
     }
   }
   return sources
