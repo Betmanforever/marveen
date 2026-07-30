@@ -1,6 +1,6 @@
 # Marveen rendszerleírás
 
-**Verzió:** 1.5 (v1.0-1.4: 2026-07-30 14:45-15:45; v1.5: 16:00, modell-drift figyelő, projects/ a mentésben, a Fable-kredit dialógus mechanizmusa)
+**Verzió:** 1.6 (v1.0-1.5: 2026-07-30 14:45-16:00; v1.6: 16:20, a pótolhatóság három kategóriája és a kockázat-inverzió)
 **Készítette:** mr-wolfe, 2026-07-30
 **Megrendelés:** Szabó Gábor, 2026-07-30: "wolfe must prepare a system description document that will be archived and any system change should be logged there."
 **Archívum helye:** zenom Drive (`zenom@zenom.hu`), `Marveen Backups` mellett
@@ -238,6 +238,23 @@ A 945 MB-os rész túlnyomóan újratermelhető függőség (`node_modules`, `.v
 
 `[NYITOTT]` **Drive-oldali retenció nincs nyesve.** A `prune_tier` csak lokálisan töröl. 110 MB/éjszaka mellett ez kb. 3,3 GB/hó, tehát a 30 GB kvóta kb. 9 hónap alatt betelik, és akkor a mentés a kvóta-ellenőrzésen áll meg. Nem sürgős, de a hiba jellege alattomos: nem romlást látunk, hanem egy nap hirtelen nincs mentés. Kanban `b2daf2c8`. A javításnál kritikus, hogy a Drive-prune soha ne töröljön olyat, aminek nincs frissebb párja, és a heti promóciót ne nyesse le a napi szabály.
 
+### 9.2 A pótolhatóság három kategóriája, és egy kockázat-inverzió
+
+`[MÉRT 2026-07-30]` A mentési prioritást **nem a fájlméret adja**, hanem a pótolhatóság, és az nem bináris. Charlie bontása:
+
+| tétel | pótolható? |
+|---|---|
+| élő zenom site forrás | **részben**: a futó deploymentből visszanyerhető |
+| `kb.db` tudásbázis | **költséggel regenerálható** a forrásanyagokból |
+| 59 board-döntés rekord | **részben**: a döntések nyoma a napi naplóban, kanbanban és memóriában is ott van |
+| `legal-share-exit` anyag | **NEM pótolható** |
+
+A negyedik más kategória: jogi anyagnál lehet egyetlen példány egy tárgyalt álláspontról, lehet bizonyító ereje, és lehet határidő-kötött. Ezek egyike sem áll vissza újra-előállítással.
+
+**A kockázat-inverzió:** pontosan ez a `legal-share-exit` az egyike annak a három könyvtárnak, amit Gábor döntésére várva **kizárva** hagytunk. Vagyis a négy tétel közül a legkevésbé pótolható az egyetlen, ami nincs védve. `[MÉRT]` A `projects/legal-share-exit/work/` tartalma az `agreement-ORIGINAL.docx` (254,6 KB) plusz hat variáns, mind kb. 1 MB; git-ben trackelt fájl **nulla**, és a 20260730-152437-es mentés manifestjében `legal-share-exit` találat **nulla**. Semmilyen második példány nincs.
+
+**Módszertani tanulság, saját hibából:** én a `projects/` tartalmát **méret szerint** rangsoroltam (149 MB pótolhatatlan réteg), ami a legkevésbé informatív dimenzió. A helyreállítási sorrend a pótolhatóságból adódik, nem a méretből.
+
 `[NYITOTT]` A három nagy projekt (`ibanguardian`, `epsom`, `whisperflow-local`) egyikének sincs saját git repója, tehát a **saját kódjuk** sincs verziózva. Külön döntés.
 
 Élő visszaállítási teszt 2026-07-30-án megtörtént.
@@ -310,6 +327,7 @@ Minden rendszerváltozás ide kerül. Formátum: dátum, mi változott, miért, 
 | 2026-07-30 14:41 | `scripts/nightly-memory-backup.py`: offsite feltöltés service-account DWD tokenre | A személyes token 404-et adott a zenom-drive mappára, a `drive-zenom.json` pedig `invalid_grant` | neo, diagnózis mr-wolfe | `git revert 6bb9dcf` |
 | 2026-07-30 14:45 | `backup-offsite-upload-wolfe` ütemezett feladat: feltöltő → ellenőrző | A szkript feltöltése helyreállt, két feltöltő duplikálna | mr-wolfe | a `SKILL.md` és `task-config.json` visszaírása a feltöltő változatra |
 | 2026-07-30 | zenom deploy: EN, DE, FR mind V2 designon, **mindkét** docrootba; HU, PL, SK 301-tel a saját domain gyökerére | Gábor döntése; a törlés 404-et gyártott volna indexelt URL-ekre | neo, audit mr-wolfe | a `deploy-dist-de-20260730` előtti állapot a repóban, a kiesett nyelvek fájljai megtartva |
+| 2026-07-30 16:20 | A mentési prioritás pótolhatóság szerint, nem méret szerint; a `legal-share-exit` bekerülése Gábor felé élesítve | A legkevésbé pótolható tétel volt az egyetlen kizárt: kockázat-inverzió | charlie bontása, mérés és eszkalálás mr-wolfe | a kizárás visszaállítása |
 | 2026-07-30 15:22 | Modell-identitás drift figyelő: `scripts/check-model-drift.sh` plusz `marveen-model-drift.timer` (`06..21:37:00`) | A 07-23/24-i modellváltás naplózás nélkül történt; a mechanizmus ismert, a naplózás hiányos | neo, megkötések mr-wolfe | `git revert d947f7f` plusz a timer letiltása |
 | 2026-07-30 15:25 | `projects/` fa a nightly mentésbe, függőség-kizárással | 1,1 GB, 22 395 fájl, se verzió se mentés; egyetlen példány egyetlen hoston | neo, lelet mr-wolfe | `git revert db49a7f` |
 | 2026-07-30 15:45 | A kódolás-kockázat állítása SZŰKÍTVE: nem flotta-szintű minta, hanem forrásdokumentum-szabály | Egy túl tág állítást írtam a permanens dokumentumba; Alex lemérte hogy a DE draft rendesen ékezetes (57 találat), tehát a defekt az ő fájljára volt specifikus | alex mérése, javítás mr-wolfe | a bővebb állítás visszaírása, de az felesleges javító köröket indítana |
