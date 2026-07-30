@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
-# Silent-by-default MODEL-IDENTITY drift check: compares the model MEASURED in
-# token_usage against the model CONFIGURED for each fleet agent, and speaks
-# only on mismatch.
+# Silent-by-default MODEL-IDENTITY drift check, two detectors:
+#   A) the latest session's MAIN-LOOP model vs the CONFIGURED model per agent
+#   B) session-boundary model switches WITHOUT a config_change_log entry --
+#      the primary detector. The switch MECHANISM is known and needs no
+#      discovery (the Fable5 usage-credits startup dialog resolves to a model
+#      choice at session start); what fails in practice is the LOGGING. By
+#      2026-07-30 there were 5 dialog occurrences and only 3 log entries
+#      (config_change_log 39, 41, 44): the 07-23 and 07-24 switches were
+#      proven afterwards from session-level measurement only. A switch that
+#      nobody wrote down is the signal -- and this also catches the case
+#      where the CONFIG itself moved without anyone recording it, which the
+#      plain config-vs-measured comparison is blind to.
+#
+# DANGER DETAIL for whoever meets the dialog next: its PRE-HIGHLIGHTED
+# default is "Switch to Sonnet 5", so a careless Enter DOWNGRADES the agent.
+# "Continue with Fable 5" must be selected deliberately (see log entry 39 vs
+# 41 for both outcomes).
 #
 # WHY MODEL IDENTITY AND NOT COST (do not rewrite this into a cost monitor):
 # the 2026-07-23/24 precedent -- an agent silently ran on the WRONG model for
 # two days and it only surfaced afterwards, from backfilled data. That drift
 # was NOT a cost problem but a CAPABILITY problem: it actually SAVED roughly
 # 322 USD-equivalent, so any cost-based alerting would have been blind to it
-# by construction. The failure mode is "the fleet quietly runs dumber (or
-# just different) than configured", and the only signal that catches it is
-# comparing measured model id vs configured model id.
+# by construction. The only signal that catches it is comparing measured
+# model identity against configured/logged model identity.
 #
 # Config sources (verified in src/web/agent-config.ts readModelFor()):
 #   - MAIN agent (mr-wolfe): repo-root .claude/settings.json `model` field.
@@ -20,41 +33,50 @@
 #     mr-wolfe every single round.
 #   - Sub-agents (agents/<name>/): agents/<name>/agent-config.json `model`.
 #
-# Measurement source: store/claudeclaw.db token_usage. Two schema facts that
-# have already caused silent failures elsewhere, encoded here so they are not
+# Measurement source: store/claudeclaw.db token_usage. Schema facts that have
+# already caused silent failures elsewhere, encoded so they are not
 # rediscovered the hard way:
 #   - token_usage.timestamp is a UNIX EPOCH INTEGER. Use
 #     datetime(timestamp,'unixepoch','localtime'); date(timestamp,'localtime')
 #     does NOT error -- it returns ZERO rows, i.e. a mute detector.
 #   - the agent column is named `agent`, not `agent_id`.
-#
-# Dominance weighting: within the window the models are ranked by token volume
-# (input+output+cache_creation+thinking), not row count, and rows with model
-# NULL or '<synthetic>' are excluded. Small background calls (e.g. haiku
-# summarizers) therefore cannot outvote the session model; additionally haiku
-# rows are ignored outright unless haiku IS the configured model, so an
-# almost-idle agent whose only window traffic is background haiku does not
-# false-alarm.
+#   - sessions are NOT single-model: subagent traffic (hard-coder on Opus,
+#     haiku summarizers) logs under the SAME session_id, and can even
+#     out-weigh the main loop (measured 2026-07-30: session 0ba2dcef fable
+#     147k vs opus 130k). The main-loop model is therefore taken from the
+#     session's FIRST rows (majority of the earliest 7), which was verified
+#     correct on all 5 recent multi-model neo sessions -- NOT from total
+#     token weight.
+#   - tiny sessions are probes (model-fallback watcher runs 1-turn "ok"
+#     probes on OTHER models); the weight floor below keeps them from
+#     reading as switches.
 #
 # Output contract (same as check-hook-drift.sh): NOTHING on stdout/stderr and
-# exit 0 when every measured agent matches its configured model. Any stdout
-# line + exit 1 means drift; the caller (model-drift-timer.sh) surfaces it.
-# An agent with no token rows in the window is silently skipped -- absence of
-# traffic is not drift.
+# exit 0 when clean. Any stdout + exit 1 means drift; the caller
+# (model-drift-timer.sh) dedups and surfaces it. Every finding line starts
+# with "  - " (the wrapper's dedup key depends on it).
 set -euo pipefail
 
 MARVEEN_ROOT="/home/szabgabor/marveen"
 DB="$MARVEEN_ROOT/store/claudeclaw.db"
-WINDOW_MIN="${WINDOW_MIN:-180}"
+LOOKBACK_H="${LOOKBACK_H:-48}"       # session-boundary scan window
+MIN_SESSION_TOKENS="${MIN_SESSION_TOKENS:-20000}"  # probe floor
+LOG_GRACE_BEFORE_H=12                # a log entry this long BEFORE the boundary counts
+LOG_GRACE_AFTER_H=2                  # ... or this long after (post-hoc logging)
 
-python3 - "$MARVEEN_ROOT" "$DB" "$WINDOW_MIN" <<'PYEOF'
+python3 - "$MARVEEN_ROOT" "$DB" "$LOOKBACK_H" "$MIN_SESSION_TOKENS" \
+          "$LOG_GRACE_BEFORE_H" "$LOG_GRACE_AFTER_H" <<'PYEOF'
 import json
 import os
 import re
 import sqlite3
 import sys
+from collections import Counter
 
-marveen_root, db_path, window_min = sys.argv[1], sys.argv[2], int(sys.argv[3])
+(marveen_root, db_path, lookback_h, min_tokens,
+ grace_before_h, grace_after_h) = sys.argv[1:7]
+lookback_h, min_tokens = int(lookback_h), int(min_tokens)
+grace_before_s, grace_after_s = int(grace_before_h) * 3600, int(grace_after_h) * 3600
 
 # Mirror of MODEL_ALIASES + DEFAULT_MODEL in src/web/agent-config.ts (the
 # config files may legally contain an alias instead of a full model id).
@@ -69,9 +91,7 @@ MODEL_ALIASES = {
 }
 
 def normalize(model):
-    """Alias-resolve, then strip the [1m] context marker and a trailing
-    -YYYYMMDD date suffix, so 'claude-opus-4-8[1m]' == 'claude-opus-4-8' and
-    'claude-haiku-4-5-20251001' == 'claude-haiku-4-5'."""
+    """Alias-resolve, strip the [1m] marker and a trailing -YYYYMMDD suffix."""
     m = MODEL_ALIASES.get(model, model)
     m = m.replace('[1m]', '')
     return re.sub(r'-20\d{6}$', '', m)
@@ -83,13 +103,15 @@ def read_json(path):
     except Exception:
         return None
 
-# Configured model per agent.
+problems = []
+
+# Configured model per agent (see header for why mr-wolfe is special).
 configured = {}
 main_cfg = read_json(os.path.join(marveen_root, '.claude', 'settings.json'))
 if isinstance(main_cfg, dict) and isinstance(main_cfg.get('model'), str):
     configured['mr-wolfe'] = main_cfg['model']
 else:
-    print(f"mr-wolfe: cannot read `model` from {marveen_root}/.claude/settings.json")
+    problems.append(f"  - mr-wolfe: nem olvashato a `model` a {marveen_root}/.claude/settings.json-bol")
 
 agents_dir = os.path.join(marveen_root, 'agents')
 for name in sorted(os.listdir(agents_dir)):
@@ -99,43 +121,98 @@ for name in sorted(os.listdir(agents_dir)):
     if isinstance(cfg, dict) and isinstance(cfg.get('model'), str):
         configured[name] = cfg['model']
 
-# Measured token volume per (agent, model) in the window.
 con = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
-rows = con.execute(
+
+# Per-session aggregates in the lookback window (probe sessions floored out).
+sess_rows = con.execute(
     """
-    SELECT agent, model,
+    SELECT agent, session_id,
+           MIN(timestamp) AS start_ts, MAX(timestamp) AS end_ts,
            SUM(input_tokens + output_tokens + cache_creation_tokens + thinking_tokens) AS weight,
-           MAX(datetime(timestamp,'unixepoch','localtime')) AS last_seen
+           datetime(MIN(timestamp),'unixepoch','localtime') AS start_local
     FROM token_usage
-    WHERE timestamp >= strftime('%s','now') - ? * 60
+    WHERE timestamp >= strftime('%s','now') - ? * 3600
       AND model IS NOT NULL AND model != '<synthetic>'
-    GROUP BY agent, model
+    GROUP BY agent, session_id
+    HAVING weight >= ?
     """,
-    (window_min,),
+    (lookback_h, min_tokens),
 ).fetchall()
+
+def main_model(agent, session_id):
+    """Main-loop model: majority of the session's earliest 7 model-bearing
+    rows (see header -- weight-dominance is wrong under subagent traffic)."""
+    first = con.execute(
+        """
+        SELECT model FROM token_usage
+        WHERE agent = ? AND session_id = ?
+          AND model IS NOT NULL AND model != '<synthetic>'
+        ORDER BY timestamp, id LIMIT 7
+        """,
+        (agent, session_id),
+    ).fetchall()
+    if not first:
+        return None
+    return Counter(m for (m,) in first).most_common(1)[0][0]
+
+def model_log_entries(agent):
+    """config_change_log rows that legitimize a model change for this agent.
+    Key styles in the wild: agent_model:<a>, agent.<a>.model,
+    agent_model_dialog:<a>; mr-wolfe's main model may also be logged as
+    agent_model:mr-wolfe."""
+    rows = con.execute(
+        "SELECT key, created_at FROM config_change_log WHERE key LIKE '%model%'",
+    ).fetchall()
+    return [ts for key, ts in rows if agent in key]
+
+sessions_by_agent = {}
+for agent, sid, start_ts, end_ts, weight, start_local in sess_rows:
+    sessions_by_agent.setdefault(agent, []).append(
+        (start_ts, end_ts, sid, weight, start_local))
+
+for agent, cfg_model in sorted(configured.items()):
+    sessions = sorted(sessions_by_agent.get(agent, []))
+    if not sessions:
+        continue  # no qualifying traffic in window -- not drift
+
+    resolved = []
+    for start_ts, end_ts, sid, weight, start_local in sessions:
+        mm = main_model(agent, sid)
+        if mm:
+            resolved.append((start_ts, end_ts, sid, mm, start_local))
+
+    # A) latest session's main-loop model vs configured
+    if resolved:
+        start_ts, _end, sid, mm, start_local = resolved[-1]
+        if normalize(mm) != normalize(cfg_model):
+            problems.append(
+                f"  - {agent}: MERT={mm} vs KONFIGURALT={cfg_model} "
+                f"(utolso session {sid[:8]}, indult {start_local})")
+
+    # B) session-boundary switches without a config_change_log entry.
+    log_ts = model_log_entries(agent)
+    for prev, cur in zip(resolved, resolved[1:]):
+        p_start, p_end, p_sid, p_model, _pl = prev
+        c_start, c_end, c_sid, c_model, c_local = cur
+        if normalize(p_model) == normalize(c_model):
+            continue
+        if c_start < p_end:
+            continue  # overlapping/parallel sessions, not a boundary
+        logged = any(c_start - grace_before_s <= ts <= c_start + grace_after_s
+                     for ts in log_ts)
+        if not logged:
+            problems.append(
+                f"  - {agent}: NAPLOZATLAN MODELLVALTAS a session-hataron: "
+                f"{p_model} ({p_sid[:8]}) -> {c_model} ({c_sid[:8]}, indult {c_local}) "
+                f"-- nincs config_change_log bejegyzes a hatar korul "
+                f"(-{grace_before_h}h..+{grace_after_h}h)")
+
 con.close()
 
-measured = {}
-for agent, model, weight, last_seen in rows:
-    measured.setdefault(agent, []).append((weight or 0, model, last_seen))
-
-drift = []
-for agent, cfg_model in configured.items():
-    candidates = measured.get(agent, [])
-    if normalize(cfg_model) != normalize(MODEL_ALIASES['haiku']):
-        candidates = [c for c in candidates if not c[1].startswith('claude-haiku')]
-    if not candidates:
-        continue  # no traffic in window -- not drift
-    weight, dominant, last_seen = max(candidates)
-    if normalize(dominant) != normalize(cfg_model):
-        drift.append(
-            f"  - {agent}: MERT={dominant} vs KONFIGURALT={cfg_model} "
-            f"({weight} token a {window_min} perces ablakban, utolso sor: {last_seen})"
-        )
-
-if drift:
-    print(f"MODELL-DRIFT ({window_min} perces ablak, sulyozas: tokenvolumen):")
-    for line in drift:
+if problems:
+    print(f"MODELL-DRIFT/NAPLOZASI-RES ({lookback_h}h ablak, "
+          f"session-floor {min_tokens} token):")
+    for line in problems:
         print(line)
     sys.exit(1)
 
