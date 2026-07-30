@@ -1,6 +1,6 @@
 # Marveen rendszerleírás
 
-**Verzió:** 1.7 (v1.0-1.6: 2026-07-30 14:45-16:20; v1.7: 16:40, a session nem egy-modelles, három új naplózatlan váltás, megőrzési kötelezettség mint külön tengely)
+**Verzió:** 1.8 (v1.0-1.7: 2026-07-30 14:45-16:40; v1.8: 17:00, a horgony-szabály: a koordinátor javasoljon mechanizmust, de jelölje meg horgonyként)
 **Készítette:** mr-wolfe, 2026-07-30
 **Megrendelés:** Szabó Gábor, 2026-07-30: "wolfe must prepare a system description document that will be archived and any system change should be logged there."
 **Archívum helye:** zenom Drive (`zenom@zenom.hu`), `Marveen Backups` mellett
@@ -175,6 +175,16 @@ Az ágensek `agents/<név>/in/` és `qa-in/` mappáin keresztül kapnak fájloka
 
 Az aznapi mérleg: mr-wolfe négy állítása dőlt meg méréssel, egyet sem ő talált meg, és **háromnak a tárgya egy másik ágens saját scope-jában volt** (mi van az `in/` mappájában, mikor írt egy fájlt, melyik két jelöltje ugyanaz). Ive hét másodperc alatt futtatta le az `ls`-t a saját mappájában; ugyanaz a koordinátornak köröket és egy hibás konklúziót jelentett.
 
+### 5.5 A horgony-szabály: a koordinátor javasoljon, de jelölje meg
+
+`[MÉRT 2026-07-30]` Aznap **három külön szakterületen** ugyanaz történt: a koordinátor szándéka jó volt, a javasolt **mechanizmus** viszont túl durva, és a területi ember javította. Charlie a scope-eltérésnél, Ive a modell-értékelésnél, Alex a riasztási küszöbnél (30 tételnél a 10 százalék három pozitívat jelent, tehát az én egylépcsős küszöböm egy hárompontos mintára épített szabály-átírást indított volna).
+
+**Amit ebből NEM szabad levonni**, és ezt Alex mondta ki: hogy a koordinátor ezentúl csak szándékot javasoljon, mechanizmust ne, és várja hogy a területi ember kitöltse. Ez **rosszabb rendszert** adna. Az ő kétlépcsős küszöbe nem létezne, ha én nem javasoltam volna először az egylépcsőset: nem azért, mert nem gondolkodott volna rajta, hanem mert nem gondolkodott volna rajta **akkor**. A konkrét forma kényszerítette ki, hogy leellenőrizze mit jelent a 10 százalék harminc tételen. Egy szándék-szintű felvetés ("valahogy jelezzük ha alacsony a base rate") ezt nem váltotta volna ki.
+
+**Vagyis a hibás javaslat is elvégzett egy munkát: horgonyt adott, amihez mérni lehetett.** A rossz javaslat gyorsabban hoz jó eredményt mint a nem-javaslat, feltéve hogy valaki ellenőrzi. Három esetben három külön ember ellenőrizte. A rendszer **működött**, nem hibázott.
+
+**A szűkebb, helyes szabály:** ne a javaslatokat hagyd el, hanem a **számokat jelöld meg annak amik**. Ha küszöböt, méretet vagy arányt javasolsz olyan területen, ahol nem te mérsz, írd oda hogy **horgony és nem döntés**. Így a területi ember tudja hogy javítania **kell** rajta, nem csak **szabad**. Ez egy szó a mondatban, nem új folyamat, és nem veszi el a koordinátortól azt amiben hasznos: hogy konkrét formában teszi fel a kérdést.
+
 **Szabály:** ha egy állítás tárgya egy másik ágens saját scope-jában van, a legolcsóbb verifikáció nem a következtetés, hanem **egy kérdés annak az ágensnek**. A mérés ott a legolcsóbb, ahol az adat lakik. Fordítva is áll: amiről a koordinátornál van az adat (Gábor korrekciói, a relay állapota, a flotta-topológia), azt ő adja tényként, ne hagyja hogy a peer következtessen rá.
 
 ---
@@ -335,6 +345,7 @@ Minden rendszerváltozás ide kerül. Formátum: dátum, mi változott, miért, 
 | 2026-07-30 14:41 | `scripts/nightly-memory-backup.py`: offsite feltöltés service-account DWD tokenre | A személyes token 404-et adott a zenom-drive mappára, a `drive-zenom.json` pedig `invalid_grant` | neo, diagnózis mr-wolfe | `git revert 6bb9dcf` |
 | 2026-07-30 14:45 | `backup-offsite-upload-wolfe` ütemezett feladat: feltöltő → ellenőrző | A szkript feltöltése helyreállt, két feltöltő duplikálna | mr-wolfe | a `SKILL.md` és `task-config.json` visszaírása a feltöltő változatra |
 | 2026-07-30 | zenom deploy: EN, DE, FR mind V2 designon, **mindkét** docrootba; HU, PL, SK 301-tel a saját domain gyökerére | Gábor döntése; a törlés 404-et gyártott volna indexelt URL-ekre | neo, audit mr-wolfe | a `deploy-dist-de-20260730` előtti állapot a repóban, a kiesett nyelvek fájljai megtartva |
+| 2026-07-30 17:00 | Horgony-szabály: a koordinátor javasoljon mechanizmust, de a saját területén kívüli számot jelölje meg horgonyként | Három peer-korrekció ugyanazon a napon; a rossz tanulság ("csak szándékot javasolj") rosszabb rendszert adna | alex korrekciója, rögzítés mr-wolfe | a szabály elhagyása |
 | 2026-07-30 16:40 | A "session egy-modelles" állítás JAVÍTVA: a sub-ágensek ugyanazon `session_id` alatt naplózódnak | Neo mérése: `353fed4d` Fable 1242 plusz Opus-4-8 24 esemény; az én `HAVING ev>15` lekérdezésem elrejtette | neo mérése, javítás mr-wolfe | a hibás állítás visszaírása, de az félrevezető |
 | 2026-07-30 16:35 | Drift-detektor v2 (`462bb4d`): B-detektor a naplózatlan session-határos váltásra, A-detektor a konfig-egyezésre | Az első futás azonnal 3 naplózatlan váltást talált 48h-n belül | neo | `git revert 462bb4d` |
 | 2026-07-30 16:20 | A mentési prioritás pótolhatóság szerint, nem méret szerint; a `legal-share-exit` bekerülése Gábor felé élesítve | A legkevésbé pótolható tétel volt az egyetlen kizárt: kockázat-inverzió | charlie bontása, mérés és eszkalálás mr-wolfe | a kizárás visszaállítása |
