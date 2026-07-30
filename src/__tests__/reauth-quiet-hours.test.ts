@@ -9,11 +9,15 @@ import {
   type QuietSuppressedEntry,
 } from '../web/reauth-healer.js'
 
-// Quiet hours (23:00-06:00 Europe/Budapest) for the reauth-healer escalation.
+// Quiet hours (22:00-06:00 Europe/Budapest) for the reauth-healer escalation.
 // Motivated by 2026-07-09 night: spock+scotty re-alerted every 30 minutes all
 // night about a dead token nobody could fix before morning. The probe keeps
 // running; ONLY notify.sh is held back, and the first sweep after 06:00 sends
 // ONE summary about the agents still dead at that moment.
+//
+// The window moved from 23:00 to 22:00 and became fleet-wide (src/quiet-hours.ts)
+// with Gabor's 2026-07-30 standing rule. The predicates are imported from the
+// reauth-healer on purpose: that also pins the re-export its other callers use.
 
 const entry = (session: string, label = session, consecutiveDead = 10): QuietSuppressedEntry => ({
   session,
@@ -23,13 +27,14 @@ const entry = (session: string, label = session, consecutiveDead = 10): QuietSup
 })
 
 describe('isQuietHour / budapestHour', () => {
-  it('23:00-05:59 csendes, 06:00-22:59 nem', () => {
+  it('22:00-05:59 csendes, 06:00-21:59 nem', () => {
+    expect(isQuietHour(22)).toBe(true)
     expect(isQuietHour(23)).toBe(true)
     expect(isQuietHour(0)).toBe(true)
     expect(isQuietHour(5)).toBe(true)
     expect(isQuietHour(6)).toBe(false)
     expect(isQuietHour(12)).toBe(false)
-    expect(isQuietHour(22)).toBe(false)
+    expect(isQuietHour(21)).toBe(false)
   })
 
   it('budapestHour a host TZ-től függetlenül Europe/Budapest órát ad (CEST=UTC+2 nyáron)', () => {
@@ -153,7 +158,7 @@ describe('üzenet-szövegek', () => {
 
   it('az összegző megnevezi a sávot és agensenként a hozzávetőleges időt', () => {
     const msg = buildQuietSummaryMessage([entry('agent-spock', 'spock', 140)])
-    expect(msg).toContain('23:00-06:00')
+    expect(msg).toContain('22:00-06:00')
     expect(msg).toContain('• spock')
     expect(msg).toMatch(/~\d+ perce/)
   })

@@ -15,6 +15,7 @@ import { getCalendarEvents, type CalendarEvent } from './google-api.js'
 import { runAgent } from './agent.js'
 import { notifyTelegram } from './notify.js'
 import { logger } from './logger.js'
+import { isQuietHour, budapestHour } from './quiet-hours.js'
 import { wrapUntrusted, UNTRUSTED_PREAMBLE } from './prompt-safety.js'
 
 // Isolation cwd for the heartbeat sub-agent. Keep this OUT of PROJECT_ROOT
@@ -350,16 +351,20 @@ async function collectData(): Promise<HeartbeatData> {
 // --- Notification filter ---
 
 function shouldNotify(data: HeartbeatData): boolean {
-  const hour = data.timestamp.getHours()
+  const hour = budapestHour(data.timestamp.getTime())
   const dayOfWeek = data.timestamp.getDay()
   const isWeekend = dayOfWeek === 0 || dayOfWeek === 6
 
-  if (data.system.dbWarning) return true
+  // Ejjeli csendes sav (22:00-06:00 Europe/Budapest, Gabor 2026-07-30-i
+  // szabalya) -- MINDEN heartbeat-ertesites elott, a dbWarning-ot is beleertve.
+  // A dbWarning ALLAPOT es nem esemeny: minden heartbeat-futas ujraszamolja, a
+  // 06:00 utani elso futas ugyis riaszt, ha meg fennall -- hajnali 3-kor
+  // viszont nincs mit kezdeni vele (wolfe + neo dontes, 2026-07-30). Korabban
+  // a kapu csak `hour >= 22` volt, also hatar nelkul (igy 00:00-05:59 szabadon
+  // riasztott az urgent kartyakra), es a dbWarning-ag MEG ELOTTE return-olt.
+  if (isQuietHour(hour)) return false
 
-  // 22:00 utan csendes ablak -- csak igazi rendszer-vesz (dbWarning, fent
-  // mar return-olt) lephet at. Stale urgent kanban-kartyak este nem zavarjak
-  // a felhasznalot.
-  if (hour >= 22) return false
+  if (data.system.dbWarning) return true
 
   if (hour >= 21) {
     return data.kanban.urgent > 0

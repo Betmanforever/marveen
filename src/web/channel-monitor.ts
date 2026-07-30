@@ -44,6 +44,7 @@ import { decidePendingAgeAlert, decidePendingAgeRealert, shouldAlertStuckTarget,
 import { detectsUsageLimit, extractLimitReset } from '../model-fallback.js'
 import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { notifyChannel } from '../notify.js'
+import { QUIET_START_HOUR, QUIET_END_HOUR, isQuietHour, budapestHour } from '../quiet-hours.js'
 import { getProvider, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { attemptChannelMcpReconnect } from './channel-mcp-reconnect.js'
 import { readLastIngestionTimestamp, TRANSCRIPT_DIR } from './inbound-probe.js'
@@ -1335,11 +1336,92 @@ function checkMainKeepaliveStaleness(): void {
   }
 }
 
+// -- Quiet hours (22:00-06:00 Europe/Budapest, see src/quiet-hours.ts) --------
+//
+// EVERY owner alert of this monitor funnels through sendAlert, so the window is
+// enforced here rather than at its ~25 call sites. Unlike the heartbeat filter
+// (which re-evaluates its whole state every run, so a suppressed run loses
+// nothing), a monitor alert is a one-off EVENT: dropping it overnight would
+// hide the incident for good. So it is buffered instead, and the first
+// non-quiet path -- an alert about to go out, or the monitor tick -- sends ONE
+// summary of what happened during the night.
+const QUIET_ALERT_BUFFER_MAX = 50
+
+export interface QuietBufferedAlert {
+  ts: number
+  text: string
+}
+
+export interface QuietAlertBuffer {
+  entries: QuietBufferedAlert[]
+  /** Alerts discarded once the buffer was full. Named in the summary so the
+   * gap is visible instead of silent. */
+  dropped: number
+}
+
+export const EMPTY_QUIET_ALERT_BUFFER: QuietAlertBuffer = { entries: [], dropped: 0 }
+
+/**
+ * Append one suppressed alert, capped at `max`. Past the cap the OLDEST entries
+ * are kept (the first alerts of the night carry the root cause; the later ones
+ * are typically its echo) and the overflow is only counted -- an unbounded
+ * buffer would let a stuck monitor loop grow it all night.
+ */
+export function bufferQuietAlert(state: QuietAlertBuffer, entry: QuietBufferedAlert, max: number): QuietAlertBuffer {
+  if (state.entries.length >= max) return { entries: state.entries, dropped: state.dropped + 1 }
+  return { entries: [...state.entries, entry], dropped: state.dropped }
+}
+
+/** The morning summary, or null when nothing was suppressed. */
+export function buildQuietAlertSummary(state: QuietAlertBuffer, max = QUIET_ALERT_BUFFER_MAX): string | null {
+  if (state.entries.length === 0) return null
+  const lines = state.entries.map((e) => {
+    const hhmm = new Date(e.ts).toLocaleTimeString('hu-HU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Budapest' })
+    return `• ${hhmm} -- ${e.text}`
+  })
+  if (state.dropped > 0) {
+    lines.push(`• (+${state.dropped} tovabbi riasztas nem fert a pufferbe, plafon: ${max})`)
+  }
+  return [
+    `🌙 Ejszakai osszegzes -- a csendes savban (${QUIET_START_HOUR}:00-0${QUIET_END_HOUR}:00) ${state.entries.length} riasztas volt elnyomva:`,
+    ...lines,
+  ].join('\n')
+}
+
+let quietAlerts: QuietAlertBuffer = EMPTY_QUIET_ALERT_BUFFER
+
 export function sendAlert(text: string): void {
+  const nowMs = Date.now()
+  if (isQuietHour(budapestHour(nowMs))) {
+    quietAlerts = bufferQuietAlert(quietAlerts, { ts: nowMs, text }, QUIET_ALERT_BUFFER_MAX)
+    logger.info(
+      { buffered: quietAlerts.entries.length, dropped: quietAlerts.dropped },
+      'sendAlert: quiet hours -- owner alert buffered for the morning summary',
+    )
+    return
+  }
+  // First alert after the window: the night's summary goes out FIRST so the
+  // owner reads the two in chronological order.
+  flushQuietAlerts()
   // notifyChannel logs its own send failures (see notify.ts); this catch is
   // defense-in-depth against a throw OUTSIDE its try/catches (getProvider,
   // formatMessage, splitMessage) -- never swallow silently, same reasoning.
   notifyChannel(text).catch((err) => logger.error({ err }, 'sendAlert: notifyChannel threw'))
+}
+
+/**
+ * Send the buffered overnight alerts as ONE summary. Driven from both non-quiet
+ * paths -- a fresh alert, and the monitor tick, so a quiet morning does not sit
+ * on the summary until the next incident. Idempotent: the buffer is cleared
+ * BEFORE the send, so a second call finds nothing to flush. Goes out via
+ * notifyChannel, NOT sendAlert -- that would recurse straight back into here.
+ */
+export function flushQuietAlerts(): void {
+  if (isQuietHour(budapestHour(Date.now()))) return
+  const summary = buildQuietAlertSummary(quietAlerts)
+  if (summary == null) return
+  quietAlerts = EMPTY_QUIET_ALERT_BUFFER
+  notifyChannel(summary).catch((err) => logger.error({ err }, 'flushQuietAlerts: notifyChannel threw'))
 }
 
 function handleMarveenDown(): void {
@@ -1484,6 +1566,11 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     // Restore persisted failure counts on first tick so a dashboard restart
     // does not reset the cap and restart agents that have already been given up on.
     ensureAgentRestartFailuresInitialized()
+
+    // Morning flush of the overnight alert buffer. Runs first in the tick so the
+    // summary goes out even when this tick fires no alert of its own (and even
+    // if a later pass throws). No-op while quiet or when nothing was buffered.
+    flushQuietAlerts()
 
     type Target = { session: string; isMarveen: boolean; agentName?: string; provider: ChannelProviderType }
     const targets: Target[] = [{ session: MAIN_CHANNELS_SESSION, isMarveen: true, provider: mainProvider }]

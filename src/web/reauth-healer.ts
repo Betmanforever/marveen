@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { resolveFromPath } from '../platform.js'
+import { QUIET_START_HOUR, QUIET_END_HOUR, isQuietHour, budapestHour } from '../quiet-hours.js'
 import { listAgentNames } from './agent-config.js'
 import { isAgentRunning, capturePane } from './agent-process.js'
 import { resolveAgentSession } from './channel-mcp-reconnect.js'
@@ -130,7 +131,7 @@ async function sendBestEffortLogin(session: string): Promise<void> {
   }
 }
 
-// -- Quiet hours (23:00-06:00 Europe/Budapest) -------------------------------
+// -- Quiet hours (22:00-06:00 Europe/Budapest, see src/quiet-hours.ts) --------
 //
 // Overnight a dead token is not actionable: the fix is a manual browser
 // /login, and nobody does that at 03:00 -- but the healer used to re-alert
@@ -140,21 +141,11 @@ async function sendBestEffortLogin(session: string): Promise<void> {
 // sends ONE summary naming the agents that are STILL dead at that moment
 // (suppressed intermediates are dropped, healed agents are dropped silently),
 // and the normal 30-min re-alert cadence resumes from that summary.
-export const QUIET_START_HOUR = 23 // inclusive
-export const QUIET_END_HOUR = 6    // exclusive
-
-export function isQuietHour(hourLocal: number): boolean {
-  return hourLocal >= QUIET_START_HOUR || hourLocal < QUIET_END_HOUR
-}
-
-// Local wall-clock hour in Europe/Budapest regardless of the host TZ (the
-// same explicit-TZ rule the rest of the fleet follows for time handling).
-export function budapestHour(nowMs: number): number {
-  return parseInt(
-    new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Budapest', hour: '2-digit', hour12: false }).format(new Date(nowMs)),
-    10,
-  )
-}
+//
+// The window itself is fleet-wide now (Gabor's 2026-07-30 rule, which also
+// moved the start to 22:00) and lives in the shared module; re-exported here so
+// the existing importers keep working against this path.
+export { QUIET_START_HOUR, QUIET_END_HOUR, isQuietHour, budapestHour }
 
 export interface QuietSuppressedEntry {
   session: string
