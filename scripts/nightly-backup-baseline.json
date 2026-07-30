@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "created_at": "2026-07-25T15:39:01",
+  "created_by": "scripts/nightly-memory-backup.py --update-baseline",
+  "previous_created_at": "2026-07-25T15:32:05",
+  "note": "Kategoriankenti nem-ures assertion bazisvonala (plan C1/D4/23). A nightly script SOHA nem irja ezt a fajlt magatol: ha hianyzik, leall es riaszt. Csak tudatos, emberi/agent dontessel frissul. files>0 baseline mellett a 0 fajl hard stop; bytes>0 mellett a 0 bajt hard stop; a bytes==0 kategoriak ('0 is OK' placeholderek) novekedese figyelmeztetes, ami ezt a fajlt frissitendove teszi.",
+  "categories": {
+    "identity": {
+      "files": 10,
+      "bytes": 138236
+    },
+    "neo_file_memory": {
+      "files": 3,
+      "bytes": 2542
+    },
+    "agent_memory_placeholder": {
+      "files": 3,
+      "bytes": 0
+    },
+    "mrwolfe_home_memory": {
+      "files": 40,
+      "bytes": 121896
+    },
+    "repo_agent_memory": {
+      "files": 47,
+      "bytes": 144542
+    },
+    "scattered_memory_dirs": {
+      "files": 71,
+      "bytes": 184522
+    },
+    "skills": {
+      "files": 148,
+      "bytes": 1825112
+    },
+    "subagent_defs": {
+      "files": 4,
+      "bytes": 34371
+    },
+    "slash_commands": {
+      "files": 2,
+      "bytes": 2226
+    },
+    "scheduled_tasks": {
+      "files": 45,
+      "bytes": 59690
+    },
+    "mcp_config": {
+      "files": 5,
+      "bytes": 11680
+    },
+    "baseline_state": {
+      "files": 1,
+      "bytes": 2522
+    },
+    "self_script": {
+      "files": 3,
+      "bytes": 61496
+    }
+  },
+  "db_tables": [
+    "agent_messages",
+    "background_tasks",
+    "config_change_log",
+    "conversation_log",
+    "cost_line_items",
+    "cost_sources",
+    "daily_logs",
+    "idea_box",
+    "idea_comments",
+    "idea_status_log",
+    "kanban_card_events",
+    "kanban_card_labels",
+    "kanban_cards",
+    "kanban_comments",
+    "labels",
+    "memories",
+    "memories_fts",
+    "memories_fts_config",
+    "memories_fts_data",
+    "memories_fts_docsize",
+    "memories_fts_idx",
+    "pending_channel_requests",
+    "pending_task_retries",
+    "scheduled_tasks",
+    "sessions",
+    "site_checks",
+    "site_monitor_state",
+    "sqlite_sequence",
+    "store_file_audit",
+    "task_runs",
+    "token_usage",
+    "token_usage_cursors",
+    "tool_call_log",
+    "vault_ssh_keys",
+    "vault_ssh_servers"
+  ],
+  "db_row_counts": {
+    "memories": 687,
+    "daily_logs": 335,
+    "kanban_cards": 136,
+    "kanban_comments": 510,
+    "kanban_card_labels": 0,
+    "labels": 0,
+    "config_change_log": 41
+  }
+}
