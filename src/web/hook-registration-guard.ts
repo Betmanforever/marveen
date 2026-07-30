@@ -36,6 +36,7 @@ export const KNOWN_HOOK_SCRIPTS: readonly string[] = [
   'telegram_progress_watchdog.py',
   'inbox-drain.py',
   'ledger-capture.py',
+  'skill-index-autoregen.py',
 ]
 
 // Path fragment that marks a checkout as an agent worktree. Kept

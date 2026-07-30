@@ -133,10 +133,11 @@ export function ensureAgentHooks(name: string): boolean {
 }
 
 // Idempotent migration: ensure the staleness-guard UserPromptSubmit hook is
-// present. Unlike ensureAgentHooks (which seeds the WHOLE hooks block only for
-// hook-less agents), this MERGES a single UserPromptSubmit entry into an agent
-// that already has other hooks -- so the guard reaches the existing fleet, not
-// just freshly-scaffolded agents. The guard warns the agent when an inbound
+// present. ensureAgentHooks() ALSO merges into agents that already have other
+// hooks (per-event, per-command diff against the template, not seed-only) --
+// this function exists as a narrower, single-hook variant of the same
+// merge idea, for the one hook that needed to land ahead of a template update
+// reaching everyone. The guard warns the agent when an inbound
 // <channel ts="..."> message was delivered long after it was sent (a lagged /
 // re-delivered message that may be stale), so it re-confirms before irreversible
 // actions. Re-running is a no-op once the entry exists (matched by command path).

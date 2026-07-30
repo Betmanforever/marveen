@@ -34,6 +34,16 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/skill-index-autoregen.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "mcp__plugin.telegram.telegram__reply",
         "hooks": [
           {

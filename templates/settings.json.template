@@ -43,6 +43,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{PROJECT_ROOT}}/scripts/hooks/skill-index-autoregen.py",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

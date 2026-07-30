@@ -41,7 +41,7 @@ import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT } from '../con
 import { getEffectiveSettingValue } from '../settings-store.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
-import { writeAgentSettingsFromProfile, ensureFleetRosterSection } from './agent-scaffold.js'
+import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureAgentHooks, ensureAgentStalenessHook } from './agent-scaffold.js'
 import { schedulePluginUnlockAfterRespawn, getSessionClaudePid, hasBunChild, hasPluginInUseMarker, channelPluginInitPending, CHANNEL_INIT_PENDING_MAX_MS } from './channel-plugin-unlock.js'
 import { getSecret } from './vault.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
@@ -862,6 +862,15 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean; resumeS
     // without hardcoding agent names.
     const profile = loadProfileTemplate(resolveAgentSecurityProfile(name))
     writeAgentSettingsFromProfile(name, profile)
+    // writeAgentSettingsFromProfile() only sets permissions + the governance
+    // gates (email-send, self-pace, decision-flag); the BASE template hooks
+    // (PreCompact memory/skill save, staleness-guard, PostToolUse skill-index
+    // regen) previously reached a brand-new agent only on the NEXT dashboard
+    // restart (web.ts's startup loop is the only other ensureAgentHooks()
+    // caller). Idempotent, so safe to re-run on every spawn -- closes the gap
+    // for an agent that never sees a restart between creation and first use.
+    ensureAgentHooks(name)
+    ensureAgentStalenessHook(name)
     ensureFleetRosterSection(name)
     // A sub-agent must load ONLY its own channel plugin. The user-scope
     // enabledPlugins would otherwise make EVERY sub-agent spawn a telegram
