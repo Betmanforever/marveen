@@ -81,13 +81,15 @@ export const ALERT_REGISTRY: AlertEmitter[] = [
     source: '~/.claude/scheduled-tasks/pending-uzenet-watchdog (mr-wolfe)',
     owner: false,
     route: 'coordinator',
-    ownerFacing: false,
-    threshold: 'pending > 3 min, agent judgement, */5 06-21',
-    dedupKey: 'agent judgement',
+    ownerFacing: true,
+    threshold: 'pending > 3 min AND wedge pattern (busy-but-working pane is explicitly not a finding), */5 06-21',
+    dedupKey: 'agent judgement + alert_claims lookup (defers to the dashboard owner\'s live claim)',
     quietHours: 'cron 06-21 only',
     enabled: true,
-    notes: 'Audit (d) on its Telegram leg: detection stays, the direct-to-Gabor leg is the '
-      + 'coordinator\'s own task file to remove (not this codebase).',
+    notes: 'SKILL.md reworked 2026-07-31 (neo draft, mr-wolfe applied): remediation-first '
+      + '(Escape/parked-clear/nudge, continue-restart on context ceiling) under Gabor\'s blanket '
+      + 'silent-fixing authorization; ownerFacing only for a NAMED decision after remediation '
+      + 'failed twice, per AC-2. The coordinator RUNS this task, so its coordinator route is itself.',
   },
 
   // --- ritual execution ------------------------------------------------------
