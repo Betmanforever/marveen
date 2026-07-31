@@ -112,6 +112,8 @@ export interface AlertState {
   emits: Record<string, number>
   /** Epoch ms of every owner-facing send inside the rate-ceiling window. */
   ownerSends: number[]
+  /** Epoch ms of every FATAL-class owner send; separate ledger, own ceiling. */
+  fatalSends: number[]
   /** Epoch ms of the last rate-breaker notice (at most one per hour window). */
   lastBreakerAt: number | null
   /** Rolling 24h digest buffer (audit AC-7). */
@@ -121,7 +123,7 @@ export interface AlertState {
 }
 
 export const EMPTY_ALERT_STATE: AlertState = {
-  emits: {}, ownerSends: [], lastBreakerAt: null, digest: [], digestDropped: 0,
+  emits: {}, ownerSends: [], fatalSends: [], lastBreakerAt: null, digest: [], digestDropped: 0,
 }
 
 function entryKey(kind: string, key: string): string {
@@ -133,7 +135,7 @@ function entryKey(kind: string, key: string): string {
  * direction for a control. */
 export function loadAlertState(path: string = ALERT_STATE_PATH): AlertState {
   try {
-    if (!existsSync(path)) return { ...EMPTY_ALERT_STATE, emits: {}, ownerSends: [], digest: [] }
+    if (!existsSync(path)) return { ...EMPTY_ALERT_STATE, emits: {}, ownerSends: [], fatalSends: [], digest: [] }
     const raw = JSON.parse(readFileSync(path, 'utf-8')) as Partial<AlertState>
     const emits: Record<string, number> = {}
     for (const [k, v] of Object.entries(raw?.emits ?? {})) {
@@ -142,6 +144,9 @@ export function loadAlertState(path: string = ALERT_STATE_PATH): AlertState {
     const ownerSends = Array.isArray(raw?.ownerSends)
       ? raw.ownerSends.filter((n): n is number => typeof n === 'number' && Number.isFinite(n))
       : []
+    const fatalSends = Array.isArray(raw?.fatalSends)
+      ? raw.fatalSends.filter((n): n is number => typeof n === 'number' && Number.isFinite(n))
+      : []
     const digest = Array.isArray(raw?.digest)
       ? raw.digest.filter((e): e is DigestEntry => !!e && typeof e.ts === 'number' && typeof e.summary === 'string')
       : []
@@ -149,12 +154,13 @@ export function loadAlertState(path: string = ALERT_STATE_PATH): AlertState {
     return {
       emits,
       ownerSends,
+      fatalSends,
       lastBreakerAt: typeof breaker === 'number' && Number.isFinite(breaker) ? breaker : null,
       digest,
       digestDropped: typeof raw?.digestDropped === 'number' ? raw.digestDropped : 0,
     }
   } catch {
-    return { ...EMPTY_ALERT_STATE, emits: {}, ownerSends: [], digest: [] }
+    return { ...EMPTY_ALERT_STATE, emits: {}, ownerSends: [], fatalSends: [], digest: [] }
   }
 }
 
@@ -231,6 +237,16 @@ export const OWNER_SENDS_PER_DAY = 10
 export const OWNER_HOUR_MS = 60 * 60 * 1000
 export const OWNER_DAY_MS = 24 * 60 * 60 * 1000
 
+// FATAL class (wolfe decision, 2026-07-31, card 8bcbd8fe follow-up to the
+// audit's section-8 silence warning): alerts whose suppression converts a spam
+// problem into a silence problem -- coordinator-dead escalations, channel
+// FATAL -- are EXEMPT from the global ceiling but get their own, higher one.
+// Never unlimited: a broken fatal-class emitter looping at full rate is still
+// bounded, and every suppression it does hit lands in the digest like any
+// other, so the muting itself stays measurable.
+export const FATAL_SENDS_PER_HOUR = 6
+export const FATAL_SENDS_PER_DAY = 20
+
 export type CeilingVerdict = 'allow' | 'hour-ceiling' | 'day-ceiling'
 
 /**
@@ -245,20 +261,28 @@ export type CeilingVerdict = 'allow' | 'hour-ceiling' | 'day-ceiling'
  * the silence failure the audit's section 8 warns about, and it is strictly
  * worse than the spam it replaces.
  */
-export function decideOwnerSendAllowance(ownerSends: number[], nowMs: number): CeilingVerdict {
+export function decideOwnerSendAllowance(
+  ownerSends: number[],
+  nowMs: number,
+  perHour = OWNER_SENDS_PER_HOUR,
+  perDay = OWNER_SENDS_PER_DAY,
+): CeilingVerdict {
   const inWindow = (ts: number, windowMs: number): boolean => ts > nowMs - windowMs && ts <= nowMs + windowMs
   const inHour = ownerSends.filter((ts) => inWindow(ts, OWNER_HOUR_MS)).length
   const inDay = ownerSends.filter((ts) => inWindow(ts, OWNER_DAY_MS)).length
-  if (inHour >= OWNER_SENDS_PER_HOUR) return 'hour-ceiling'
-  if (inDay >= OWNER_SENDS_PER_DAY) return 'day-ceiling'
+  if (inHour >= perHour) return 'hour-ceiling'
+  if (inDay >= perDay) return 'day-ceiling'
   return 'allow'
 }
 
-/** Record an owner-facing send, dropping stamps outside the day window in
- * EITHER direction (see decideOwnerSendAllowance on future-dated stamps). */
-export function recordOwnerSend(state: AlertState, nowMs: number): AlertState {
-  const kept = state.ownerSends.filter((ts) => ts > nowMs - OWNER_DAY_MS && ts <= nowMs + OWNER_DAY_MS)
-  return { ...state, ownerSends: [...kept, nowMs] }
+/** Record an owner-facing send in the given ledger ('owner' or 'fatal' -- the
+ * two ceilings must not consume each other's budget), dropping stamps outside
+ * the day window in EITHER direction (see decideOwnerSendAllowance on
+ * future-dated stamps). */
+export function recordOwnerSend(state: AlertState, nowMs: number, ledger: 'owner' | 'fatal' = 'owner'): AlertState {
+  const prune = (arr: number[]): number[] => arr.filter((ts) => ts > nowMs - OWNER_DAY_MS && ts <= nowMs + OWNER_DAY_MS)
+  if (ledger === 'fatal') return { ...state, fatalSends: [...prune(state.fatalSends), nowMs] }
+  return { ...state, ownerSends: [...prune(state.ownerSends), nowMs] }
 }
 
 /**
@@ -273,10 +297,13 @@ export function shouldSendBreakerNotice(lastBreakerAt: number | null, nowMs: num
 }
 
 /** The one visible line that says the ceiling is engaged. */
-export function buildBreakerNotice(verdict: CeilingVerdict, mutedCount: number): string {
+export function buildBreakerNotice(verdict: CeilingVerdict, mutedCount: number, fatal = false): string {
+  const perDay = fatal ? FATAL_SENDS_PER_DAY : OWNER_SENDS_PER_DAY
+  const perHour = fatal ? FATAL_SENDS_PER_HOUR : OWNER_SENDS_PER_HOUR
+  const cls = fatal ? 'FATAL-osztaly, ' : ''
   const which = verdict === 'day-ceiling'
-    ? `napi plafon: ${OWNER_SENDS_PER_DAY}`
-    : `orankenti plafon: ${OWNER_SENDS_PER_HOUR}`
+    ? `${cls}napi plafon: ${perDay}`
+    : `${cls}orankenti plafon: ${perHour}`
   return `🔇 ${mutedCount} tovabbi riasztas elnemitva (${which}). A tetelek a napi osszesitobe kerulnek, nem vesznek el.`
 }
 

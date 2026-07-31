@@ -41,6 +41,7 @@ import { runPendingAgeWatchdog, SIGNAL_ID as QUEUE_SIGNAL_ID } from './pending-a
 import {
   claimEmit, loadAlertState, saveAlertState, bufferDigestEntry, recordOwnerSend,
   decideOwnerSendAllowance, shouldSendBreakerNotice, buildBreakerNotice,
+  FATAL_SENDS_PER_HOUR, FATAL_SENDS_PER_DAY,
   type DigestEntry,
 } from '../alert-policy.js'
 import { claimAlertItem, getLiveAlertClaim, releaseAlertClaim, expireAlertClaims } from '../db.js'
@@ -1386,7 +1387,12 @@ export function appendDigestEntry(entry: Omit<DigestEntry, 'ts'>): void {
   }
 }
 
-export function sendAlert(text: string): void {
+// opts.fatal (wolfe decision 2026-07-31): FATAL-class alerts -- the ones whose
+// suppression converts spam into silence (coordinator-dead escalation, channel
+// FATAL) -- bypass the global owner ceiling and draw from their own, higher
+// ledger (FATAL_SENDS_PER_*). Never uncapped; their suppressions land in the
+// digest like any other, so the muting stays measurable.
+export function sendAlert(text: string, opts: { fatal?: boolean } = {}): void {
   const nowMs = Date.now()
   if (isQuietHour(budapestHour(nowMs))) {
     quietAlerts = bufferQuietAlert(quietAlerts, { ts: nowMs, text }, QUIET_ALERT_BUFFER_MAX)
@@ -1407,21 +1413,25 @@ export function sendAlert(text: string): void {
   // problem (audit section 8).
   try {
     const state = loadAlertState()
-    const verdict = decideOwnerSendAllowance(state.ownerSends, nowMs)
+    const fatal = opts.fatal === true
+    const verdict = fatal
+      ? decideOwnerSendAllowance(state.fatalSends, nowMs, FATAL_SENDS_PER_HOUR, FATAL_SENDS_PER_DAY)
+      : decideOwnerSendAllowance(state.ownerSends, nowMs)
     if (verdict !== 'allow') {
-      const buffered = bufferDigestEntry(state, { ts: nowMs, category: 'muted', source: 'rate-ceiling', summary: text })
+      const source = fatal ? 'rate-ceiling-fatal' : 'rate-ceiling'
+      const buffered = bufferDigestEntry(state, { ts: nowMs, category: 'muted', source, summary: text })
       const breakerDue = shouldSendBreakerNotice(buffered.lastBreakerAt, nowMs)
       const mutedInHour = buffered.digest.filter(
-        (e) => e.source === 'rate-ceiling' && e.ts > nowMs - 60 * 60 * 1000,
+        (e) => e.source === source && e.ts > nowMs - 60 * 60 * 1000,
       ).length
       saveAlertState(breakerDue ? { ...buffered, lastBreakerAt: nowMs } : buffered)
-      logger.warn({ verdict, mutedInHour }, 'sendAlert: owner-facing rate ceiling engaged -- alert diverted to the daily digest')
+      logger.warn({ verdict, mutedInHour, fatal }, 'sendAlert: owner-facing rate ceiling engaged -- alert diverted to the daily digest')
       if (breakerDue) {
-        notifyChannel(buildBreakerNotice(verdict, mutedInHour)).catch((err) => logger.error({ err }, 'sendAlert: breaker notice threw'))
+        notifyChannel(buildBreakerNotice(verdict, mutedInHour, fatal)).catch((err) => logger.error({ err }, 'sendAlert: breaker notice threw'))
       }
       return
     }
-    saveAlertState(recordOwnerSend(state, nowMs))
+    saveAlertState(recordOwnerSend(state, nowMs, fatal ? 'fatal' : 'owner'))
   } catch (err) {
     // The ceiling is a governor, not a gate: if its store is unreadable the
     // alert still goes out. Losing an alert to a broken state file would be the
@@ -2244,7 +2254,10 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           const msg = createAgentMessage('alert-policy', MAIN_AGENT_ID, text)
           logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
         },
-        sendOwner: (text) => sendAlert(text),
+        // The watchdog's owner leg fires exactly when the coordinator was told
+        // and went silent through the grace window (AC-5) -- the class whose
+        // suppression IS the silence risk, hence fatal (own, higher ceiling).
+        sendOwner: (text) => sendAlert(text, { fatal: true }),
         appendDigest: (entry) => appendDigestEntry(entry),
         claimEmit: (kind, key, dedupMs) => claimEmit(kind, key, nowMs, dedupMs),
       })

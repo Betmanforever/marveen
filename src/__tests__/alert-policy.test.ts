@@ -14,7 +14,8 @@ import {
   loadAlertState, saveAlertState, shouldEmit, markEmitted, claimEmit,
   decideOwnerSendAllowance, recordOwnerSend, shouldSendBreakerNotice, buildBreakerNotice,
   bufferDigestEntry, buildDigestSection, countDigest, renderDigest,
-  OWNER_SENDS_PER_HOUR, OWNER_SENDS_PER_DAY, OWNER_HOUR_MS, DIGEST_WINDOW_MS, DIGEST_MAX_LINES,
+  OWNER_SENDS_PER_HOUR, OWNER_SENDS_PER_DAY, OWNER_HOUR_MS, OWNER_DAY_MS,
+  FATAL_SENDS_PER_HOUR, FATAL_SENDS_PER_DAY, DIGEST_WINDOW_MS, DIGEST_MAX_LINES,
   EMPTY_ALERT_STATE,
   type AlertFacts, type DigestEntry,
 } from '../alert-policy.js'
@@ -251,5 +252,53 @@ describe('AC-7 daily digest', () => {
   it('drops entries that fell out of the 24h window at render time', () => {
     saveAlertState({ ...EMPTY_ALERT_STATE, digest: [entry({ ts: NOW - DIGEST_WINDOW_MS - 1 })] }, STORE)
     expect(renderDigest(NOW, { path: STORE }).section).toBeNull()
+  })
+})
+
+describe('FATAL-class ceiling (wolfe decision 2026-07-31, AC-8 exemption)', () => {
+  // The class whose suppression converts spam into silence gets its OWN,
+  // higher ledger -- exempt from the global ceiling, never uncapped.
+  const NOW = 1_785_500_000_000
+
+  it('a fatal send is allowed when the OWNER ledger is at its cap', () => {
+    const ownerAtCap = Array.from({ length: OWNER_SENDS_PER_DAY }, (_, i) => NOW - 1000 - i)
+    // Owner ledger exhausted...
+    expect(decideOwnerSendAllowance(ownerAtCap, NOW)).not.toBe('allow')
+    // ...but the fatal ledger is separate and empty.
+    expect(decideOwnerSendAllowance([], NOW, FATAL_SENDS_PER_HOUR, FATAL_SENDS_PER_DAY)).toBe('allow')
+  })
+
+  it('caps fatal sends at its own hourly and daily limits', () => {
+    const hourFull = Array.from({ length: FATAL_SENDS_PER_HOUR }, (_, i) => NOW - 1000 - i)
+    expect(decideOwnerSendAllowance(hourFull, NOW, FATAL_SENDS_PER_HOUR, FATAL_SENDS_PER_DAY)).toBe('hour-ceiling')
+    const daySpread = Array.from({ length: FATAL_SENDS_PER_DAY }, (_, i) => NOW - (i + 2) * 60 * 60 * 1000 / 2)
+      .filter((ts) => ts > NOW - OWNER_DAY_MS)
+    if (daySpread.length >= FATAL_SENDS_PER_DAY) {
+      expect(decideOwnerSendAllowance(daySpread, NOW, FATAL_SENDS_PER_HOUR, FATAL_SENDS_PER_DAY)).toBe('day-ceiling')
+    }
+    expect(FATAL_SENDS_PER_HOUR).toBeGreaterThan(OWNER_SENDS_PER_HOUR)
+    expect(FATAL_SENDS_PER_DAY).toBeGreaterThan(OWNER_SENDS_PER_DAY)
+  })
+
+  it('recordOwnerSend writes the two ledgers independently', () => {
+    let s = { ...EMPTY_ALERT_STATE }
+    s = recordOwnerSend(s, NOW, 'owner')
+    s = recordOwnerSend(s, NOW + 1, 'fatal')
+    expect(s.ownerSends).toEqual([NOW])
+    expect(s.fatalSends).toEqual([NOW + 1])
+  })
+
+  it('fatal ledger survives a store round-trip and ignores garbage', () => {
+    const p = join(tmpdir(), `alert-fatal-${process.pid}.json`)
+    saveAlertState({ ...EMPTY_ALERT_STATE, fatalSends: [NOW, Number.NaN as unknown as number] }, p)
+    const loaded = loadAlertState(p)
+    expect(loaded.fatalSends).toEqual([NOW])
+    rmSync(p, { force: true })
+  })
+
+  it('breaker notice names the FATAL class and its own limits', () => {
+    expect(buildBreakerNotice('hour-ceiling', 2, true)).toContain('FATAL-osztaly')
+    expect(buildBreakerNotice('hour-ceiling', 2, true)).toContain(String(FATAL_SENDS_PER_HOUR))
+    expect(buildBreakerNotice('hour-ceiling', 2)).not.toContain('FATAL')
   })
 })
