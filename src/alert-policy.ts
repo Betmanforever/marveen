@@ -120,10 +120,13 @@ export interface AlertState {
   digest: DigestEntry[]
   /** Entries dropped once the digest buffer hit its cap; counted, not silent. */
   digestDropped: number
+  /** Consumed-but-unacked digest entries (close condition C-4); null when none. */
+  pendingAck: { token: string; ts: number; entries: DigestEntry[] } | null
 }
 
 export const EMPTY_ALERT_STATE: AlertState = {
   emits: {}, ownerSends: [], fatalSends: [], lastBreakerAt: null, digest: [], digestDropped: 0,
+  pendingAck: null,
 }
 
 function entryKey(kind: string, key: string): string {
@@ -151,6 +154,16 @@ export function loadAlertState(path: string = ALERT_STATE_PATH): AlertState {
       ? raw.digest.filter((e): e is DigestEntry => !!e && typeof e.ts === 'number' && typeof e.summary === 'string')
       : []
     const breaker = raw?.lastBreakerAt
+    const pa = raw?.pendingAck
+    const pendingAck =
+      pa && typeof pa === 'object' && typeof pa.token === 'string'
+        && typeof pa.ts === 'number' && Number.isFinite(pa.ts) && Array.isArray(pa.entries)
+        ? {
+            token: pa.token,
+            ts: pa.ts,
+            entries: pa.entries.filter((e): e is DigestEntry => !!e && typeof e.ts === 'number' && typeof e.summary === 'string'),
+          }
+        : null
     return {
       emits,
       ownerSends,
@@ -158,6 +171,7 @@ export function loadAlertState(path: string = ALERT_STATE_PATH): AlertState {
       lastBreakerAt: typeof breaker === 'number' && Number.isFinite(breaker) ? breaker : null,
       digest,
       digestDropped: typeof raw?.digestDropped === 'number' ? raw.digestDropped : 0,
+      pendingAck,
     }
   } catch {
     return { ...EMPTY_ALERT_STATE, emits: {}, ownerSends: [], fatalSends: [], digest: [] }
@@ -405,21 +419,60 @@ export function buildDigestSection(
   ].join('\n')
 }
 
+// How long consumed-but-unacked entries stay parked before returning to the
+// buffer. Long enough that a briefing in normal flight never collides with it;
+// short enough that a failed 07:27 briefing's findings are back for any retry
+// and certainly for the next morning.
+export const DIGEST_ACK_TTL_MS = 6 * 60 * 60 * 1000
+
 /**
- * The digest section for the morning briefing. `consume` clears the buffer, so
- * the same finding is never reported twice; the caller (the briefing endpoint)
- * passes it only when it will actually deliver the text.
+ * The digest section for the morning briefing.
+ *
+ * `consume` is TWO-PHASE (audit close condition C-4): the old delete-on-read
+ * lost the whole night's findings whenever the briefing failed AFTER the
+ * fetch -- claude -p dying, the Telegram send failing -- because the buffer was
+ * already empty. Now a consuming read only PARKS the rendered entries under an
+ * ack token; ackDigestConsume(token) is what deletes, and the caller sends it
+ * only after the briefing actually went out. Parked entries past
+ * DIGEST_ACK_TTL_MS return to the buffer on the next load, so a briefing that
+ * never acks costs a delay, not the data.
  */
 export function renderDigest(
   nowMs: number,
   opts: { consume?: boolean; path?: string } = {},
-): { section: string | null; counts: DigestCounts } {
+): { section: string | null; counts: DigestCounts; ackToken?: string } {
   const path = opts.path ?? ALERT_STATE_PATH
-  const state = loadAlertState(path)
+  const state = revertExpiredConsume(loadAlertState(path), nowMs)
   const fresh = state.digest.filter((e) => nowMs - e.ts < DIGEST_WINDOW_MS)
   const section = buildDigestSection(fresh, state.digestDropped)
   if (opts.consume) {
-    saveAlertState({ ...state, digest: [], digestDropped: 0 }, path)
+    const ackToken = `ack-${nowMs.toString(36)}-${fresh.length}`
+    saveAlertState({
+      ...state,
+      digest: [],
+      digestDropped: 0,
+      pendingAck: fresh.length > 0 ? { token: ackToken, ts: nowMs, entries: fresh } : null,
+    }, path)
+    return { section, counts: countDigest(fresh), ackToken }
   }
+  saveAlertState(state, path)
   return { section, counts: countDigest(fresh) }
+}
+
+/** Delete the parked entries -- the briefing that fetched them went out. A
+ * stale/unknown token is a no-op: the entries it named either already
+ * reverted (TTL) or were re-consumed under a newer token. */
+export function ackDigestConsume(token: string, path: string = ALERT_STATE_PATH): boolean {
+  const state = loadAlertState(path)
+  if (!state.pendingAck || state.pendingAck.token !== token) return false
+  saveAlertState({ ...state, pendingAck: null }, path)
+  return true
+}
+
+/** Un-park a consume that was never acked within the TTL. Pure. */
+export function revertExpiredConsume(state: AlertState, nowMs: number): AlertState {
+  const pa = state.pendingAck
+  if (!pa) return state
+  if (nowMs - pa.ts < DIGEST_ACK_TTL_MS && nowMs >= pa.ts) return state
+  return { ...state, digest: [...pa.entries, ...state.digest], pendingAck: null }
 }

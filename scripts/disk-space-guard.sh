@@ -115,6 +115,20 @@ alert_owner() {
   if [ "${DISK_GUARD_ALERT_DRYRUN:-}" = "1" ]; then
     echo "ALERT_DRYRUN: $msg"; return 0
   fi
+  # Alert-policy routing (card 5e68c5e1, audit C-1): coordinator first; the
+  # direct Bot API leg survives only as the dashboard-down backstop, and even
+  # then never inside quiet hours (22:00-06:00) -- the guard re-runs, so a
+  # still-full disk re-alerts after 06:00. Note: under disk-FULL the dashboard
+  # API may itself fail, which correctly falls through to the backstop.
+  . "$INSTALL_DIR/scripts/alert-route.sh"
+  if dashboard_alive && route_to_coordinator "$msg"; then
+    log "routed to coordinator (alert-policy)"; return 0
+  fi
+  local hour
+  hour=$((10#$(date +%H)))
+  if [ "$hour" -ge 22 ] || [ "$hour" -lt 6 ]; then
+    log "QUIET-DEFER (22-06, dashboard down): $msg"; return 0
+  fi
   # Token + owner chat id both come from config, never hardcoded: token from the
   # channels env, chat id from .env ALLOWED_CHAT_ID (or TELEGRAM_CHAT_ID in the
   # channels env). If either is missing, skip the alert silently.

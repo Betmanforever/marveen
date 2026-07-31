@@ -90,6 +90,32 @@ Becsült kiesés: ${gap_txt}
 
 log "host restart detected: prev btime=$prev new=$btime; sending Telegram"
 
+# Alert-policy routing (card 5e68c5e1, audit C-1): coordinator first. This
+# oneshot fires AT BOOT, racing the dashboard's own startup, so give the
+# dashboard up to 60s to come up before concluding it is down -- the
+# inter-agent queue is durable and never wakes the owner at night.
+. "$(cd "$(dirname "$0")" && pwd)/alert-route.sh"
+routed=0
+for _try in 1 2 3 4 5 6; do
+  if dashboard_alive; then
+    route_to_coordinator "$msg" && routed=1
+    break
+  fi
+  sleep 10
+done
+if [[ "$routed" = "1" ]]; then
+  log "routed to coordinator (alert-policy)"
+  exit 0
+fi
+# Backstop leg (dashboard stayed down past 60s): quiet-hours gated. A oneshot
+# has no re-run, so the deferred notice survives only in this unit's journal --
+# acceptable for an informational event; the down dashboard itself is what the
+# morning round will surface.
+hour=$((10#$(date +%H)))
+if [[ "$hour" -ge 22 || "$hour" -lt 6 ]]; then
+  log "QUIET-DEFER (22-06, dashboard down): $msg"
+  exit 0
+fi
 # Best-effort Telegram send. Never let a send failure fail the unit.
 token=""
 if [[ -f "$ENV_FILE" ]]; then

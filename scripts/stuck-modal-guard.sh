@@ -120,6 +120,18 @@ sanitize_model() {
 # --- direct Bot API alert (mirrors channel-watchdog.sh alert_owner) -------------
 alert_owner() {
   local msg="$1" token chat
+  # Alert-policy routing (card 5e68c5e1, audit C-1): coordinator first; direct
+  # Bot API only as the dashboard-down backstop, quiet-hours (22-06) gated --
+  # the guard loops, so a persisting modal re-alerts after 06:00.
+  . "$INSTALL_DIR/scripts/alert-route.sh"
+  if dashboard_alive && route_to_coordinator "$msg"; then
+    log "routed to coordinator (alert-policy)"; return 0
+  fi
+  local hour
+  hour=$((10#$(date +%H)))
+  if [ "$hour" -ge 22 ] || [ "$hour" -lt 6 ]; then
+    log "QUIET-DEFER (22-06, dashboard down): $msg"; return 0
+  fi
   # Token + owner chat id both from config, never hardcoded.
   # `tr -d '\r '` strips a trailing CR (CRLF-edited .env) / stray spaces.
   token="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$TG_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r ')"

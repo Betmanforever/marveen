@@ -14,6 +14,7 @@ import {
   loadAlertState, saveAlertState, shouldEmit, markEmitted, claimEmit,
   decideOwnerSendAllowance, recordOwnerSend, shouldSendBreakerNotice, buildBreakerNotice,
   bufferDigestEntry, buildDigestSection, countDigest, renderDigest,
+  ackDigestConsume, DIGEST_ACK_TTL_MS,
   OWNER_SENDS_PER_HOUR, OWNER_SENDS_PER_DAY, OWNER_HOUR_MS, OWNER_DAY_MS,
   FATAL_SENDS_PER_HOUR, FATAL_SENDS_PER_DAY, DIGEST_WINDOW_MS, DIGEST_MAX_LINES,
   EMPTY_ALERT_STATE,
@@ -300,5 +301,61 @@ describe('FATAL-class ceiling (wolfe decision 2026-07-31, AC-8 exemption)', () =
     expect(buildBreakerNotice('hour-ceiling', 2, true)).toContain('FATAL-osztaly')
     expect(buildBreakerNotice('hour-ceiling', 2, true)).toContain(String(FATAL_SENDS_PER_HOUR))
     expect(buildBreakerNotice('hour-ceiling', 2)).not.toContain('FATAL')
+  })
+})
+
+describe('two-phase digest consume (close condition C-4)', () => {
+  // Delete-on-read lost the night's findings whenever the briefing died AFTER
+  // the fetch. Consume now parks entries under an ack token; only the ack
+  // deletes, and an unacked park reverts after the TTL.
+  const NOW = Date.UTC(2026, 6, 31, 5, 27, 0)
+  const entry = (over: Partial<DigestEntry> = {}): DigestEntry => ({
+    ts: NOW - 1000, category: 'auto-fixed', source: 't', summary: 'ejszakai tetel', ...over,
+  })
+
+  it('consume parks the entries under a token and empties the visible buffer', () => {
+    saveAlertState({ ...EMPTY_ALERT_STATE, digest: [entry()] }, STORE)
+    const consumed = renderDigest(NOW, { consume: true, path: STORE })
+    expect(consumed.section).toContain('ejszakai tetel')
+    expect(consumed.ackToken).toBeTruthy()
+    // Within the TTL the parked entries do not render again.
+    expect(renderDigest(NOW + 1000, { path: STORE }).section).toBeNull()
+  })
+
+  it('ack deletes the parked entries for good', () => {
+    saveAlertState({ ...EMPTY_ALERT_STATE, digest: [entry()] }, STORE)
+    const { ackToken } = renderDigest(NOW, { consume: true, path: STORE })
+    expect(ackDigestConsume(ackToken!, STORE)).toBe(true)
+    expect(renderDigest(NOW + DIGEST_ACK_TTL_MS + 1, { path: STORE }).section).toBeNull()
+  })
+
+  it('an unacked consume reverts after the TTL instead of losing the findings', () => {
+    saveAlertState({ ...EMPTY_ALERT_STATE, digest: [entry({ ts: NOW - 1000 })] }, STORE)
+    renderDigest(NOW, { consume: true, path: STORE })
+    // Briefing died: no ack. Past the TTL the entry is back...
+    const later = NOW + DIGEST_ACK_TTL_MS + 1
+    expect(renderDigest(later, { path: STORE }).section).toContain('ejszakai tetel')
+  })
+
+  it('a stale token is a no-op', () => {
+    saveAlertState({ ...EMPTY_ALERT_STATE, digest: [entry()] }, STORE)
+    renderDigest(NOW, { consume: true, path: STORE })
+    expect(ackDigestConsume('ack-nem-letezo', STORE)).toBe(false)
+    // The real park is untouched: it still reverts after the TTL.
+    expect(renderDigest(NOW + DIGEST_ACK_TTL_MS + 1, { path: STORE }).section).toContain('ejszakai tetel')
+  })
+
+  it('a consume with an EMPTY buffer parks nothing and needs no ack', () => {
+    const consumed = renderDigest(NOW, { consume: true, path: STORE })
+    expect(consumed.section).toBeNull()
+    expect(loadAlertState(STORE).pendingAck).toBeNull()
+  })
+
+  it('pendingAck survives a store round-trip', () => {
+    saveAlertState({ ...EMPTY_ALERT_STATE, digest: [entry()] }, STORE)
+    const { ackToken } = renderDigest(NOW, { consume: true, path: STORE })
+    const loaded = loadAlertState(STORE)
+    expect(loaded.pendingAck?.token).toBe(ackToken)
+    expect(loaded.pendingAck?.entries).toHaveLength(1)
   })
 })

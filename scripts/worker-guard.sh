@@ -29,6 +29,20 @@ PATTERN='worker not ready|Failed to generate agent'
 BOT_TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$HOME/.claude/channels/telegram/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
 
 notify() {
+  # Alert-policy routing (card 5e68c5e1, audit C-1): coordinator first; the
+  # direct Bot API leg survives only as the dashboard-down backstop, and even
+  # then never inside quiet hours (22:00-06:00, src/quiet-hours.ts) -- the guard
+  # keeps running, so a persisting failure re-alerts after 06:00.
+  . "$INSTALL_DIR/scripts/alert-route.sh"
+  if dashboard_alive && route_to_coordinator "$1"; then
+    return 0
+  fi
+  local hour
+  hour=$((10#$(date +%H)))
+  if [ "$hour" -ge 22 ] || [ "$hour" -lt 6 ]; then
+    echo "[worker-guard] QUIET-DEFER (22-06, dashboard down): $1" >> "$INSTALL_DIR/store/host-watchdog.log" 2>/dev/null || true
+    return 0
+  fi
   [ -z "$BOT_TOKEN" ] && return 0
   curl -s -m 15 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${CHAT_ID}" \

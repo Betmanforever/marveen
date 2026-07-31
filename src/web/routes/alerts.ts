@@ -1,4 +1,4 @@
-import { renderDigest } from '../../alert-policy.js'
+import { renderDigest, ackDigestConsume } from '../../alert-policy.js'
 import { listLiveAlertClaims } from '../../db.js'
 import { json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
@@ -18,12 +18,24 @@ export async function tryHandleAlerts(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
-  // Consuming read: returns the section AND clears the buffer, so the same
-  // finding is never reported twice. POST, not a GET flag: it mutates state,
-  // and only non-safe methods pass through this server's cross-origin write
-  // guard (isBlockedCrossOriginWrite treats every GET as safe by definition).
+  // Consuming read: returns the section and PARKS the rendered entries under
+  // an ack token (close condition C-4) -- the delete happens only at the ack
+  // below, sent after the briefing actually went out, so a briefing that dies
+  // after this fetch costs a delay, not the night's findings. POST, not a GET
+  // flag: it mutates state, and only non-safe methods pass through this
+  // server's cross-origin write guard (isBlockedCrossOriginWrite treats every
+  // GET as safe by definition).
   if (path === '/api/alerts/digest/consume' && method === 'POST') {
     json(res, renderDigest(Date.now(), { consume: true }))
+    return true
+  }
+
+  // Second phase: the briefing was delivered, drop the parked entries. A
+  // stale/unknown token answers ok:false and changes nothing.
+  if (path === '/api/alerts/digest/ack' && method === 'POST') {
+    const token = url.searchParams.get('token') || ''
+    if (!token) { json(res, { error: 'token is required' }, 400); return true }
+    json(res, { ok: ackDigestConsume(token) })
     return true
   }
 

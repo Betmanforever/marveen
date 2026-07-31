@@ -32,16 +32,26 @@ cd "$INSTALL_DIR"
 # tartalmazhatnak kivulrol irt mezot (agent_messages.from_agent), es egy
 # $(...) egy dupla idezojeles promptban vegrehajtodna.
 DIGEST=""
+ACK_TOKEN=""
 TOKEN_FILE="$INSTALL_DIR/store/.dashboard-token"
 if [ -r "$TOKEN_FILE" ]; then
-  DIGEST=$(curl -s -m 5 -X POST -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
-    "http://localhost:3420/api/alerts/digest/consume" 2>/dev/null \
-    | python3 -c 'import json,re,sys
+  # Two-phase consume (close condition C-4): the fetch PARKS the entries under
+  # an ack token; the delete happens only at the ack after claude -p exited 0.
+  # A briefing that dies mid-flight never acks, and the entries return to the
+  # buffer after the TTL instead of being lost with the failed message.
+  CONSUME_JSON=$(curl -s -m 5 -X POST -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+    "http://localhost:3420/api/alerts/digest/consume" 2>/dev/null)
+  DIGEST=$(printf '%s' "$CONSUME_JSON" | python3 -c 'import json,re,sys
 try:
     s = json.load(sys.stdin).get("section") or ""
 except Exception:
     s = ""
 print(re.sub(r"[$`\"\\\\]", "", s))' 2>/dev/null)
+  ACK_TOKEN=$(printf '%s' "$CONSUME_JSON" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("ackToken") or "")
+except Exception:
+    print("")' 2>/dev/null)
 fi
 
 # Unnumbered, so a zero-finding day leaves no gap in the numbered list.
@@ -65,5 +75,17 @@ $CLAUDE --dangerously-skip-permissions \
 ${DIGEST_STEP}
 
 Tömör, lényegre törő. Ékezetesen írj magyarul." >> "$LOG" 2>&1
+CLAUDE_EXIT=$?
+
+# Ack only on success: exit 0 is the best delivery signal this script has (the
+# send happens inside the claude -p session). On failure the parked entries
+# revert after the TTL and the next briefing carries them.
+if [ "$CLAUDE_EXIT" -eq 0 ] && [ -n "$ACK_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
+  curl -s -m 5 -X POST -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+    "http://localhost:3420/api/alerts/digest/ack?token=$ACK_TOKEN" >> "$LOG" 2>&1
+  echo "" >> "$LOG"
+elif [ -n "$ACK_TOKEN" ]; then
+  echo "digest ack SKIPPED (claude exit=$CLAUDE_EXIT) -- parked entries will revert" >> "$LOG"
+fi
 
 echo "=== Kész $(date) ===" >> "$LOG"
