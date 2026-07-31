@@ -206,7 +206,7 @@ describe('/api/messages 400 guard -- unknown recipient (behavior)', () => {
   })
 
   it('the guard runs BEFORE createAgentMessage (source order)', () => {
-    const guardIdx = MESSAGES_ROUTE_SRC.indexOf('listAgentNames().includes(recipient)')
+    const guardIdx = MESSAGES_ROUTE_SRC.indexOf('isDeliverableAgent(recipient)')
     const createIdx = MESSAGES_ROUTE_SRC.indexOf('createAgentMessage(from.trim()')
     expect(guardIdx).toBeGreaterThan(0)
     expect(createIdx).toBeGreaterThan(0)

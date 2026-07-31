@@ -9,7 +9,7 @@ import { logger } from '../../logger.js'
 import { MAIN_AGENT_ID } from '../../config.js'
 import { COORDINATOR_AGENT_ID } from '../../channel-coordinator/ingest.js'
 import { sanitizeAgentIdent } from '../../prompt-safety.js'
-import { listAgentNames } from '../agent-config.js'
+import { isDeliverableAgent, listDeliverableAgents } from '../agent-config.js'
 import { readBody, json } from '../http-helpers.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
 import type { RouteContext } from './types.js'
@@ -50,13 +50,17 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // sat pending until the abandon window and meanwhile fed the queue-depth
     // watchdog false alerts. Reject at creation with the valid roster so the
     // sender can correct immediately. The roster is MAIN_AGENT_ID + the
-    // agents/ dirs (listAgentNames); a STOPPED-but-real agent stays valid --
-    // the router queues for it and the schedule/restart paths may revive it.
+    // DELIVERABLE agents only (isDeliverableAgent): a STOPPED-but-real dashboard
+    // agent stays valid -- the router queues for it and the schedule/restart
+    // paths may revive it -- but a sub-agent DEFINITION with only a file-hand-off
+    // directory (e.g. auditor's qa-in/) is NOT, because it has no inbox drain.
+    // Using isDeliverableAgent (agent-config.json) instead of a bare directory
+    // check keeps a message from queuing into an inbox that never drains.
     const recipient = to.trim()
-    if (recipient !== MAIN_AGENT_ID && !listAgentNames().includes(recipient)) {
+    if (!isDeliverableAgent(recipient)) {
       logger.warn({ from: from.trim(), to: recipient }, 'Rejected /api/messages POST to unknown recipient')
       json(res, {
-        error: `unknown recipient '${recipient}' -- not a dashboard agent. Valid: ${[MAIN_AGENT_ID, ...listAgentNames()].join(', ')}`,
+        error: `unknown recipient '${recipient}' -- not a dashboard agent. Valid: ${[MAIN_AGENT_ID, ...listDeliverableAgents()].join(', ')}`,
       }, 400)
       return true
     }

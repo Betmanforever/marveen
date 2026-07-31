@@ -555,6 +555,41 @@ export function isKnownAgent(name: string): boolean {
   }
 }
 
+// Is this a DELIVERABLE message recipient -- an inbox-owning dashboard agent,
+// not merely a directory on disk (card ba546346 root cause, 2026-07-31)?
+// A sub-agent DEFINITION (auditor, hard-coder, skill-writer, ...) may
+// legitimately own an agents/<name>/ directory for FILE hand-off -- e.g. the
+// auditor's qa-in/, created by scripts/audit-brief.py -- while having NO tmux
+// session and NO inbox drain: it is invoked via the Agent tool, never the
+// message queue. isKnownAgent (directory exists) therefore over-accepts such a
+// dir as a recipient, and a message routed there queues into an inbox that
+// never drains (proven: msg id 1355 to auditor, status failed, never
+// delivered). The discriminator is agent-config.json, which only the spawnable
+// dashboard agents carry (the launch path reads the model from it). Two
+// concepts had merged -- HAS A DIRECTORY (file hand-off) vs RECEIVES MESSAGES
+// (tmux session) -- and the message router needs the second.
+export function isDeliverableAgent(name: string): boolean {
+  if (!name) return false
+  if (name === MAIN_AGENT_ID) return true
+  try {
+    return existsSync(join(agentDir(name), 'agent-config.json'))
+  } catch {
+    return false
+  }
+}
+
+// The deliverable-recipient roster (dashboard agents only), for the guard's
+// error message so a rejected sender sees exactly who it CAN reach.
+export function listDeliverableAgents(): string[] {
+  return listAgentNames().filter((n) => {
+    try {
+      return existsSync(join(agentDir(n), 'agent-config.json'))
+    } catch {
+      return false
+    }
+  })
+}
+
 // Parse YAML frontmatter capabilities from a persona file.
 // Expected format (first block in the file):
 //   ---
