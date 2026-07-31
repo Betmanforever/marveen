@@ -1,0 +1,16 @@
+[Unit]
+Description=Weekly Marveen offline backup onto the physically held E: drive
+
+[Timer]
+# Sunday 19:00 is chosen, not inherited: it is outside the 22:00-06:00 standing
+# night pause (so a finding can be acted on) and clear of the 21:30 nightly, so
+# the two legs never contend for the same archive folder (audit AC-B1/AC-B8).
+OnCalendar=Sun *-*-* 19:00:00
+RandomizedDelaySec=300
+# The WSL host is regularly off on a Sunday evening -- Persistent=true runs the
+# missed week at the next boot instead of silently skipping it. The presence
+# gate makes a catch-up run safe: a detached drive is a logged skip, not a write.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Marveen weekly OFFLINE backup leg to the E: drive (audit 6(b), Tier 1)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/szabgabor/marveen
+ExecStart=/usr/bin/python3 /home/szabgabor/marveen/scripts/weekly-elocal-backup.py

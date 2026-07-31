@@ -152,6 +152,32 @@ export const ALERT_REGISTRY: AlertEmitter[] = [
       + 'silent daily control. Unit files installed but NOT enabled (operator decision).',
   },
 
+  // --- backup legs -----------------------------------------------------------
+  {
+    id: 'weekly-elocal-backup',
+    signalId: 'backup-elocal-leg',
+    source: 'scripts/weekly-elocal-backup.py',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: '3 consecutive weekly runs with the drive absent (marker-UUID + write-probe gate), '
+      + 'ANY read-back digest mismatch (immediately, every occurrence), a failed monthly restore '
+      + 'rehearsal, or entering any other failure state',
+    dedupKey: 'store/.weekly-elocal.state: consecutive_misses plus an `alerted` flag that stays '
+      + 'set until recovery, so an absent drive is reported once and not weekly',
+    quietHours: 'OnCalendar Sun 19:00 (+<=5 min jitter) is outside 22:00-06:00 by construction; '
+      + 'every send is an /api/messages inter-agent message to mr-wolfe, no direct Bot API path',
+    enabled: true,
+    notes: 'Audit 2026-07-31 section 6(b), Tier 1 only (Tier 2 gated on Gabor\'s key-custody '
+      + 'decision). A successful week writes the daily log and sends nothing (AC-D4). Unit files '
+      + 'are in scripts/systemd/; `enabled` records the intended landed state, and the operator '
+      + 'step that makes it true is `systemctl --user enable --now marveen-weekly-elocal.timer` -- '
+      + 'if that is not done, flip this to false, the field means "running", not "exists". '
+      + 'One inherited leak: on a rehearsal FAIL the nightly-memory-backup.py child emits its own '
+      + 'direct Bot API alert; not suppressed on purpose (disarming another control from the '
+      + 'outside is worse), and 19:00 is outside the window.',
+  },
+
   // --- shared transports -----------------------------------------------------
   {
     id: 'notify-sh',
