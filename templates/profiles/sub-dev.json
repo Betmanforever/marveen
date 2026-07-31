@@ -6,7 +6,7 @@
   "filesystem": {
     "allow": [],
     "deny": [
-      "mcp__claude_ai_Supabase__*"
+      "mcp__supabase"
     ]
   }
 }

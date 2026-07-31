@@ -57,6 +57,7 @@
       "mcp__drive-zenom__appendSpreadsheetRows",
       "mcp__drive-zenom__listCalendars",
       "mcp__drive-zenom__getCalendarEvents",
+      "mcp__supabase",
       "Skill"
     ],
     "deny": [
