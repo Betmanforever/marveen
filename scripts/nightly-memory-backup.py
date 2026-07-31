@@ -682,6 +682,41 @@ def git_state_text():
     return "\n".join(lines) + "\n"
 
 
+def write_git_bundle(payload_dir):
+    """Interim offsite copy of the unpushed source history (backup-audit card
+    8cacdfa1, risk-map row 15): a full bundle of every ref, until the push
+    permission question is settled. The bundle is compressed binary, so the
+    value-shaped secret scan cannot see inside it (audit section 7) -- that
+    fact is stated openly in the manifest instead of being hidden. Failure
+    warns loudly but does not kill the run: the knowledge-layer payload must
+    still ship even if the source-history extra cannot."""
+    if not shutil.which("git"):
+        return {"error": "git nem elerheto a PATH-on"}
+    bundle = os.path.join(payload_dir, "git", "marveen-full.bundle")
+    os.makedirs(os.path.dirname(bundle), exist_ok=True)
+
+    def fail(msg):
+        if os.path.isfile(bundle):
+            os.unlink(bundle)  # never ship a partial/unverified bundle
+        return {"error": msg}
+
+    try:
+        create = subprocess.run(["git", "-C", REPO, "bundle", "create", bundle, "--all"],
+                                capture_output=True, text=True, timeout=300)
+        if create.returncode != 0:
+            return fail(f"bundle create exit {create.returncode}: {(create.stderr or '')[-200:]}")
+        verify = subprocess.run(["git", "-C", REPO, "bundle", "verify", bundle],
+                                capture_output=True, text=True, timeout=120)
+        if verify.returncode != 0:
+            return fail(f"bundle verify exit {verify.returncode}: {(verify.stderr or '')[-200:]}")
+        heads = subprocess.run(["git", "-C", REPO, "bundle", "list-heads", bundle],
+                               capture_output=True, text=True, timeout=60).stdout
+    except subprocess.TimeoutExpired:
+        return fail("bundle create/verify timeout")
+    return {"path": "git/marveen-full.bundle", "bytes": os.path.getsize(bundle),
+            "refs": len(heads.splitlines())}
+
+
 # --------------------------------------------------------------------------
 # secret scan (plan D1)
 # --------------------------------------------------------------------------
@@ -980,9 +1015,14 @@ def run_nightly(dry_run):
     staged, excluded = stage_raw_files(found, payload_dir)
     log(f"nyers fajlok stagelve: {staged} (denylist-kizaras: {len(excluded)})")
 
-    # 5. git state
+    # 5. git state + full-history bundle (interim until the push question)
     with open(f"{payload_dir}/git-state.txt", "w", encoding="utf-8") as f:
         f.write(git_state_text())
+    bundle_info = write_git_bundle(payload_dir)
+    if "error" in bundle_info:
+        log(f"  FIGYELEM: git bundle kimaradt -- {bundle_info['error']}")
+    else:
+        log(f"  git bundle: {human(bundle_info['bytes'])}, {bundle_info['refs']} ref, verify OK")
 
     # 6. two-layer secret scan
     hard, soft = secret_scan(payload_dir)
@@ -1011,6 +1051,7 @@ def run_nightly(dry_run):
         "denylist_excluded": excluded,
         "quarantine_keyword_hits": soft,
         "baseline_created_at": baseline.get("created_at"),
+        "git_bundle": bundle_info,
     }
     with open(f"{payload_dir}/BACKUP-INFO.json", "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
@@ -1133,6 +1174,17 @@ def render_manifest(info, archive_name, archive_size, digest, member_count, stag
     lines += ["", "DENYLIST-KIZARASOK (fajlnev-szint):"]
     lines += ([f"  {e['pattern']:24} {e['path']}" for e in info["denylist_excluded"]]
               or ["  nincs"])
+
+    gb = info.get("git_bundle", {})
+    if "error" in gb:
+        lines += ["", f"GIT BUNDLE: KIMARADT -- {gb['error']}"]
+    elif gb:
+        lines += ["", "GIT BUNDLE (teljes forras-tortenet, minden ref, interim a push-jog "
+                      "rendezeseig -- kartya 8cacdfa1):",
+                  f"  {gb['path']}  {human(gb['bytes'])}  {gb['refs']} ref  (bundle verify OK)",
+                  "  FIGYELEM: tomoritett binaris, az ertek-alaku secret-scan NEM lat bele "
+                  "(audit 7. szakasz, tudatosan vallalt).",
+                  "  Visszaallitas: git clone git/marveen-full.bundle <celkonyvtar>"]
 
     lines += ["", "SECRET-SCAN:", "  ertek-alaku (hard stop) talalat: 0",
               f"  kulcsszo-emlites (karanten, emberi atnezesre javasolt): {soft_total}"]
