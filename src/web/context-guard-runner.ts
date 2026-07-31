@@ -106,7 +106,7 @@ function performRestart(name: string): void {
     const uid = typeof process.getuid === 'function' ? process.getuid() : ''
     execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/com.${SERVICE_ID}.channels`], { timeout: 10_000 })
   } else {
-    restartAgentProcess(name, { fresh: true })
+    restartAgentProcess(name, { fresh: true, initiator: 'context-guard' })
   }
 }
 

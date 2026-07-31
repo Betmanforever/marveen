@@ -43,6 +43,7 @@ import {
   sendEnterToSession,
   clearStaleParkedInput,
 } from './agent-process.js'
+import { startupModelCheck } from './model-fallback-runner.js'
 import { scheduledPromptParked } from '../pane-state.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { sendTelegramMessage } from './telegram.js'
@@ -195,7 +196,7 @@ function attemptFireTask(
   now: number,
   preCheckPrefix?: string,
   lateCatchUpMs?: number,
-): 'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' {
+): 'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'model-unverified' {
   const isMainAgent = agentName === MAIN_AGENT_ID
   // Allow per-task session override via targetSession config field.
   // Falls back to the standard agent session name derivation.
@@ -285,6 +286,21 @@ function attemptFireTask(
         return 'mcp-missing'
       }
     }
+  }
+
+  // Session-start model gate (card b0c90a8a, audit M2): in the incident the
+  // scheduler injected a task 9 seconds after a boot that was silently on the
+  // wrong model, and six scheduled turns ran before anyone knew. A YOUNG
+  // session (<3 min) whose transcript does not yet confirm the configured
+  // model defers to the pending-retry queue; the gate self-expires, so the
+  // worst case is a ~3-minute slip, never starvation. forceSend is gated too:
+  // its contract is "always EVENTUALLY land, never silently drop", and a
+  // bounded defer with a retry row keeps exactly that promise -- delivering
+  // onto an unverified model would be the wrong kind of eager.
+  if (task.type !== 'command' && startupModelCheck(agentName) === 'unverified') {
+    logger.warn({ task: task.name, agent: agentName, session },
+      'Schedule target session just started and its model is not yet verified -- deferring task')
+    return 'model-unverified'
   }
 
   try {
@@ -481,7 +497,7 @@ export function runScheduledTaskNow(
     // busy session both get a queued retry that lands once the session is
     // ready. We deliberately do NOT consult skipIfBusy here -- that flag trims
     // redundant cron ticks, but an explicit run-now must not be dropped.
-    if (result === 'starting' || result === 'busy' || result === 'mcp-missing') {
+    if (result === 'starting' || result === 'busy' || result === 'mcp-missing' || result === 'model-unverified') {
       const reason = result === 'mcp-missing' ? mcpMissingReason(task.name, agentName) : result
       insertPendingTaskRetryIfNew(task.name, agentName, now, reason)
     }
@@ -771,6 +787,11 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // pre-check exists to eliminate. The retry row keeps the task alive
           // until the server returns, and the alert names the dead server.
           insertPendingTaskRetryIfNew(task.name, agentName, now, mcpMissingReason(task.name, agentName))
+        } else if (result === 'model-unverified') {
+          // skipIfBusy not honored either: the boot window is the one moment
+          // a dropped tick IS the hazard (work on an unverified model), and
+          // the gate self-expires within minutes, so the retry always lands.
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'model-unverified')
         }
       }
     }

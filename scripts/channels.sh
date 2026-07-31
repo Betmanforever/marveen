@@ -15,6 +15,18 @@
 
 INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Restart provenance (card b0c90a8a, audit M9): the 2026-07-31 15:01:01 main
+# session respawn left no record of its initiator anywhere (audit F8), and the
+# incident reconstruction had to lean on transcript file boundaries. Every
+# new-session below appends one line here; the parent cmdline is what tells a
+# systemd relaunch apart from a hand-run script. Best-effort: never blocks.
+log_respawn_provenance() {
+  printf '[%s] respawn session=%s by=channels.sh pid=%s ppid=%s user=%s parent="%s"\n' \
+    "$(date -Iseconds)" "$1" "$$" "$PPID" "$(id -un 2>/dev/null || echo '?')" \
+    "$(ps -o args= -p "$PPID" 2>/dev/null | head -c 160)" \
+    >> "$INSTALL_DIR/store/restart-provenance.log" 2>/dev/null || true
+}
+
 # Read MAIN_AGENT_ID and CHANNEL_PROVIDER from .env WITHOUT exporting
 # every variable into the shell environment. `set -a && source .env`
 # would also export TELEGRAM_BOT_TOKEN, which then leaks into the tmux
@@ -366,6 +378,7 @@ $TMUX set-environment -g CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION false 2>/dev/null 
 # just THIS session first -- never the server, never another agent's session --
 # otherwise new-session below fails with "duplicate session".
 $TMUX kill-session -t "$SESSION" 2>/dev/null || true
+log_respawn_provenance "$SESSION"
 $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
   "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
 
@@ -407,6 +420,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         # invasive change (a stable fallback dir + a seeded ~/.claude.json project
         # entry); see the PR description / card 7EB18437.
         [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
+        log_respawn_provenance "$SESSION"
         $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
           "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
         unset _CHANNELS_STARTDIR

@@ -72,7 +72,7 @@ function performRestart(name: string, cfg: AutoRestartConfig): void {
     // launchd label the installer wrote.
     execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/com.${SERVICE_ID}.channels`], { timeout: 10_000 })
   } else {
-    restartAgentProcess(name, { fresh: cfg.mode === 'fresh' })
+    restartAgentProcess(name, { fresh: cfg.mode === 'fresh', initiator: 'auto-restart' })
   }
 }
 

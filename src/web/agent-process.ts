@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, readlinkSync, symlinkSync, rmSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, readlinkSync, symlinkSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
@@ -114,6 +114,24 @@ export function ownChannelProviderForScope(
 // CLAUDE_CODE_OAUTH_TOKEN env var -- NOT via a copied/symlinked .credentials.json.
 // See ensureIsolatedChannelConfigDir for why.
 export const FLEET_OAUTH_TOKEN_PATH = join(STORE_DIR, '.claude-oauth-token')
+
+// Restart provenance (card b0c90a8a, audit M9): the 2026-07-31 incident's
+// respawn left NO record of who initiated it, so the reconstruction had to
+// lean on transcript file boundaries (audit F8). Every session-creating path
+// appends one line here -- this file, plus the same-named append in
+// scripts/channels.sh for the main agent's out-of-dashboard respawns, is the
+// authoritative "who restarted what, when" ledger. Append-only, best-effort:
+// a provenance failure must never block a start.
+export const RESTART_PROVENANCE_LOG = join(STORE_DIR, 'restart-provenance.log')
+
+export function appendRestartProvenance(session: string, initiator: string, detail = ''): void {
+  try {
+    appendFileSync(
+      RESTART_PROVENANCE_LOG,
+      `[${new Date().toISOString()}] respawn session=${session} by=${initiator} pid=${process.pid}${detail ? ` ${detail}` : ''}\n`,
+    )
+  } catch { /* best-effort */ }
+}
 
 // True when the fleet OAuth token file exists and is non-empty. Provisioning an
 // isolated config dir WITHOUT auth would launch the sub-agent logged-out, so
@@ -649,7 +667,7 @@ function startRemoteAgentProcess(
   name: string,
   host: string,
   workdir: string,
-  opts: { fresh?: boolean },
+  opts: { fresh?: boolean; initiator?: string },
 ): { ok: boolean; error?: string } {
   const state = agentRunState(name)
   if (state === 'running') return { ok: false, error: 'Agent is already running' }
@@ -690,6 +708,7 @@ function startRemoteAgentProcess(
 
   try {
     runTmux(host, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
+    appendRestartProvenance(session, opts.initiator ?? 'dashboard:startAgentProcess', `host=${host}`)
     logger.info({ name, session, host, workdir }, 'Remote agent tmux session started')
     // Remote launch resumes iff hasPriorSession (buildRemoteLaunchCommand
     // continue flag); only re-seed the task thread on an actual fresh launch.
@@ -742,7 +761,7 @@ export function resolveResumeFlag(p: {
   return { flag: p.hasPriorSession && !p.fresh && !p.hasChannel ? '--continue ' : '' }
 }
 
-export function startAgentProcess(name: string, opts: { fresh?: boolean; resumeSessionId?: string } = {}): { ok: boolean; pid?: number; error?: string } {
+export function startAgentProcess(name: string, opts: { fresh?: boolean; resumeSessionId?: string; initiator?: string } = {}): { ok: boolean; pid?: number; error?: string } {
   const dir = agentDir(name)
   if (!existsSync(dir)) return { ok: false, error: 'Agent not found' }
 
@@ -1057,6 +1076,7 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean; resumeS
     // suffix) are not glob-expanded by the shell that tmux spawns the command in.
     const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${ollamaEnv}${deepseekEnv}cd "${dir}" && ${CLAUDE} ${continueFlag}${skipFlag}--model '${model}' ${channelFlag}`.trimEnd()
     runTmux(null, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
+    appendRestartProvenance(session, opts.initiator ?? 'dashboard:startAgentProcess')
 
     logger.info({ name, session, channelDir: agentChannelDir }, 'Agent tmux session started')
 
@@ -1157,7 +1177,7 @@ export function getAgentProcessInfo(name: string): { running: boolean; session?:
   }
 }
 
-export function restartAgentProcess(name: string, opts: { fresh?: boolean; resumeSessionId?: string } = {}): { ok: boolean; pid?: number; error?: string } {
+export function restartAgentProcess(name: string, opts: { fresh?: boolean; resumeSessionId?: string; initiator?: string } = {}): { ok: boolean; pid?: number; error?: string } {
   if (isAgentRunning(name)) {
     const stopResult = stopAgentProcess(name)
     if (!stopResult.ok) return { ok: false, error: stopResult.error || 'Failed to stop running agent before restart' }

@@ -394,7 +394,7 @@ function restartFor(name: string): void {
   } else {
     // 'continue' (fresh: false) re-spawns with --continue so the conversation
     // survives the model swap.
-    restartAgentProcess(name, { fresh: false })
+    restartAgentProcess(name, { fresh: false, initiator: 'model-fallback' })
   }
 }
 
@@ -569,6 +569,52 @@ function checkMidSessionDrift(
   announceSwitch(name, decision.measured, configured, 'drift-alert',
     `Ok: az agent menet KOZBEN sodrodott le a konfiguralt modellrol (mert: ${decision.measured}, konfiguralt: ${configured}), a session indulasa meg a helyes modellen tortent. Automatikus restartot ilyenkor NEM inditok (elo munkakontextust torolne -- audit-feltetel, 2026-07-31 R2). A helyreallitas kezi dontes: /model a sessionben, vagy restart a dashboardrol.`,
     { notifyMain: true })
+}
+
+// How long after a session's start the scheduler holds work back while the
+// model is unconfirmed. Sized to the detector above: first rows land with the
+// first turn, the startup burst + 60s sweeps need ~2 sightings, and the
+// correction restart resolves inside ~3 minutes. Past this age the gate opens
+// unconditionally -- the drift machinery owns the problem from here, and a
+// session that never verifies (e.g. one that never got a first prompt) must
+// not starve its scheduled work forever.
+const STARTUP_MODEL_CHECK_GRACE_SEC = 180
+
+export type StartupModelCheck = 'verified' | 'unverified' | 'not-applicable'
+
+/**
+ * Session-start model gate for the schedule runner (card b0c90a8a, audit M2):
+ * in the incident the scheduler injected a task 9 seconds after boot and the
+ * fleet went back to work without knowing what it was running on. A YOUNG
+ * session whose boot rows do not yet confirm the configured model reads
+ * 'unverified' -- the scheduler defers via its pending-retry queue and the
+ * next tick re-checks. 'not-applicable' means the gate has nothing to say
+ * (session past the grace window, remote host, no session): deliver normally.
+ *
+ * Deliberately time-bounded: a fresh session produces NO assistant rows until
+ * its first prompt, so an unconditional "verify first" gate would deadlock a
+ * session whose only input source is the scheduler itself. Worst case under
+ * the bound: delivery slips by the grace window, then the boot-drift
+ * corrector fixes any wrong model within ~2 sweeps of the rows that first
+ * delivery produces -- while the context is still essentially empty.
+ */
+export function startupModelCheck(name: string): StartupModelCheck {
+  try {
+    if (name !== MAIN_AGENT_ID && readAgentRemoteHost(name)) return 'not-applicable'
+    const src = transcriptSourceFor(name)
+    if (src.since === null) return 'not-applicable'
+    const ageSec = Date.now() / 1000 - src.since
+    if (ageSec > STARTUP_MODEL_CHECK_GRACE_SEC) return 'not-applicable'
+    const sample = readBootModelSample(src.workingDir, src.since, src.configDir, DRIFT_SAMPLE_ROWS)
+    const measured = deriveMeasuredModel(sample.bootModels)
+    if (!measured) return 'unverified'
+    return normalizeModelId(measured) === normalizeModelId(readModelFor(name))
+      ? 'verified'
+      : 'unverified'
+  } catch {
+    // A broken measurement must never block the scheduler outright.
+    return 'not-applicable'
+  }
 }
 
 function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: string[]): void {
