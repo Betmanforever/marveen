@@ -55,8 +55,16 @@ def main():
     card = rows[0]
     full_id = card["id"]
 
+    # Output under projects/_audit/, NOT agents/auditor/ (card ba546346 fix,
+    # Wolfe's decision 2026-07-31). Writing to agents/<name>/ created a
+    # directory that listAgentNames() treated as an agent -- a phantom member,
+    # and a message-recipient with no inbox. projects/ means "deliverables",
+    # not "agents", the auditor is proven to Read from under it, and it is
+    # gitignored (a generated brief does not clutter the tree). NOT store/
+    # either -- that is where the dashboard token lives, and inputs should not
+    # sit next to secrets.
     out_path = (sys.argv[2] if len(sys.argv) > 2
-                else os.path.join(REPO, "agents", "auditor", "qa-in",
+                else os.path.join(REPO, "projects", "_audit",
                                   f"audit-brief-{full_id}.txt"))
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
