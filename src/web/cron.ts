@@ -1,4 +1,5 @@
 import { CronExpressionParser } from 'cron-parser'
+import { QUIET_START_HOUR, QUIET_END_HOUR } from '../quiet-hours.js'
 
 // All scheduled-task cron expressions (SKILL.md/task-config.json, the
 // dashboard schedule editor) are authored in the operator's own wall-clock
@@ -98,9 +99,11 @@ export function cronMatchesNow(cron: string, catchUpMs: number = NORMAL_CATCH_UP
 // below any schedule cadence we run.
 export const TICK_GAP_THRESHOLD_MS = 5 * 60_000
 // Quiet band in operator-local wall-clock time: no catch-up fires inside it,
-// and no catch-up window may reach back into it.
-export const QUIET_BAND_START_HOUR = 22
-export const QUIET_BAND_END_HOUR = 6
+// and no catch-up window may reach back into it. The 22/6 boundary is defined
+// once in src/quiet-hours.ts (card 093ee62a) and aliased here, so the scheduler
+// cannot drift from the notification paths that also gate on quiet hours.
+export const QUIET_BAND_START_HOUR = QUIET_START_HOUR
+export const QUIET_BAND_END_HOUR = QUIET_END_HOUR
 
 export interface CatchUpWindow {
   /** Window to hand cronMatchesNow() on this tick. Never below NORMAL_CATCH_UP_MS. */

@@ -343,14 +343,10 @@ export function decideModelAction(f: ModelFallbackFacts): ModelAction {
 // deferred to the next daytime sweep. A DOWNGRADE is NOT gated: that one
 // unsticks an agent sitting deaf on a limited or unusable model, which is
 // exactly the failure the night shift must not sleep through.
-export const QUIET_HOURS_START = 22
-export const QUIET_HOURS_END = 6
-
-/**
- * True when the given local hour-of-day (0-23) falls inside the fleet's quiet
- * window. Pure so the boundary is testable without mocking the clock; the
- * runner supplies `new Date(now).getHours()`.
- */
-export function isQuietHour(hour: number): boolean {
-  return hour >= QUIET_HOURS_START || hour < QUIET_HOURS_END
-}
+// Fleet quiet window: single source of truth is src/quiet-hours.ts (card
+// 093ee62a, 2026-07-30 -- Gabor's "22:00-06:00, every schedule respects it").
+// Re-exported here so the runner keeps importing isQuietHour from this module,
+// but the 22/6 boundary is defined in exactly one place: change it there and
+// every consumer (scheduler catch-up, this runner, the notification paths)
+// follows, instead of three copies silently drifting apart.
+export { isQuietHour } from './quiet-hours.js'
