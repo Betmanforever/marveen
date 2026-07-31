@@ -232,11 +232,15 @@ export function runPendingAgeWatchdog(deps: WatchdogDeps): WatchdogOutcome {
   if (!episode) {
     episode = { escalation: { wolfeFlaggedAt: null, gaborNotifiedAt: null }, claimed: new Set(), flagged: false, startedAt: nowMs }
   }
+  // Peek the escalation decision; it is only COMMITTED below, and only when a
+  // foreign claim is not suppressing this pass. Committing it under suppression
+  // would advance the machine without sending anything -- burning this episode's
+  // single owner-fallback (gaborNotifiedAt) on a message nobody received, so
+  // that once the foreign claim expired the item would stay silent forever.
   const esc = decideDialogEscalation(episode.escalation, nowMs, {
     graceMs: COORDINATOR_GRACE_MS,
     dedupMs: COORDINATOR_REFLAG_MS,
   })
-  episode.escalation = esc.next
 
   const route = decideAlertRoute({
     needsHuman: false,
@@ -257,7 +261,10 @@ export function runPendingAgeWatchdog(deps: WatchdogDeps): WatchdogOutcome {
   )
 
   if (route === 'digest') {
-    // Someone else owns it: record the second sighting and stay quiet.
+    // Someone else owns it: record the second sighting and stay quiet. The
+    // escalation state is deliberately NOT committed (see the peek above), so
+    // when the foreign claim expires this episode still has its full ladder --
+    // coordinator flag first, owner fallback after the grace.
     deps.appendDigest({
       category: 'muted',
       source: SIGNAL_ID,
@@ -266,6 +273,7 @@ export function runPendingAgeWatchdog(deps: WatchdogDeps): WatchdogOutcome {
     outcome.routes.push('digest')
     return outcome
   }
+  episode.escalation = esc.next
 
   if (esc.action === 'notify-wolfe') {
     // Dedup on the SET of stuck ids: the same backlog re-flags at most once per

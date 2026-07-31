@@ -203,6 +203,26 @@ describe('AC-4: an item another emitter already owns never reaches the owner', (
     expect(rec.digest.every((d) => d.category === 'muted')).toBe(true)
     expect(rec.digest[0].summary).toContain('pending-uzenet-watchdog')
   })
+
+  it('once the foreign claim EXPIRES the full ladder still runs (suppression is not silence)', () => {
+    // The regression this guards: while suppressed, the escalation machine must
+    // not advance. If it did, the episode's single owner-fallback would be
+    // spent on a message nobody received and the item would stay silent for
+    // good -- the audit's section 8 failure, in miniature.
+    const rec = newRecorder()
+    const claimed: HarnessOpts = {
+      paneAt: () => 'frozen pane',
+      foreignClaim: { itemKey: `msg:${ROW.id}`, by: 'pending-uzenet-watchdog' },
+    }
+    replay(rec, () => [ROW], START, START + 45 * MIN, claimed)
+    expect(rec.owner).toEqual([])
+
+    // The other emitter goes away (its claim expired); the watchdog takes over.
+    const free: HarnessOpts = { paneAt: () => 'frozen pane' }
+    replay(rec, () => [ROW], START + 46 * MIN, START + 70 * MIN, free)
+    expect(rec.coordinator).toHaveLength(1)
+    expect(rec.owner).toHaveLength(1)
+  })
 })
 
 describe('boot grace and self-healing', () => {
