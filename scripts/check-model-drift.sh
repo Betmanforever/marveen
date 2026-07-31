@@ -82,7 +82,7 @@ grace_before_s, grace_after_s = int(grace_before_h) * 3600, int(grace_after_h) *
 # config files may legally contain an alias instead of a full model id).
 DEFAULT_MODEL = 'claude-sonnet-5'
 MODEL_ALIASES = {
-    'opus': 'claude-opus-4-8[1m]',
+    'opus': 'claude-opus-5',
     'sonnet': 'claude-sonnet-5',
     'sonnet-5': 'claude-sonnet-5',
     'sonnet-4-6': 'claude-sonnet-4-6',

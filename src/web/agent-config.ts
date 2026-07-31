@@ -14,7 +14,11 @@ export const DEFAULT_MODEL = 'claude-sonnet-5'
 
 // Map short model names to full Claude model IDs (backwards compat with old configs)
 export const MODEL_ALIASES: Record<string, string> = {
-  'opus': 'claude-opus-4-8[1m]',
+  // 'opus' = the CURRENT Opus tier. Wolfe's decision 2026-07-31 (msg 3225):
+  // every deliberate version-pin in the fleet uses a FULL model id (measured:
+  // all six configs + config_change_log 10-16), so the short alias means
+  // "whatever Opus is current", not a frozen version.
+  'opus': 'claude-opus-5',
   'sonnet': 'claude-sonnet-5',
   'sonnet-5': 'claude-sonnet-5',
   'sonnet-4-6': 'claude-sonnet-4-6',
