@@ -337,6 +337,240 @@ export function decideModelAction(f: ModelFallbackFacts): ModelAction {
   return { kind: 'none' }
 }
 
+// --- Unintended MODEL DRIFT (2026-07-31 incident, card b0c90a8a) ---
+//
+// A THIRD failure class, and the one the two detectors above are blind to by
+// construction: the agent is answering on a model it was never configured for,
+// with nothing in the pane to detect. Measured 2026-07-31: the main channels
+// session was restarted at 15:01:01 with the CORRECT `--model claude-fable-5`
+// (verified from the PID's cmdline), yet its first API call 29s later answered
+// as claude-sonnet-5 and 22 assistant turns ran on Sonnet until 15:31, when the
+// owner switched by hand. Cause: the dashboard itself was restarting between
+// 15:01:01 and 15:02:06, so neither the channel-monitor's model-credit dialog
+// branch (which navigates that dialog to the CONFIGURED model) nor this runner
+// was alive; the credit gate resolved silently to its pre-highlighted "Switch
+// to Sonnet 5" default and nothing put it back.
+//
+// The response is deliberately the OPPOSITE of a fallback: a usage-limit
+// downgrade is intentional and steps DOWN the chain, a drift is unintended and
+// must go BACK to the configured model. Everything below is pure; the runner
+// supplies the measurement (see readBootModelSample) and gates the I/O (idle
+// pane, restart, audit row).
+//
+// SCOPE, so nobody mistakes this for a general model-identity monitor: the
+// measurement is what the CURRENT PROCESS BOOT started on, which is the
+// restart-window failure above. A session that boots correctly and switches
+// LATER is invisible here by construction -- that one belongs to the hourly
+// scripts/check-model-drift.sh detector.
+
+// The session's main-loop model is the majority of its EARLIEST model-bearing
+// rows -- never the token-weighted dominant one. Where sub-agent turns land
+// INLINE in the parent session log they can out-weigh the main loop outright
+// (measured 2026-07-30 on session 0ba2dcef: fable 147k tokens vs opus 130k);
+// Claude Code 2.1.220 writes them to a per-session `subagents/` sidecar
+// instead (measured 2026-07-31 on session d1ab52c1). Sampling the first rows
+// is correct under BOTH, because a sub-agent cannot answer before the main
+// loop's own first turn. Both constants mirror scripts/check-model-drift.sh,
+// which validated the rule against all 5 recent multi-model neo sessions.
+export const DRIFT_SAMPLE_ROWS = 7
+// ... but do not wait for all 7: the incident produced 6 Sonnet rows in the
+// first 16 seconds and then nothing for 3.5 minutes. Three rows is enough to
+// call the main loop, and it is what keeps the detector inside the ~65s
+// restart window this feature exists to close.
+export const DRIFT_MIN_ROWS = 3
+
+/**
+ * Compare-ready model id: strips the `[1m]` context-window marker and a
+ * trailing `-YYYYMMDD` version pin, so `claude-opus-4-8[1m]` (config) and
+ * `claude-opus-4-8` (API response) are the same model. Mirrors normalize() in
+ * scripts/check-model-drift.sh. Alias expansion is NOT done here: the
+ * configured side already comes through resolveModelId() and the measured side
+ * is always a full API model id, so adding the alias map would only duplicate
+ * agent-config.ts and break this module's zero-import property.
+ */
+export function normalizeModelId(model: string): string {
+  return model.trim().replace(/\[1m\]/g, '').replace(/-20\d{6}$/, '')
+}
+
+/**
+ * The main-loop model behind a session's earliest model-bearing rows, or null
+ * when it cannot be called: fewer than `minRows` samples, or a tie.
+ *
+ * The tie -> null is a DELIBERATE deviation from the shell script, which takes
+ * the first-inserted on a tie. There the output is a report line a human
+ * reads; here it restarts a live session, so an ambiguous sample must mean "no
+ * measurement" and let the next sweep (one more row) resolve it.
+ */
+export function deriveMeasuredModel(models: readonly string[], minRows = DRIFT_MIN_ROWS): string | null {
+  const sample = models.filter((m) => typeof m === 'string' && m.trim().length > 0).slice(0, DRIFT_SAMPLE_ROWS)
+  if (sample.length < minRows) return null
+  const counts = new Map<string, number>()
+  for (const m of sample) counts.set(m, (counts.get(m) ?? 0) + 1)
+  let best: string | null = null
+  let bestCount = 0
+  let tied = false
+  for (const [model, count] of counts) {
+    if (count > bestCount) { best = model; bestCount = count; tied = false }
+    else if (count === bestCount) tied = true
+  }
+  return tied ? null : best
+}
+
+/** One agent's run of consecutive sweeps that all measured the SAME drift. */
+export interface ModelDriftStreak {
+  /** The measured (wrong) model. */
+  model: string
+  /** Consecutive sweeps that measured it, including the latest one. */
+  sweeps: number
+}
+
+/**
+ * Fold this sweep's measurement into the agent's drift streak. Returns null
+ * (streak cleared) when there is no drift to confirm.
+ *
+ * An UNMEASURABLE sweep (`measuredModel === null` -- session too young, tail
+ * scan inconclusive) clears the streak rather than carrying it: "sustained"
+ * has to mean consecutive POSITIVE observations, or a flapping measurement
+ * could accumulate its way to a restart it never actually justified.
+ */
+export function advanceDriftStreak(
+  prev: ModelDriftStreak | null,
+  measuredModel: string | null,
+  configuredModel: string,
+): ModelDriftStreak | null {
+  if (!measuredModel) return null
+  if (normalizeModelId(measuredModel) === normalizeModelId(configuredModel)) return null
+  const sameAsPrev = prev !== null && normalizeModelId(prev.model) === normalizeModelId(measuredModel)
+  return { model: measuredModel, sweeps: sameAsPrev ? prev!.sweeps + 1 : 1 }
+}
+
+export interface ModelDriftFacts {
+  /** This agent's current drift streak, or null when nothing is drifting. */
+  streak: ModelDriftStreak | null
+  /** Model of the agent's MOST RECENT turn, or null when unknown. */
+  latestModel: string | null
+  /** The agent's configured model -- the correction target. */
+  configuredModel: string
+  /** True when an INTENTIONAL fallback record is active for this agent. */
+  hasActiveDowngrade: boolean
+  /** True when the pane currently shows a usage-limit / access-failure signal. */
+  limitSignal: boolean
+  /** Consecutive drift sweeps required before correcting. */
+  minSweeps: number
+}
+
+export type ModelDriftAction =
+  | {
+      kind: 'none'
+      reason: 'no-drift' | 'already-recovered' | 'intentional-downgrade' | 'limit-signal' | 'not-sustained'
+    }
+  | { kind: 'correct'; model: string; measured: string }
+
+/**
+ * Decide whether an agent's measured/configured mismatch is an unintended
+ * drift worth correcting. Pure; the runner owns the flap cap, the quiet-hours
+ * and idle gates, and the restart.
+ *
+ * The three guards that keep this from fighting anything deliberate:
+ *
+ *   - latestModel already on the configured model: the drift is OVER (an
+ *     operator answered the dialog or typed /model). The streak cannot notice
+ *     that by itself -- it is built from the boot's first rows, which never
+ *     change while the session lives -- so without this veto a hand-fixed
+ *     agent would be restarted for a drift that no longer exists.
+ *   - hasActiveDowngrade: while a downgrade record is live the agent is MEANT
+ *     to be off its original model, and the write+restart+first-rows sequence
+ *     transiently reads as a mismatch. Correcting there would undo a
+ *     deliberate fallback -- and, under an account-scoped limit, re-trip it.
+ *   - limitSignal: a limit or access banner is on the pane right now.
+ *     Restarting onto the (higher) configured model under an active limit buys
+ *     nothing; decideModelAction owns that situation.
+ */
+export function decideDriftAction(f: ModelDriftFacts): ModelDriftAction {
+  if (!f.streak) return { kind: 'none', reason: 'no-drift' }
+  if (f.latestModel && normalizeModelId(f.latestModel) === normalizeModelId(f.configuredModel)) {
+    return { kind: 'none', reason: 'already-recovered' }
+  }
+  if (f.hasActiveDowngrade) return { kind: 'none', reason: 'intentional-downgrade' }
+  if (f.limitSignal) return { kind: 'none', reason: 'limit-signal' }
+  if (f.streak.sweeps < f.minSweeps) return { kind: 'none', reason: 'not-sustained' }
+  return { kind: 'correct', model: f.configuredModel, measured: f.streak.model }
+}
+
+// --- MID-SESSION drift (scope decision on card b0c90a8a, 2026-07-31 16:2x) ---
+//
+// The boot detector above is structurally blind to a session that boots on the
+// RIGHT model and slides off it later: its measurement is the boot's first
+// rows, which never change while the session lives. That variant is real --
+// measured 2026-07-31 10:37:27, neo's own main loop switched fable-5 ->
+// opus-4-8 mid-session, no dialog, no /model, no config change, and stayed
+// there for 5+ hours until a human noticed.
+//
+// The response here is ALERT ONLY, never a restart. That asymmetry is the
+// audit's R2 condition (2026-07-31, ESCALATE item): a boot-window correction
+// destroys an empty context, a mid-session correction destroys a working one,
+// so past the boot window the automated system detects and reports while the
+// fix stays a human decision (/model, or a restart they choose to take).
+//
+// The signal is latestModel -- the very value the boot path only trusts as a
+// veto. Two things make it strong enough to ALERT on (though still not to
+// restart on): the scan only reads interactive main-loop turns (sub-agent
+// traffic lives in the subagents/ sidecar since Claude Code 2.1.220, and the
+// entrypoint filter drops headless runs), and the streak demands more
+// consecutive sightings than the boot path, so a single odd row cannot page
+// anyone.
+
+/** Consecutive sweeps of the same wrong latestModel before alerting. */
+export const MIN_MIDSESSION_DRIFT_SWEEPS = 3
+
+export interface MidSessionDriftFacts {
+  /** Streak built from latestModel sightings (advanceDriftStreak), or null. */
+  streak: ModelDriftStreak | null
+  /** deriveMeasuredModel(bootModels) for the same boot, or null. */
+  bootMeasured: string | null
+  configuredModel: string
+  hasActiveDowngrade: boolean
+  limitSignal: boolean
+  minSweeps: number
+  /** True when this drift episode was already announced. */
+  alreadyAlerted: boolean
+}
+
+export type MidSessionDriftAction =
+  | {
+      kind: 'none'
+      reason:
+        | 'no-drift'
+        | 'boot-drift'
+        | 'intentional-downgrade'
+        | 'limit-signal'
+        | 'not-sustained'
+        | 'already-alerted'
+    }
+  | { kind: 'alert'; measured: string }
+
+/**
+ * Decide whether a sustained latestModel mismatch deserves an alert. Pure;
+ * the runner owns the streak bookkeeping and the once-per-episode latch.
+ *
+ * The one guard beyond the boot path's set: when the BOOT rows themselves
+ * measure wrong, the session has been off-model since start and the
+ * correction path owns it -- alerting here too would page twice for one
+ * event, and worse, keep paging after the correction path hit its flap cap
+ * deliberately (that cap already announces itself once).
+ */
+export function decideMidSessionDriftAction(f: MidSessionDriftFacts): MidSessionDriftAction {
+  if (!f.streak) return { kind: 'none', reason: 'no-drift' }
+  if (f.bootMeasured && normalizeModelId(f.bootMeasured) !== normalizeModelId(f.configuredModel)) {
+    return { kind: 'none', reason: 'boot-drift' }
+  }
+  if (f.hasActiveDowngrade) return { kind: 'none', reason: 'intentional-downgrade' }
+  if (f.limitSignal) return { kind: 'none', reason: 'limit-signal' }
+  if (f.streak.sweeps < f.minSweeps) return { kind: 'none', reason: 'not-sustained' }
+  if (f.alreadyAlerted) return { kind: 'none', reason: 'already-alerted' }
+  return { kind: 'alert', measured: f.streak.model }
+}
+
 // The fleet's nightly pause: 22:00-06:00 in the host's local timezone
 // (Europe/Budapest on this install). A REVERT costs a session restart and is
 // never urgent -- the agent is working fine on the fallback model -- so it is

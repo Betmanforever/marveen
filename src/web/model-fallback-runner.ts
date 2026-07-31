@@ -15,6 +15,7 @@ import {
   resolveModelId,
   readMainModel,
   writeMainModel,
+  agentDir,
   DEFAULT_MODEL,
 } from './agent-config.js'
 import {
@@ -22,15 +23,22 @@ import {
   agentSessionName,
   restartAgentProcess,
   capturePane,
+  getAgentRunningSince,
+  getSessionCreatedAt,
   FLEET_OAUTH_TOKEN_PATH,
   hasFleetOauthToken,
 } from './agent-process.js'
+import { resolveAgentConfigDir } from './claude-plans.js'
+import { readBootModelSample } from './active-model.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { paneLooksIdle } from '../pane-state.js'
 import { readModelFallbackConfig } from './model-fallback-store.js'
 import {
   detectsUsageLimit, detectsModelAccessFailure, decideModelAction,
   detectsUnrecognizedApiError, sanitizeFailureSnippet, isQuietHour,
+  deriveMeasuredModel, advanceDriftStreak, decideDriftAction,
+  decideMidSessionDriftAction, normalizeModelId,
+  DRIFT_SAMPLE_ROWS, MIN_MIDSESSION_DRIFT_SWEEPS, type ModelDriftStreak,
 } from '../model-fallback.js'
 import { logConfigChange, createAgentMessage } from '../db.js'
 
@@ -46,6 +54,17 @@ import { logConfigChange, createAgentMessage } from '../db.js'
 
 const INITIAL_DELAY_MS = 50_000
 const INTERVAL_MS = 60_000
+
+// Startup burst (card b0c90a8a). The 50s first tick left the dashboard's own
+// restart window uncovered: on 2026-07-31 the dashboard was down 15:01:01 to
+// 15:02:06 and the main agent came back on the WRONG model at 15:01:30, with
+// neither this runner nor the channel-monitor's credit-dialog branch alive to
+// notice. Two extra sweeps put the first drift measurement at ~10s and the
+// earliest correction at ~25s (MIN_DRIFT_SWEEPS consecutive sightings), so the
+// blind window closes instead of running until someone spots it by hand.
+// Offsets picked to miss the other watchers' ticks (auto-restart 40s,
+// stuck-tool-call 35s) so the boot does not pile tmux calls onto one moment.
+const STARTUP_SWEEP_DELAYS_MS = [10_000, 25_000]
 
 // agent name -> downgrade record. Absent => currently on its own primary.
 //   at:     when the (first) downgrade happened (ms)
@@ -186,6 +205,34 @@ const stickyRevertHistory = new Map<string, StickyRevertHistory>()
 const FLAP_WINDOW_MS = 24 * 3_600_000
 const MAX_PROBE_REVERTS = 2
 
+// --- Unintended model drift (card b0c90a8a) ---
+//
+// Sustained-drift bookkeeping. Two CONSECUTIVE sweeps must measure the same
+// wrong model before anything restarts: the correction costs a session
+// restart, and a single sample can be a young session whose first turns have
+// not landed yet. See advanceDriftStreak for why an unmeasurable sweep clears
+// the streak instead of carrying it.
+const MIN_DRIFT_SWEEPS = 2
+const driftStreaks = new Map<string, ModelDriftStreak>()
+
+// Flap-breaker, same shape as the probe-revert one (audit C-B): a drift
+// correction restarts the agent so the credit dialog is answered by the live
+// channel-monitor. If that branch is itself broken the corrected session
+// drifts straight back, and an uncapped loop would restart the agent forever.
+// After MAX_DRIFT_CORRECTIONS inside FLAP_WINDOW_MS the auto-correction stops
+// for that agent and says so ONCE; from there it is an operator decision.
+const MAX_DRIFT_CORRECTIONS = 2
+interface DriftCorrectHistory { count: number; lastAt: number; capNotified: boolean }
+const driftCorrectHistory = new Map<string, DriftCorrectHistory>()
+
+// Mid-session variant (scope decision 2026-07-31 16:2x): a separate streak
+// built from latestModel, alert-only (see decideMidSessionDriftAction for the
+// audit R2 asymmetry). The latch remembers which wrong model was announced so
+// one episode pages exactly once; it clears the moment the session is seen
+// back on its configured model, so a LATER second drift alerts again.
+const latestDriftStreaks = new Map<string, ModelDriftStreak>()
+const midDriftAlerted = new Map<string, string>()
+
 function maybeProbePreferred(name: string, record: DowngradeRecord, nowMs: number): void {
   if (!record.sticky || probeConfirmed.has(name) || probeInFlight.has(name)) return
   if (!record.from.startsWith('claude-')) return
@@ -257,8 +304,16 @@ function maybeProbePreferred(name: string, record: DowngradeRecord, nowMs: numbe
 // on Telegram. (The config_change_log audit row is written separately, right
 // after the model write, so a failed restart can never hide the change -- the
 // monthly model-eval needs that assignment history for correct attribution.)
-function announceSwitch(name: string, from: string, to: string, kind: string, detail: string): void {
-  if (name === MAIN_AGENT_ID) return // the main agent IS the relay; log only
+function announceSwitch(
+  name: string, from: string, to: string, kind: string, detail: string,
+  opts: { notifyMain?: boolean } = {},
+): void {
+  // The main agent IS the relay, so a switch it lives through needs no message
+  // -- log only. `notifyMain` is the one exception: a drift correction respawns
+  // the main session FRESH (channels.sh does not --continue), so the agent that
+  // comes back has no memory of the switch at all. The queue is durable, so the
+  // message survives the restart and is read on the next inbox drain.
+  if (name === MAIN_AGENT_ID && !opts.notifyMain) return
   try {
     createAgentMessage(
       'model-fallback',
@@ -341,6 +396,179 @@ function restartFor(name: string): void {
     // survives the model swap.
     restartAgentProcess(name, { fresh: false })
   }
+}
+
+/**
+ * Where this agent's live session log and its boot boundary are. The config
+ * dir must come from resolveAgentConfigDir -- since the per-agent
+ * CLAUDE_CONFIG_DIR migration a sub-agent's transcripts are NOT under ~/.claude
+ * (that is why sub-agent token logging silently stopped on 2026-07-08), and
+ * reading the wrong projects dir would report a permanent false "unmeasurable".
+ */
+function transcriptSourceFor(name: string): { workingDir: string; configDir?: string; since: number | null } {
+  if (name === MAIN_AGENT_ID) {
+    return {
+      workingDir: PROJECT_ROOT,
+      since: getSessionCreatedAt(MAIN_CHANNELS_SESSION),
+    }
+  }
+  return {
+    workingDir: agentDir(name),
+    configDir: resolveAgentConfigDir(name).configDir ?? undefined,
+    since: getAgentRunningSince(name),
+  }
+}
+
+/**
+ * Detect and undo an UNINTENDED model drift (card b0c90a8a, 2026-07-31): the
+ * agent is answering on a model it was never configured for, with nothing in
+ * the pane to see. Called only when the pane-based logic has nothing to do, so
+ * the deliberate fallback path always keeps precedence.
+ *
+ * The correction is a RESTART, not a model write: the configured value on disk
+ * is already right (verified in the incident -- the respawn passed the correct
+ * --model and the credit gate overrode it anyway). Respawning with the
+ * dashboard alive means the channel-monitor's credit-dialog branch is there to
+ * answer the gate with the configured model this time.
+ */
+function checkModelDrift(
+  name: string, pane: string, nowMs: number, limitSignal: boolean, hasActiveDowngrade: boolean,
+): void {
+  // A remote agent's transcripts live on the laptop, not on this filesystem;
+  // scanning here would read "unmeasurable" forever (harmless) or, worse, a
+  // stale local dir of the same name. Skip explicitly.
+  if (name !== MAIN_AGENT_ID && readAgentRemoteHost(name)) return
+  const src = transcriptSourceFor(name)
+  if (src.since === null) return
+  const configured = readModelFor(name)
+  const sample = readBootModelSample(src.workingDir, src.since, src.configDir, DRIFT_SAMPLE_ROWS)
+  const measured = deriveMeasuredModel(sample.bootModels)
+  const streak = advanceDriftStreak(driftStreaks.get(name) ?? null, measured, configured)
+  if (streak) driftStreaks.set(name, streak)
+  else driftStreaks.delete(name)
+
+  // Mid-session check BEFORE the boot path's early returns: it must run on
+  // every sweep, and its own boot-drift guard keeps the two paths disjoint.
+  checkMidSessionDrift(name, sample.latestModel, measured, configured, limitSignal, hasActiveDowngrade)
+
+  const decision = decideDriftAction({
+    streak,
+    latestModel: sample.latestModel,
+    configuredModel: configured,
+    hasActiveDowngrade,
+    limitSignal,
+    minSweeps: MIN_DRIFT_SWEEPS,
+  })
+  if (decision.kind === 'none') return
+
+  // Flap cap before any restart cost, so a broken credit-dialog branch cannot
+  // turn this into a restart loop.
+  const stale = driftCorrectHistory.get(name)
+  if (stale && nowMs - stale.lastAt > FLAP_WINDOW_MS) driftCorrectHistory.delete(name)
+  const hist = driftCorrectHistory.get(name)
+  if (hist && hist.count >= MAX_DRIFT_CORRECTIONS) {
+    if (!hist.capNotified) {
+      hist.capNotified = true
+      logger.warn({ name, measured: decision.measured, configured },
+        'model-fallback: drift correction cap reached, auto-correction disabled for this agent')
+      announceSwitch(name, decision.measured, configured, 'drift-stop',
+        `Az agent 24 oran belul tobbszor visszasodrodott a konfiguralt modellrol (${configured}) erre: ${decision.measured}. Az automatikus drift-korrekciot ennel az agentnel KIKAPCSOLTAM -- a modell-kapu (credit-dialogus) valoszinuleg nem oldodik meg magatol. A visszaallitas manualis dontes.`,
+        { notifyMain: true })
+    }
+    return
+  }
+
+  // Same quiet-hours rule as the rest of the sweep (audit 2026-07-31, P2): the
+  // main agent's Linux restart is a FRESH spawn, so an unattended 03:00
+  // correction would wipe Mr. Wolfe's conversation -- and during quiet hours no
+  // traffic depends on him, so the wrong model has no consumer until 06:00
+  // anyway. Sub-agent corrections are NOT deferred: same reasoning as a
+  // downgrade, they free an agent that is silently running below spec.
+  if (isQuietHour(new Date(nowMs).getHours()) && name === MAIN_AGENT_ID) {
+    logger.info({ name, measured: decision.measured, configured },
+      'model-fallback: drift correction due but quiet hours, deferring')
+    return
+  }
+  if (!paneLooksIdle(pane)) {
+    logger.info({ name, measured: decision.measured, configured },
+      'model-fallback: drift correction due but pane busy, deferring')
+    return
+  }
+
+  // Audit row BEFORE the restart, mirroring the switch path: old = what it was
+  // ACTUALLY running, new = the configured value it is being put back on. This
+  // is also what keeps scripts/check-model-drift.sh's unlogged-switch detector
+  // quiet about a boundary this runner explains.
+  try {
+    logConfigChange(`agent.${name}.model`, decision.measured, configured, 'model-fallback:drift-autocorrect')
+  } catch (err) {
+    logger.warn({ err, name }, 'model-fallback: drift config_change_log write failed')
+  }
+  driftStreaks.delete(name)
+  driftCorrectHistory.set(name, {
+    count: (hist?.count ?? 0) + 1,
+    lastAt: nowMs,
+    capNotified: false,
+  })
+  // Arm the shared post-switch cooldown: the respawned session needs time to
+  // write its first turns before any detector reads this agent again.
+  lastSwitchAt.set(name, nowMs)
+
+  let restartOk = true
+  try {
+    restartFor(name)
+  } catch (err) {
+    restartOk = false
+    logger.warn({ err, name }, 'model-fallback: drift-correcting restart failed')
+  }
+  announceSwitch(name, decision.measured, configured, 'drift-autocorrect',
+    `Ok: az agent tartosan a KONFIGURALT modell helyett mason futott (mert: ${decision.measured}, konfiguralt: ${configured}). Ez NEM szandekolt fallback, hanem drift -- valoszinuleg egy modell-kredit dialogus dolt el csendben a restart-ablakban -- ezert session-restarttal visszaallitottam a konfiguraltra.`
+    + (restartOk ? '' : ' FIGYELEM: a session-restart nem sikerult, a drift TOVABBRA IS fennall.'),
+    { notifyMain: true })
+  logger.info({ name, measured: decision.measured, configured, restartOk },
+    'model-fallback: corrected unintended model drift')
+}
+
+/**
+ * Alert (never restart) on a session that booted RIGHT and slid off its model
+ * later -- the variant the boot rows cannot see (measured 2026-07-31 10:37,
+ * neo, fable-5 -> opus-4-8 mid-session, unnoticed for 5+ hours). Alert-only is
+ * the audit's R2 condition: past the boot window a restart destroys a working
+ * context, so the fix stays a human decision (/model in the session, or a
+ * restart they choose to take).
+ */
+function checkMidSessionDrift(
+  name: string, latestModel: string | null, bootMeasured: string | null,
+  configured: string, limitSignal: boolean, hasActiveDowngrade: boolean,
+): void {
+  const streak = advanceDriftStreak(latestDriftStreaks.get(name) ?? null, latestModel, configured)
+  if (streak) latestDriftStreaks.set(name, streak)
+  else latestDriftStreaks.delete(name)
+  // Seen back on the configured model: the episode is over, re-arm the latch.
+  // An UNMEASURABLE sweep does not re-arm -- a scan hiccup mid-episode would
+  // otherwise page a second time for the same drift.
+  if (latestModel && normalizeModelId(latestModel) === normalizeModelId(configured)) {
+    midDriftAlerted.delete(name)
+  }
+  const alreadyAlerted =
+    streak !== null && midDriftAlerted.get(name) === normalizeModelId(streak.model)
+  const decision = decideMidSessionDriftAction({
+    streak,
+    bootMeasured,
+    configuredModel: configured,
+    hasActiveDowngrade,
+    limitSignal,
+    minSweeps: MIN_MIDSESSION_DRIFT_SWEEPS,
+    alreadyAlerted,
+  })
+  if (decision.kind === 'none') return
+
+  midDriftAlerted.set(name, normalizeModelId(decision.measured))
+  logger.warn({ name, measured: decision.measured, configured },
+    'model-fallback: mid-session model drift detected, alerting (no auto-restart past boot window)')
+  announceSwitch(name, decision.measured, configured, 'drift-alert',
+    `Ok: az agent menet KOZBEN sodrodott le a konfiguralt modellrol (mert: ${decision.measured}, konfiguralt: ${configured}), a session indulasa meg a helyes modellen tortent. Automatikus restartot ilyenkor NEM inditok (elo munkakontextust torolne -- audit-feltetel, 2026-07-31 R2). A helyreallitas kezi dontes: /model a sessionben, vagy restart a dashboardrol.`,
+    { notifyMain: true })
 }
 
 function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: string[]): void {
@@ -426,6 +654,10 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
       logger.info({ name, downgradedAt: record.at, from: record.from },
         'model-fallback: limit still visible but cascade guard holds (one step per window)')
     }
+    // Only when the pane says nothing: the deliberate fallback path always
+    // wins, and the drift correction is the last resort for the failure class
+    // that leaves NO trace in the pane (card b0c90a8a).
+    checkModelDrift(name, pane, nowMs, limitDetected || accessFailure !== null, record !== null)
     return
   }
 
@@ -559,6 +791,10 @@ export function startModelFallbackRunner(): NodeJS.Timeout {
       lastSwitchAt.clear()
       handledLine.clear()
       stickyRevertHistory.clear()
+      driftStreaks.clear()
+      driftCorrectHistory.clear()
+      latestDriftStreaks.clear()
+      midDriftAlerted.clear()
       return
     }
     const now = Date.now()
@@ -574,6 +810,9 @@ export function startModelFallbackRunner(): NodeJS.Timeout {
   // across a dashboard restart, otherwise the revert branch is unreachable and
   // it stays on the fallback model forever.
   loadDowngradeState()
+  // Startup burst FIRST, so the dashboard's own restart window is covered
+  // instead of being the one moment nothing watches (card b0c90a8a).
+  for (const delay of STARTUP_SWEEP_DELAYS_MS) setTimeout(sweep, delay)
   setTimeout(sweep, INITIAL_DELAY_MS)
   return setInterval(sweep, INTERVAL_MS)
 }

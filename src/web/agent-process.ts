@@ -603,15 +603,27 @@ export function sessionExistsOnHost(host: string | null, session: string): boole
   }
 }
 
-export function getAgentRunningSince(name: string): number | null {
+/**
+ * When a tmux session was created, as a unix epoch (seconds), or null.
+ *
+ * Both restart transports re-create the session (stopAgentProcess kills it and
+ * startAgentProcess opens a new one; channels.sh does kill-session +
+ * new-session), so this IS the current claude process's boot boundary -- which
+ * is what a transcript scan needs to tell this boot's turns from the previous
+ * one's in a --continue'd session log.
+ */
+export function getSessionCreatedAt(session: string, host: string | null = null): number | null {
   try {
-    const host = readAgentRemoteHost(name)
-    const out = captureTmux(host, ['display-message', '-p', '-t', agentSessionName(name), '#{session_created}']).trim()
+    const out = captureTmux(host, ['display-message', '-p', '-t', session, '#{session_created}']).trim()
     const ts = parseInt(out, 10)
     return Number.isFinite(ts) ? ts : null
   } catch {
     return null
   }
+}
+
+export function getAgentRunningSince(name: string): number | null {
+  return getSessionCreatedAt(agentSessionName(name), readAgentRemoteHost(name))
 }
 
 
