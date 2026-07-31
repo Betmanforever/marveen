@@ -37,7 +37,13 @@ import {
   type StuckInputState, type StuckInputThresholds, type StuckInputAction,
   type StuckInputActionFacts,
 } from '../pane-state.js'
-import { decidePendingAgeAlert, decidePendingAgeRealert, shouldAlertStuckTarget, isTargetInBootGrace } from './message-router.js'
+import { runPendingAgeWatchdog, SIGNAL_ID as QUEUE_SIGNAL_ID } from './pending-age-watchdog.js'
+import {
+  claimEmit, loadAlertState, saveAlertState, bufferDigestEntry, recordOwnerSend,
+  decideOwnerSendAllowance, shouldSendBreakerNotice, buildBreakerNotice,
+  type DigestEntry,
+} from '../alert-policy.js'
+import { claimAlertItem, getLiveAlertClaim, releaseAlertClaim, expireAlertClaims } from '../db.js'
 // The plan limit modal wears the same navigable-modal footer as a genuine
 // menu; the limit-banner detector tells the two apart so the menu-recovery
 // alert can name the real cause (see the blocking-menu pass below).
@@ -590,30 +596,10 @@ function buildContextBudgetOwnerFallback(label: string): string {
   )
 }
 
-// Pending-age watchdog state (see the watchdog pass in check()). The wedge
-// escalation itself flows through agent_messages, so when THAT queue silently
-// starves (2026-07-12) the escalation dies with it. The pass reads the queue
-// DIRECTLY and alerts the owner via sendAlert (NEVER agent_messages), so it
-// survives the queue wedging. One alert per stuck episode; re-armed when the
-// backlog clears.
-let pendingAgeLastAlertAt: number | null = null
-const PENDING_AGE_ALERT_THRESHOLD_MS = 3 * 60 * 1000
-const PENDING_AGE_ALERT_DEDUP_MS = 15 * 60 * 1000
-// Past this age even a busy-working target alerts: an endless turn starves
-// the queue just as dead as a wedge (busy-vs-wedged discrimination ceiling).
-const PENDING_AGE_ALERT_HARD_CEILING_MS = 15 * 60 * 1000
-// Ceiling RE-ARM: once the OLDEST pending row has out-waited this age (~3x the
-// routine dedup) the episode is not merely slow but wedged-and-worsening, so a
-// severity escalation re-alert fires INSIDE the routine dedup window
-// (decidePendingAgeRealert). Self-throttled to one per PENDING_AGE_REALERT_DEDUP_MS
-// via the shared pendingAgeLastAlertAt stamp, so it can never storm the tick.
-const PENDING_AGE_REALERT_CEILING_MS = 45 * 60 * 1000
-const PENDING_AGE_REALERT_DEDUP_MS = 5 * 60 * 1000
-// Boot-grace suppression (2026-07-22 14:59 false alarm, Gabor approval): a
-// target whose claude process started less than this long ago is booting, not
-// wedged -- its pending rows are normal recovery latency. Kept under the hard
-// ceiling so a boot that never completes still alerts.
-const PENDING_AGE_BOOT_GRACE_MS = 5 * 60 * 1000
+// Pending-age watchdog: the decision path lives in pending-age-watchdog.ts (all
+// thresholds, the stall predicate and the coordinator-first escalation), so it
+// can be replayed in tests with injected senders. This file supplies the I/O:
+// the queue read, the pane probe, the claim table and the two transports.
 
 // Age of the session's pane-leader process (claude itself for agent panes).
 // null on any failure -- callers must fail-open (no boot-grace claimed).
@@ -1390,6 +1376,16 @@ export function buildQuietAlertSummary(state: QuietAlertBuffer, max = QUIET_ALER
 
 let quietAlerts: QuietAlertBuffer = EMPTY_QUIET_ALERT_BUFFER
 
+/** Add one line to the 24h digest buffer (audit AC-7). Best-effort: a digest
+ * write must never break the monitor tick or swallow the caller's own path. */
+export function appendDigestEntry(entry: Omit<DigestEntry, 'ts'>): void {
+  try {
+    saveAlertState(bufferDigestEntry(loadAlertState(), { ts: Date.now(), ...entry }))
+  } catch (err) {
+    logger.warn({ err, source: entry.source }, 'appendDigestEntry failed (non-fatal)')
+  }
+}
+
 export function sendAlert(text: string): void {
   const nowMs = Date.now()
   if (isQuietHour(budapestHour(nowMs))) {
@@ -1403,6 +1399,35 @@ export function sendAlert(text: string): void {
   // First alert after the window: the night's summary goes out FIRST so the
   // owner reads the two in chronological order.
   flushQuietAlerts()
+  // Owner-facing rate ceiling (audit AC-8): 3/hour, 10/day ACROSS emitters.
+  // Every owner alert of this process funnels through here, so this is the one
+  // place that can bound the total. The overflow is NOT dropped -- it lands in
+  // the digest, and one breaker line per hour says so out loud, because a
+  // ceiling that hides its own operation turns a spam problem into a silence
+  // problem (audit section 8).
+  try {
+    const state = loadAlertState()
+    const verdict = decideOwnerSendAllowance(state.ownerSends, nowMs)
+    if (verdict !== 'allow') {
+      const buffered = bufferDigestEntry(state, { ts: nowMs, category: 'muted', source: 'rate-ceiling', summary: text })
+      const breakerDue = shouldSendBreakerNotice(buffered.lastBreakerAt, nowMs)
+      const mutedInHour = buffered.digest.filter(
+        (e) => e.source === 'rate-ceiling' && e.ts > nowMs - 60 * 60 * 1000,
+      ).length
+      saveAlertState(breakerDue ? { ...buffered, lastBreakerAt: nowMs } : buffered)
+      logger.warn({ verdict, mutedInHour }, 'sendAlert: owner-facing rate ceiling engaged -- alert diverted to the daily digest')
+      if (breakerDue) {
+        notifyChannel(buildBreakerNotice(verdict, mutedInHour)).catch((err) => logger.error({ err }, 'sendAlert: breaker notice threw'))
+      }
+      return
+    }
+    saveAlertState(recordOwnerSend(state, nowMs))
+  } catch (err) {
+    // The ceiling is a governor, not a gate: if its store is unreadable the
+    // alert still goes out. Losing an alert to a broken state file would be the
+    // worse failure.
+    logger.warn({ err }, 'sendAlert: rate-ceiling bookkeeping failed -- sending anyway')
+  }
   // notifyChannel logs its own send failures (see notify.ts); this catch is
   // defense-in-depth against a throw OUTSIDE its try/catches (getProvider,
   // formatMessage, splitMessage) -- never swallow silently, same reasoning.
@@ -2190,84 +2215,39 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     // wedge escalation itself flows through agent_messages, so when THAT queue
     // silently starves (2026-07-12: four messages pending 10+ min in BOTH
     // directions, including a coordinator-bound pull-model message) the
-    // escalation dies with it. Read the queue DIRECTLY and alert the owner via
-    // sendAlert (NEVER agent_messages -- that is the failing channel). Include
-    // coordinator-bound (pull-model) messages: they are exactly the ones that
-    // silently starve. One alert per stuck episode; re-armed when the backlog
-    // clears. Wrapped so a DB hiccup can never break the rest of the monitor tick.
+    // escalation dies with it -- so the queue is read DIRECTLY here, and the
+    // OWNER path (sendAlert) never depends on an inter-agent message being
+    // DELIVERED, only on one having been sent.
+    //
+    // The decisions live in pending-age-watchdog.ts (audit AC-11: the whole
+    // path must be replayable with injected senders); this block is the I/O
+    // wiring. Routing per audit AC-2/AC-4/AC-5: routine findings go to the
+    // coordinator with a claim on each item, and the owner is alerted only when
+    // the coordinator was told and went silent through the grace window.
+    // Wrapped so a DB hiccup can never break the rest of the monitor tick.
     try {
-      const pending = getPendingMessages()
       const nowMs = Date.now()
-      const agesMs = pending.map((m) => nowMs - m.created_at * 1000)
-      if (!agesMs.some((a) => a > PENDING_AGE_ALERT_THRESHOLD_MS)) {
-        // Backlog below threshold: re-arm so the next episode alerts promptly.
-        pendingAgeLastAlertAt = null
-      } else if (
-        decidePendingAgeAlert(agesMs, pendingAgeLastAlertAt, nowMs, PENDING_AGE_ALERT_THRESHOLD_MS, PENDING_AGE_ALERT_DEDUP_MS) ||
-        // Ceiling RE-ARM: once the OLDEST row out-waits the ceiling the episode is
-        // wedged-and-worsening, so escalate INSIDE the routine dedup window (at the
-        // faster PENDING_AGE_REALERT_DEDUP_MS cadence, self-throttled off the same
-        // pendingAgeLastAlertAt stamp so it never storms).
-        decidePendingAgeRealert(Math.max(...agesMs), pendingAgeLastAlertAt, nowMs, PENDING_AGE_REALERT_CEILING_MS, PENDING_AGE_REALERT_DEDUP_MS)
-      ) {
-        // Busy-vs-wedged discrimination (2026-07-13 09:00 false alarm): a
-        // target that is ACTIVELY WORKING holds its inbox until the turn ends
-        // by design -- that is latency, not starvation. Classify each stuck
-        // row's target pane and alert only on rows whose target is not a
-        // healthy-busy session; a hard ceiling re-includes even busy targets
-        // (an endless turn starves the queue just as dead as a wedge). One
-        // capture per distinct target session, cached for this pass.
-        const stuckAll = pending
-          .map((m) => ({ m, ageMs: nowMs - m.created_at * 1000 }))
-          .filter((x) => x.ageMs > PENDING_AGE_ALERT_THRESHOLD_MS)
-          .sort((a, b) => b.ageMs - a.ageMs)
-        const paneCache = new Map<string, { state: string | null; wedge: boolean; procAgeMs: number | null }>()
-        const classifyTarget = (toAgent: string): { state: string | null; wedge: boolean; procAgeMs: number | null } => {
-          const session = toAgent === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(toAgent)
-          const cached = paneCache.get(session)
-          if (cached) return cached
+      expireAlertClaims(Math.floor(nowMs / 1000))
+      runPendingAgeWatchdog({
+        nowMs,
+        pending: getPendingMessages(),
+        sessionFor: (agent) => (agent === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(agent)),
+        probeTarget: (agent) => {
+          const session = agent === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(agent)
           const pane = capturePane(session)
-          const out = pane == null
-            ? { state: null, wedge: false, procAgeMs: null } // unreadable -> fail-open (alerts)
-            : {
-                state: detectPaneState(pane),
-                wedge: parkedInputText(pane) != null || paneShowsContextLow(pane) || paneShowsContextSaturation(pane),
-                procAgeMs: paneProcessAgeMs(session),
-              }
-          paneCache.set(session, out)
-          return out
-        }
-        const stuck = stuckAll.filter((x) => {
-          const t = classifyTarget(x.m.to_agent)
-          // Boot-grace: a just-(re)started target holds its inbox while claude
-          // boots -- suppress like healthy-busy, but never past the hard
-          // ceiling and never over a wedge signal (2026-07-22 14:59 false alarm).
-          if (!t.wedge && x.ageMs <= PENDING_AGE_ALERT_HARD_CEILING_MS
-              && isTargetInBootGrace(t.procAgeMs, PENDING_AGE_BOOT_GRACE_MS)) return false
-          return shouldAlertStuckTarget(t.state, t.wedge, x.ageMs, PENDING_AGE_ALERT_HARD_CEILING_MS)
-        }).slice(0, 5)
-        if (stuck.length === 0) {
-          // Every stuck row's target is healthy-busy: benign latency. Do NOT
-          // bump the dedup stamp -- if a target wedges (or the ceiling passes)
-          // on a later tick, the alert must fire promptly, not wait out a
-          // window consumed by a suppressed non-alert.
-          logger.info({ suppressed: stuckAll.length }, 'Pending-age watchdog: all stuck targets are busy-working (no wedge signal) -- alert suppressed')
-        } else {
-          pendingAgeLastAlertAt = nowMs
-          // List up to the 5 oldest alert-worthy rows (id, from→to, minutes pending).
-          const list = stuck.map((x) => `#${x.m.id} ${x.m.from_agent}→${x.m.to_agent} (${Math.floor(x.ageMs / 60000)}p)`).join(', ')
-          const thresholdMin = Math.floor(PENDING_AGE_ALERT_THRESHOLD_MS / 60000)
-          const oldestMin = Math.floor(stuck[0].ageMs / 60000)
-          // Escalation wording is SEVERITY-driven (oldest past the ceiling), not
-          // cadence-driven: a routine-cadence re-alert on a 45+ min backlog is
-          // still an escalation. Past the ceiling this is a wedge, not latency.
-          const escalation = stuck[0].ageMs > PENDING_AGE_REALERT_CEILING_MS
-          logger.error({ stuck: stuck.length, oldestMin, escalation }, 'Inter-agent message queue starving -- pending rows past age threshold')
-          sendAlert(escalation
-            ? `⛔ ESZKALACIO -- az inter-agent uzenetsor MEG MINDIG akad: ${stuck.length} uzenet, a legregebbi ${oldestMin} perce pending (tullepte a ${Math.floor(PENDING_AGE_REALERT_CEILING_MS / 60000)} perces plafont). Legidosebbek: ${list}. Ez mar nem lassulas hanem beragadas -- nezd meg a dashboard uzenetsort / a cel-agens sessiont.`
-            : `⛔ Az inter-agent uzenetsor akad: ${stuck.length} uzenet ${thresholdMin}+ perce pending, es a cel-agent NEM dolgozik epp (vagy wedge-jelet mutat). Legidosebbek: ${list}. Nezd meg a dashboard uzenetsort.`)
-        }
-      }
+          return { pane, procAgeMs: pane == null ? null : paneProcessAgeMs(session) }
+        },
+        liveClaimBy: (itemKey, nowSec) => getLiveAlertClaim(QUEUE_SIGNAL_ID, itemKey, nowSec)?.claimed_by ?? null,
+        claimForCoordinator: (itemKey, nowSec, ttlSec) => { claimAlertItem(QUEUE_SIGNAL_ID, itemKey, 'coordinator', nowSec, ttlSec) },
+        releaseClaim: (itemKey) => { releaseAlertClaim(QUEUE_SIGNAL_ID, itemKey) },
+        sendCoordinator: (text) => {
+          const msg = createAgentMessage('alert-policy', MAIN_AGENT_ID, text)
+          logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
+        },
+        sendOwner: (text) => sendAlert(text),
+        appendDigest: (entry) => appendDigestEntry(entry),
+        claimEmit: (kind, key, dedupMs) => claimEmit(kind, key, nowMs, dedupMs),
+      })
     } catch (err) {
       logger.warn({ err }, 'channel-monitor: pending-age watchdog pass failed')
     }

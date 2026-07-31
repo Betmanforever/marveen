@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Marveen model-ledger reconciliation once a day
+
+[Timer]
+# Daily, inside the 06..21 waking band (Gabor's quiet hours are 22:00-06:00).
+# The gap this control looks for is measured in days, so an hourly cadence would
+# only re-report the same finding (audit AC-10).
+OnCalendar=*-*-* 07:47:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

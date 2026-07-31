@@ -1,0 +1,6 @@
+[Unit]
+Description=Marveen model-ledger reconciliation (audit-trail control, coordinator-routed)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/szabgabor/marveen/scripts/model-ledger-reconcile-timer.sh

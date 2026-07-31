@@ -4,14 +4,21 @@
 # pending-inbox-starvation-timer.sh and model-drift-timer.sh: a control that
 # lives inside an agent's turn cycle is unreachable exactly when that agent
 # (or the scheduler feeding it) is the fault -- and twice in one week it was
-# GABOR who noticed a missed ritual first. Alert path is notify.sh (direct
-# Bot API), independent of the dashboard, the inter-agent queue, and every
-# agent session.
+# GABOR who noticed a missed ritual first.
+#
+# ROUTING (card 8bcbd8fe, audit verdict (b), 2026-07-31): a missed ritual is
+# mr-wolfe's to fix -- he owns the schedule and can re-fire the task -- so while
+# the dashboard answers, the finding goes to him via /api/messages and Gabor
+# hears nothing. notify.sh (direct Bot API) survives ONLY for the dashboard-down
+# case, which is the genuine backstop role: the dashboard, the coordinator, the
+# inter-agent queue and sendAlert's quiet-hours buffer are then all gone at once.
 set -uo pipefail
 
 REPO="/home/szabgabor/marveen"
 CHECK="$REPO/scripts/check-ritual-execution.sh"
 NOTIFY="$REPO/scripts/notify.sh"
+# shellcheck source=scripts/alert-route.sh
+source "$REPO/scripts/alert-route.sh"
 
 out="$(bash "$CHECK" 2>&1)"
 rc=$?
@@ -39,7 +46,23 @@ if [ -f "$STATE" ]; then
 fi
 printf '%s\n%s\n' "$key" "$now_s" > "$STATE"
 
-bash "$NOTIFY" "RITUALE-KIMARADAS RIASZTAS (host-szintu timer, nem agens)
+# The missed ritual names are the "  - <name>: ..." lines of the check output;
+# pass them through verbatim so the coordinator sees WHICH ritual to re-fire.
+if dashboard_alive; then
+  if route_to_coordinator "[HOST-WATCHDOG] Ritual-kimaradas eszlelve (host-szintu timer, nem agens).
+
+$out
+
+Fontos: a scheduler gap-catchup meg utolag kezbesitheti a kimaradt slotot, tehat ez nem feltetlenul vegleges kimaradas -- eloszor ellenorizd. Ha tenyleg kimaradt, a te dolgod ujrainditani vagy potolni az adott ritualet (a schedule a te hataskorod). Gabort NEM ertesitettuk."; then
+    exit 1
+  fi
+  echo "route_to_coordinator failed despite a live dashboard -- falling back to notify.sh" >&2
+  fallback_note="(a koordinator-utvonal nem valaszolt)"
+else
+  fallback_note="(a dashboard nem valaszol, ezert kozvetlen ertesites)"
+fi
+
+bash "$NOTIFY" "RITUALE-KIMARADAS RIASZTAS (host-szintu timer, nem agens) $fallback_note
 
 $out"
 notify_rc=$?

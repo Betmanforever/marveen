@@ -760,6 +760,28 @@ export function initDatabase(dbPathOverride?: string): void {
   try { db.exec('ALTER TABLE vault_ssh_servers ADD COLUMN ssh_key_id TEXT REFERENCES vault_ssh_keys(id)') } catch { /* already exists */ }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_vault_ssh_servers_key ON vault_ssh_servers(ssh_key_id)`)
 
+  // --- Alert claims (cross-emitter "someone already owns this" ledger) ---
+  // Audit AC-4 (2026-07-31): three independent detectors watched ONE stuck
+  // message with three thresholds and three private dedup stores, so the owner
+  // got three Telegram messages about one fact -- not a bug but the guaranteed
+  // output of a design where no detector can see another's state. A watchdog
+  // that starts observing an item CLAIMS it here; any other emitter that finds
+  // a live claim may append but must not page the owner. The claim expires at
+  // 2x the claiming watchdog's cadence, so a dead claimer releases the item
+  // automatically and escalation resumes (AC-5) instead of going silent.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS alert_claims (
+      signal_id TEXT NOT NULL,
+      item_key TEXT NOT NULL,
+      claimed_by TEXT NOT NULL,
+      claimed_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      notes TEXT,
+      PRIMARY KEY (signal_id, item_key)
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_alert_claims_expiry ON alert_claims(expires_at)`)
+
   // One-shot migration from the old JSON file (which had a read-modify-write
   // race). Import rows if they exist, then rename the file so we don't keep
   // re-importing. Wrapped in a transaction so a crash mid-import is safe.
@@ -2774,3 +2796,88 @@ export function deleteVaultSshServer(id: string): boolean {
   return db.prepare('DELETE FROM vault_ssh_servers WHERE id = ?').run(id).changes > 0
 }
 
+
+// ---- Alert claims (audit AC-4) ----------------------------------------------
+//
+// "No path may alert the owner about an item that the coordinator's own
+// watchdog is already tracking." The claim row IS that shared state: the
+// dashboard watchdog writes it when it hands an item to the coordinator, and
+// every other emitter (host timers included, via /api/alerts/claim) reads it
+// before deciding whether it may go owner-facing. Times are epoch SECONDS,
+// matching the rest of this module.
+
+export interface AlertClaim {
+  signal_id: string
+  item_key: string
+  claimed_by: string
+  claimed_at: number
+  expires_at: number
+  notes: string | null
+}
+
+/** The live (unexpired) claim on an item, or null when it is unclaimed. */
+export function getLiveAlertClaim(signalId: string, itemKey: string, nowSec: number): AlertClaim | null {
+  const row = db.prepare(
+    'SELECT * FROM alert_claims WHERE signal_id = ? AND item_key = ? AND expires_at > ?',
+  ).get(signalId, itemKey, nowSec) as AlertClaim | undefined
+  return row ?? null
+}
+
+/**
+ * Claim an item, or renew a claim this same claimer already holds. A LIVE claim
+ * held by SOMEONE ELSE is never stolen -- it is returned instead, so the caller
+ * can see who owns it and downgrade its own routing (that is the whole point of
+ * the table). An EXPIRED claim is taken over: a claimer that went silent must
+ * not hold an item hostage (audit section 8 -- silence is worse than spam).
+ */
+export function claimAlertItem(
+  signalId: string, itemKey: string, claimedBy: string, nowSec: number, ttlSec: number,
+): { claim: AlertClaim; mine: boolean } {
+  const live = getLiveAlertClaim(signalId, itemKey, nowSec)
+  if (live && live.claimed_by !== claimedBy) return { claim: live, mine: false }
+  const expiresAt = nowSec + ttlSec
+  const claimedAt = live?.claimed_at ?? nowSec
+  db.prepare(
+    `INSERT INTO alert_claims (signal_id, item_key, claimed_by, claimed_at, expires_at, notes)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(signal_id, item_key) DO UPDATE SET
+       claimed_by = excluded.claimed_by,
+       claimed_at = excluded.claimed_at,
+       expires_at = excluded.expires_at`,
+  ).run(signalId, itemKey, claimedBy, claimedAt, expiresAt, live?.notes ?? null)
+  return {
+    claim: { signal_id: signalId, item_key: itemKey, claimed_by: claimedBy, claimed_at: claimedAt, expires_at: expiresAt, notes: live?.notes ?? null },
+    mine: true,
+  }
+}
+
+/** Append an observation to an existing claim. This is ALL a non-owning emitter
+ * may do with a claimed item; the note keeps the second sighting on the record
+ * instead of dropping it. Newest last, capped so a loop cannot grow the row. */
+export function appendAlertClaimNote(signalId: string, itemKey: string, note: string): boolean {
+  const row = db.prepare('SELECT notes FROM alert_claims WHERE signal_id = ? AND item_key = ?')
+    .get(signalId, itemKey) as { notes: string | null } | undefined
+  if (!row) return false
+  const merged = [row.notes ?? '', note].filter(Boolean).join('\n').split('\n').slice(-20).join('\n')
+  return db.prepare('UPDATE alert_claims SET notes = ? WHERE signal_id = ? AND item_key = ?')
+    .run(merged, signalId, itemKey).changes > 0
+}
+
+/** Release a claim (the item resolved). Idempotent. */
+export function releaseAlertClaim(signalId: string, itemKey: string): boolean {
+  return db.prepare('DELETE FROM alert_claims WHERE signal_id = ? AND item_key = ?')
+    .run(signalId, itemKey).changes > 0
+}
+
+/** Delete expired claims; returns how many were reaped. Housekeeping only --
+ * every read already filters on expires_at, so a missed sweep cannot resurrect
+ * a stale claim. */
+export function expireAlertClaims(nowSec: number): number {
+  return db.prepare('DELETE FROM alert_claims WHERE expires_at <= ?').run(nowSec).changes
+}
+
+/** All live claims for a signal (dashboard/host-script visibility). */
+export function listLiveAlertClaims(signalId: string, nowSec: number): AlertClaim[] {
+  return db.prepare('SELECT * FROM alert_claims WHERE signal_id = ? AND expires_at > ? ORDER BY claimed_at')
+    .all(signalId, nowSec) as AlertClaim[]
+}

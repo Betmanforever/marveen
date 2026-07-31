@@ -21,6 +21,36 @@ echo "=== Reggeli napindító $(date) ===" >> "$LOG"
 
 cd "$INSTALL_DIR"
 
+# Riasztas-osszesito (audit AC-7): a 24 oras digest a napindito RESZEKENT megy
+# ki, nem kulon uzenetkent -- egy plusz utemezett uzenet pont az a zaj, amit ez
+# a policy megszuntet. consume=1: a puffer urul, ugyanaz a tetel nem megy ki
+# ketszer. Ures napon a section null, ilyenkor a szekcio teljesen kimarad.
+# Ha a dashboard nem valaszol, a napindito ettol meg elmegy (a digest kimarad).
+#
+# A szoveg PROMPTBA kerul, ezert a kinyereskor kiszurjuk a shell- es
+# prompt-veszelyes karaktereket ($ ` " \): a digest sorai kozvetve
+# tartalmazhatnak kivulrol irt mezot (agent_messages.from_agent), es egy
+# $(...) egy dupla idezojeles promptban vegrehajtodna.
+DIGEST=""
+TOKEN_FILE="$INSTALL_DIR/store/.dashboard-token"
+if [ -r "$TOKEN_FILE" ]; then
+  DIGEST=$(curl -s -m 5 -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+    "http://localhost:3420/api/alerts/digest?consume=1" 2>/dev/null \
+    | python3 -c 'import json,re,sys
+try:
+    s = json.load(sys.stdin).get("section") or ""
+except Exception:
+    s = ""
+print(re.sub(r"[$`\"\\\\]", "", s))' 2>/dev/null)
+fi
+
+DIGEST_STEP=""
+if [ -n "$DIGEST" ]; then
+  DIGEST_STEP="4. Rendszer-osszesito - vedd at SZO SZERINT a briefing vegere, kulon szekciokent, ne ertelmezd ujra:
+$DIGEST
+"
+fi
+
 $CLAUDE --dangerously-skip-permissions \
   --channels plugin:telegram@claude-plugins-official \
   -p "Reggeli napindító - készítsd el és küld el Telegramra (chat_id: $CHAT_ID).
@@ -28,7 +58,7 @@ $CLAUDE --dangerously-skip-permissions \
 1. Email check: search_emails az elmúlt 12 órából, szűrd ki a spam/promo emaileket
 2. Naptár: getCalendarEvents a mai napra a $CALENDAR_ID naptárból (Europe/Budapest timezone)
 3. AI hírek: WebSearch \"AI news [tegnapi dátum]\"
-4. Küld el Telegramra a reply tool-lal (chat_id: $CHAT_ID)
+${DIGEST_STEP}5. Küld el Telegramra a reply tool-lal (chat_id: $CHAT_ID)
 
 Tömör, lényegre törő. Ékezetesen írj magyarul." >> "$LOG" 2>&1
 

@@ -1,0 +1,194 @@
+// Emitter registry: who is allowed to alert about what (audit AC-1/AC-2/AC-9).
+//
+// The 2026-07-31 audit counted 40 autonomous emitters that can reach the owner
+// with no human in the loop, and found the same signal watched by three
+// detectors with three thresholds and three private dedup stores -- so one stuck
+// message produced three Telegram messages. Nothing in the system declared who
+// OWNED a signal, so nothing could tell a duplicate from an independent finding.
+//
+// This file is that declaration. Exactly ONE enabled emitter may own a signal;
+// the others are observers, which may log, append to the claim row and feed the
+// digest, but must not send. `ownerFacing` marks the few emitters allowed to
+// reach Gabor directly, and it is legal only when the alert names a decision
+// only he can make.
+//
+// It lives in src/ rather than store/ on purpose: store/ is gitignored, so a
+// registry there would not survive a fresh checkout and the guard test below
+// would have nothing to check. It is CODE-adjacent policy, not runtime state.
+//
+// Coverage note: this pass populates the emitters card 8bcbd8fe touched plus
+// their duplicates. The remaining ~33 of the audit's 40 are follow-up work
+// (audit section 1 has the full inventory).
+
+export type AlertRouteTarget = 'coordinator' | 'owner' | 'digest' | 'log-only'
+
+export interface AlertEmitter {
+  /** Stable id of the emitting code path. */
+  id: string
+  /** The SIGNAL it reports on. Exactly one enabled owner per signal. */
+  signalId: string
+  /** Source file (and, where it helps, the anchor within it). */
+  source: string
+  /** True = this emitter decides; false = it may only observe (AC-1). */
+  owner: boolean
+  /** Where its findings go by default. */
+  route: AlertRouteTarget
+  /** May it reach the owner directly? Only with a decision he alone can make. */
+  ownerFacing: boolean
+  /** Detection threshold, in words. */
+  threshold: string
+  /** What its dedup / re-arm is keyed on. */
+  dedupKey: string
+  /** How 22:00-06:00 is honoured (audit AC-9). */
+  quietHours: string
+  /** false = present but not running (systemd timer disabled, etc.). */
+  enabled: boolean
+  notes?: string
+}
+
+export const ALERT_REGISTRY: AlertEmitter[] = [
+  // --- queue-starving: three emitters, one signal (audit RC-4) ---------------
+  {
+    id: 'dashboard-pending-age-watchdog',
+    signalId: 'queue-starving',
+    source: 'src/web/pending-age-watchdog.ts (called from channel-monitor.ts)',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: true,
+    threshold: 'pending > 3 min AND target pane unchanged across 2 sweeps (P3)',
+    dedupKey: 'sorted stuck message ids; alert-state emits + alert_claims row per message',
+    quietHours: 'owner leg via sendAlert -> buffered, morning summary',
+    enabled: true,
+    notes: 'ownerFacing only through the AC-5 coordinator-silence escalation, once per episode.',
+  },
+  {
+    id: 'host-inbox-starvation-timer',
+    signalId: 'queue-starving',
+    source: 'scripts/pending-inbox-starvation-timer.sh',
+    owner: false,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'pull-mode message pending > 10 min (no busy detection -- audit RC-3)',
+    dedupKey: 'store/.pending-inbox-starvation.state, keyed on the starving id set',
+    quietHours: 'OnCalendar 06..21 only; sends route to the coordinator',
+    enabled: false,
+    notes: 'systemd timer disabled 2026-07-31 16:52. Converted to a dashboard-DOWN backstop: '
+      + 'while the dashboard answers, findings go to the coordinator and never to Gabor.',
+  },
+  {
+    id: 'pending-uzenet-watchdog',
+    signalId: 'queue-starving',
+    source: '~/.claude/scheduled-tasks/pending-uzenet-watchdog (mr-wolfe)',
+    owner: false,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'pending > 3 min, agent judgement, */5 06-21',
+    dedupKey: 'agent judgement',
+    quietHours: 'cron 06-21 only',
+    enabled: true,
+    notes: 'Audit (d) on its Telegram leg: detection stays, the direct-to-Gabor leg is the '
+      + 'coordinator\'s own task file to remove (not this codebase).',
+  },
+
+  // --- ritual execution ------------------------------------------------------
+  {
+    id: 'host-ritual-execution-timer',
+    signalId: 'ritual-missed',
+    source: 'scripts/ritual-execution-timer.sh',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'fixed-time ritual with no dispatch/execution evidence 90 min past its slot',
+    dedupKey: 'store/.ritual-execution.state, md5 of the missed-ritual name set',
+    quietHours: 'OnCalendar 06..21 only',
+    enabled: true,
+    notes: 'Audit (b): mr-wolfe owns the schedule and can re-fire it. Owner path only when '
+      + 'the dashboard is unreachable (backstop role).',
+  },
+
+  // --- model identity --------------------------------------------------------
+  {
+    id: 'host-model-drift-timer',
+    signalId: 'model-drift',
+    source: 'scripts/model-drift-timer.sh -> scripts/check-model-drift.sh',
+    owner: false,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'latest interactive session boot model != configured (P1+P2 filtered)',
+    dedupKey: 'store/.model-drift.state, md5 of the agent/measured/configured set',
+    quietHours: 'OnCalendar 06..21 only',
+    enabled: false,
+    notes: 'Timer disabled 2026-07-31 16:52 (audit endorses detector A retirement). Script kept '
+      + 'and P1/P2-hardened as a dashboard-down backstop; re-enabling is an operator decision.',
+  },
+  {
+    id: 'dashboard-model-fallback-runner',
+    signalId: 'model-drift',
+    source: 'src/web/model-fallback-runner.ts (checkModelDrift / checkMidSessionDrift)',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'boot-window drift -> auto-correct; mid-session drift -> coordinator alert',
+    dedupKey: 'per-agent in-runner state + config_change_log provenance rows',
+    quietHours: 'coordinator route, no owner leg',
+    enabled: true,
+    notes: 'Audit section 5: anchored to the live tmux session, entrypoint-filtered, '
+      + 'already-recovered veto. Endorsed as the owner of this signal.',
+  },
+  {
+    id: 'model-ledger-reconcile',
+    signalId: 'model-ledger-gap',
+    source: 'scripts/check-model-ledger-reconcile.sh',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'session-boundary model switch with no config_change_log entry (-12h..+2h)',
+    dedupKey: 'store/.model-ledger-reconcile.state, md5 of the finding set',
+    quietHours: 'daily 07:47 slot, outside the band',
+    enabled: false,
+    notes: 'Audit AC-10: the governance half of the retired drift check, rehomed as its own '
+      + 'silent daily control. Unit files installed but NOT enabled (operator decision).',
+  },
+
+  // --- shared transports -----------------------------------------------------
+  {
+    id: 'notify-sh',
+    signalId: 'transport-host-backstop',
+    source: 'scripts/notify.sh',
+    owner: true,
+    route: 'owner',
+    ownerFacing: true,
+    threshold: 'n/a -- transport, not a detector',
+    dedupKey: 'n/a (each caller dedups)',
+    quietHours: 'EXEMPT: callers are OnCalendar-gated to 06..21, and its whole purpose is to '
+      + 'work when the dashboard (and with it sendAlert + quiet-hours buffering) is down',
+    enabled: true,
+    notes: 'AC-9 exemption, stated reason above. The only sanctioned direct Bot API path for '
+      + 'host scripts; a script may use it ONLY after the dashboard probe fails.',
+  },
+]
+
+export interface RegistryConflict {
+  signalId: string
+  emitters: string[]
+}
+
+/**
+ * Signals with more than one ENABLED owner (audit AC-1). Disabled emitters are
+ * ignored: a retired-but-present script is not a duplicate alert.
+ */
+export function findDuplicateSignalOwners(registry: AlertEmitter[] = ALERT_REGISTRY): RegistryConflict[] {
+  const bySignal = new Map<string, string[]>()
+  for (const e of registry) {
+    if (!e.enabled || !e.owner) continue
+    bySignal.set(e.signalId, [...(bySignal.get(e.signalId) ?? []), e.id])
+  }
+  return [...bySignal.entries()]
+    .filter(([, ids]) => ids.length > 1)
+    .map(([signalId, emitters]) => ({ signalId, emitters }))
+}
+
+/** Emitters allowed to reach the owner directly (audit AC-2 keeps this small). */
+export function ownerFacingEmitters(registry: AlertEmitter[] = ALERT_REGISTRY): AlertEmitter[] {
+  return registry.filter((e) => e.enabled && e.ownerFacing)
+}

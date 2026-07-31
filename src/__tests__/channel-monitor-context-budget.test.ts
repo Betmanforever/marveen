@@ -130,24 +130,37 @@ describe('channel-monitor: context-budget message builders (restart recommendati
   })
 })
 
-describe('channel-monitor: in-process pending-age watchdog (never via agent_messages)', () => {
-  it('reads the queue directly and alerts the owner via sendAlert, NOT agent_messages', () => {
+describe('channel-monitor: in-process pending-age watchdog (I/O wiring only)', () => {
+  // The 2026-07-31 audit (AC-11) requires the whole decision path to be
+  // replayable with injected senders, so it now lives in pending-age-watchdog.ts
+  // (behavioural tests: pending-age-watchdog.test.ts). What must stay true HERE
+  // is the wiring: the queue is read directly, and both transports are supplied.
+  it('reads the queue directly and injects both transports into the watchdog', () => {
     const region = pendingWatchdogRegion()
     expect(region).toContain('getPendingMessages()')
-    expect(region).toContain('decidePendingAgeAlert(')
-    expect(region).toContain('sendAlert(')
-    // The whole point: the failing channel must not be reused to report itself.
-    expect(region).not.toContain('createAgentMessage')
+    expect(region).toContain('runPendingAgeWatchdog(')
+    // Coordinator leg (routine findings) AND the independent owner leg.
+    expect(region).toContain('createAgentMessage')
+    expect(region).toContain('sendAlert(text)')
+    // Claim table wiring (AC-4): the shared "someone already owns this" ledger.
+    expect(region).toContain('claimAlertItem(')
+    expect(region).toContain('getLiveAlertClaim(')
   })
 
-  it('lists the oldest stuck rows (id, from→to, minutes) and re-arms when the backlog clears', () => {
+  it('probes the target pane per sweep (P3 needs one sample per tick) and is fail-safe', () => {
     const region = pendingWatchdogRegion()
-    expect(region).toContain('.slice(0, 5)')
-    expect(region).toContain('x.m.from_agent')
-    expect(region).toContain('x.m.to_agent')
-    // Re-arm: the dedup stamp is reset once nothing is past threshold.
-    expect(region).toContain('pendingAgeLastAlertAt = null')
+    expect(region).toContain('capturePane(session)')
+    expect(region).toContain('paneProcessAgeMs(session)')
     // Defensive: a DB hiccup must not break the rest of the monitor tick.
     expect(region).toMatch(/try \{[\s\S]*?\} catch \(err\) \{/)
+  })
+
+  it('the owner leg does NOT depend on an inter-agent message being delivered', () => {
+    // The queue this watchdog reports on is the queue the coordinator message
+    // travels through. If it is genuinely wedged the flag rots in it, the grace
+    // expires unanswered and sendAlert (an independent transport) still fires.
+    const wd = readFileSync(join(__dirname, '..', 'web', 'pending-age-watchdog.ts'), 'utf-8')
+    expect(wd).toContain('only on one having been SENT')
+    expect(wd).not.toContain('markMessageDelivered')
   })
 })

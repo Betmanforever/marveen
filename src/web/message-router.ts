@@ -97,92 +97,13 @@ export function shouldAbandonGaveUp(ageMs: number, windowMs: number): boolean {
   return ageMs > windowMs
 }
 
-/**
- * Pure decision: should the in-process pending-age watchdog fire a DIRECT owner
- * alert now? True iff any pending message has out-waited `thresholdMs` AND the
- * dedup window has elapsed since the last alert. Returns false when nothing is
- * over threshold so the CALLER re-arms (sets lastAlertAt = null) as the backlog
- * clears -- the next stuck episode then alerts promptly.
- *
- * This backstops the queue that the wedge-escalation itself flows through: on
- * 2026-07-12 four inter-agent messages sat pending 10+ min in BOTH directions
- * (including a coordinator-bound pull-model message) with nothing alarming,
- * because the escalation path is the same agent_messages queue that had
- * starved. The watchdog reads the queue directly and NEVER writes to
- * agent_messages, so it survives that queue wedging.
- *
- * A future-dated lastAlertAt (clock skew / NTP correction) counts as "alert now"
- * rather than stalling the delta negative, mirroring the other decision guards.
- */
-export function decidePendingAgeAlert(
-  pendingAgesMs: number[],
-  lastAlertAt: number | null,
-  now: number,
-  thresholdMs: number,
-  dedupMs: number,
-): boolean {
-  if (!pendingAgesMs.some((age) => age > thresholdMs)) return false
-  if (lastAlertAt === null) return true
-  if (now < lastAlertAt) return true
-  return now - lastAlertAt >= dedupMs
-}
-
-/**
- * Pure decision: past the routine dedup, should a SEVERITY-ESCALATION re-alert
- * fire for a pending-age episode that is not merely slow but stuck? The routine
- * decidePendingAgeAlert() suppresses every re-alert inside its dedup window --
- * right for a queue that is just briefly busy, but wrong once the OLDEST row has
- * out-waited `ceilingMs` (>> the routine threshold): that backlog is wedged and
- * getting worse, and the owner should hear about it before the full dedup window
- * elapses. This is the ceiling RE-ARM (2026-07: a starving queue re-alerted only
- * on the slow routine cadence, so a worsening wedge read the same as a transient
- * blip).
- *
- * True iff the oldest pending age is past the ceiling AND at least
- * `realertDedupMs` has passed since the last alert. It reuses the SAME
- * `lastAlertAt` stamp the routine path bumps, so escalations self-throttle to at
- * most one per `realertDedupMs` and can never storm the monitor tick. A null
- * `lastAlertAt` returns false: no routine alert has fired yet, so the routine
- * path owns the first alert and there is nothing to escalate past. A future-dated
- * `lastAlertAt` (clock skew) counts as "escalate now", mirroring
- * decidePendingAgeAlert. Callers word the escalation distinctly ("meg mindig
- * akad ... N perce").
- */
-export function decidePendingAgeRealert(
-  oldestAgeMs: number,
-  lastAlertAt: number | null,
-  now: number,
-  ceilingMs: number,
-  realertDedupMs: number,
-): boolean {
-  if (oldestAgeMs <= ceilingMs) return false
-  if (lastAlertAt === null) return false
-  if (now < lastAlertAt) return true
-  return now - lastAlertAt >= realertDedupMs
-}
-
-/**
- * Pure decision: does a stuck pending message's TARGET state warrant an owner
- * alert, or is the delay benign? A pull-model/push target that is ACTIVELY
- * WORKING (busy pane, no wedge signals) holds its inbox until the turn ends by
- * design -- alerting on that is a false alarm (2026-07-13 09:00: the 3-minute
- * blind alert fired on a merely-busy coordinator and paged the operator).
- * Suppress ONLY while all three hold: the pane is genuinely busy, shows no
- * wedge signal (parked input / context ceiling), and the message has not
- * out-waited the hard ceiling -- past the ceiling a "busy" pane is itself
- * suspect (an endless turn starves the queue just as dead as a wedge).
- * Fail-open: an unreadable pane ('unknown'/'error'/null capture) always alerts.
- */
-export function shouldAlertStuckTarget(
-  paneState: string | null,
-  wedgeSignal: boolean,
-  ageMs: number,
-  hardCeilingMs: number,
-): boolean {
-  if (ageMs > hardCeilingMs) return true
-  if (wedgeSignal) return true
-  return paneState !== 'busy'
-}
+// decidePendingAgeAlert / decidePendingAgeRealert / shouldAlertStuckTarget used
+// to live here: an age threshold, a 45-minute severity re-alert, and a
+// busy-vs-wedged pane-STATE check. The 2026-07-31 audit retired all three
+// (RC-3, predicate P3): age is not a stuck-detector, and pane STATE cannot tell
+// a working turn from a frozen one -- only pane PROGRESS can. The replacements
+// are pane-state.ts's updatePaneProgress/isPaneStalled and the escalation
+// machine in pending-age-watchdog.ts.
 
 /**
  * Pure decision: is the stuck message's TARGET inside its boot-grace window?

@@ -2189,3 +2189,76 @@ export function decideContextBudgetEscalation(
     next: { consecutiveHits: hits, wolfeFlaggedAt: inner.next.wolfeFlaggedAt, gaborNotifiedAt: inner.next.gaborNotifiedAt },
   }
 }
+
+// ---- Pane PROGRESS (audit AC-6 / predicate P3) -------------------------------
+//
+// detectPaneState answers "is it typing"; it does not answer "is it MOVING".
+// That gap produced the 2026-07-31 16:44 false alert: a legitimate 20-minute
+// working turn tripped a 15-minute age ceiling that deliberately re-included
+// healthy-busy targets. Age is not a stuck-detector -- a working agent redraws
+// its pane (spinner, token counter, tool output), a wedged one does not -- so a
+// pending-message alert now requires a STALLED pane rather than a big number of
+// minutes. A genuinely long working turn never alerts at any age; a stalled one
+// alerts at the threshold.
+
+export interface PaneProgressState {
+  /** Hash of the last capture. */
+  hash: string
+  /** Consecutive sweeps that produced the SAME hash. */
+  unchangedSweeps: number
+  /** When the last capture was taken (epoch ms), for gap detection. */
+  lastSeenMs: number
+}
+
+/**
+ * FNV-1a over the pane text. Non-crypto by choice: this is a change-detector,
+ * not a security boundary, and pane-state.ts stays import-free (see the header)
+ * so it remains trivially unit-testable. Returned as hex so a state file /log
+ * line carries something comparable by eye.
+ */
+export function paneProgressHash(pane: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < pane.length; i++) {
+    h ^= pane.charCodeAt(i)
+    // >>> 0 keeps it an unsigned 32-bit value through the multiply.
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+
+/**
+ * Fold one capture into the per-session progress state.
+ *
+ * `pane === null` (unreadable capture) returns null: the caller must NOT treat
+ * an unmeasurable pane as "progressing" -- isPaneStalled fails OPEN on null, so
+ * a vanished/broken session still alerts.
+ *
+ * A gap longer than `maxGapMs` between captures resets the counter: the
+ * watchdog only samples a session while one of its messages is stuck, so two
+ * observations can be hours apart, and comparing across that gap would call a
+ * session "unchanged" that in fact did a full turn in between.
+ */
+export function updatePaneProgress(
+  prev: PaneProgressState | undefined,
+  pane: string | null,
+  nowMs: number,
+  maxGapMs: number,
+): PaneProgressState | null {
+  if (pane === null) return null
+  const hash = paneProgressHash(pane)
+  if (!prev || nowMs - prev.lastSeenMs > maxGapMs || nowMs < prev.lastSeenMs || prev.hash !== hash) {
+    return { hash, unchangedSweeps: 0, lastSeenMs: nowMs }
+  }
+  return { hash, unchangedSweeps: prev.unchangedSweeps + 1, lastSeenMs: nowMs }
+}
+
+/**
+ * Pure decision: is the pane stalled? True once `minUnchangedSweeps` consecutive
+ * sweeps produced no change (2 sweeps = 3 identical captures, ~2 min on the 60s
+ * monitor tick). Fail-OPEN on a null state (unreadable pane): a control that
+ * cannot measure must not claim the target is fine.
+ */
+export function isPaneStalled(state: PaneProgressState | null, minUnchangedSweeps: number): boolean {
+  if (state === null) return true
+  return state.unchangedSweeps >= minUnchangedSweeps
+}

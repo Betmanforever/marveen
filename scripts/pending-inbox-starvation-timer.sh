@@ -14,14 +14,26 @@
 # single agent's turn cycle" and then names folyamatos-ellenorzes, which IS an
 # agent turn cycle. This timer is that outside host.
 #
-# The alert path is notify.sh (direct Telegram Bot API from .env), chosen
-# because it depends on neither the dashboard, the inter-agent queue, nor any
-# agent session -- i.e. none of the components this check exists to watch.
+# ROUTING (card 8bcbd8fe, audit AC-2/AC-4, 2026-07-31). This wrapper used to
+# send every finding straight to Gabor. It is a machine fact about a queue the
+# coordinator watches too, and this timer has NO busy-detection at all (audit
+# RC-3: it alerts on age alone at 10 minutes while its own check script
+# documents legitimate 30-45 minute turns), so it produced the 16:40 false
+# alert. Two changes:
+#   1. while the dashboard answers, the finding goes to mr-wolfe via
+#      /api/messages -- never to Gabor;
+#   2. notify.sh survives ONLY for the dashboard-down case, which is the actual
+#      backstop role: then the dashboard, the coordinator, the inter-agent queue
+#      and sendAlert's quiet-hours buffer are all gone at once.
+# The in-process watchdog (src/web/pending-age-watchdog.ts) OWNS this signal and
+# has the pane-progress predicate this script lacks; this one is an observer.
 set -uo pipefail
 
 REPO="/home/szabgabor/marveen"
 CHECK="$REPO/scripts/check-pending-inbox-starvation.sh"
 NOTIFY="$REPO/scripts/notify.sh"
+# shellcheck source=scripts/alert-route.sh
+source "$REPO/scripts/alert-route.sh"
 
 out="$(bash "$CHECK" 2>&1)"
 rc=$?
@@ -63,7 +75,24 @@ if [ -f "$STATE" ]; then
 fi
 printf '%s\n%s\n' "$key" "$now_s" > "$STATE"
 
-bash "$NOTIFY" "INBOX-STARVATION RIASZTAS (host-szintu timer, nem agens)
+# Coordinator first. A finding that reaches mr-wolfe is DONE here -- the owner
+# is not told, by design: he is told only if the coordinator layer itself is
+# unreachable (below) or if the in-process watchdog escalates (audit AC-5).
+if dashboard_alive; then
+  if route_to_coordinator "[HOST-WATCHDOG] Inbox-starvation eszlelve (host-szintu timer, nem agens).
+
+$out
+
+A dashboard el, a beragadt sorra van sajat figyelo is (pending-age watchdog, pane-progress alapu). A te dolgod: nezd meg a dashboard uzenetsort, es ha valos, oldd fel vagy inditsd ujra az erintett agenst. Gabort NEM ertesitettuk."; then
+    exit 1
+  fi
+  echo "route_to_coordinator failed despite a live dashboard -- falling back to notify.sh" >&2
+  fallback_note="(a koordinator-utvonal nem valaszolt)"
+else
+  fallback_note="(a dashboard nem valaszol, ezert kozvetlen ertesites)"
+fi
+
+bash "$NOTIFY" "INBOX-STARVATION RIASZTAS (host-szintu timer, nem agens) $fallback_note
 
 $out"
 notify_rc=$?
