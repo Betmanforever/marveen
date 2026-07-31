@@ -206,4 +206,29 @@ describe('schedule runner: host-suspend catch-up', () => {
       mockLoggerInfo.mock.calls.some(c => String(c[1]).includes('Schedule tick gap')),
     ).toBe(false)
   })
+
+  // card sched-fired-lie: sendPromptToSession can synchronously return
+  // 'gave-up' (pane parked in a permission dialog -- typing would blind-approve
+  // it). The old code discarded that result and logged 'fired', so a task that
+  // was never delivered read as run. It must instead record 'gave-up' and
+  // enqueue the never-abandon pending retry.
+  it('a gave-up delivery is recorded as gave-up (not fired) and enqueues a pending retry', async () => {
+    mockListScheduledTasks.mockReturnValue([HB_5MIN])
+    mockSendPrompt.mockReturnValue('gave-up')
+    // 09:00 local: a normal on-time slot -- no gap involved, so this pins the
+    // plain delivery path, not the catch-up path.
+    vi.setSystemTime(new Date('2026-07-31T07:00:00.000Z'))
+    const { startScheduleRunner } = await loadRunner()
+    stop = startScheduleRunner()
+    vi.advanceTimersByTime(5000)
+
+    expect(mockSendPrompt).toHaveBeenCalledTimes(1)
+    // The lie that started the card: it must NOT be 'fired'.
+    expect(runsFor(HB_5MIN.name)).toEqual(['gave-up'])
+    // Compensated on the never-abandon path, same as the async swallowed-Enter
+    // branch: the router re-injects once the dialog is resolved.
+    expect(mockInsertPendingRetry).toHaveBeenCalledWith(
+      HB_5MIN.name, HB_5MIN.agent, expect.any(Number), 'giveup',
+    )
+  })
 })

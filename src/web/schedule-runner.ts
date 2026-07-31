@@ -340,9 +340,31 @@ function attemptFireTask(
     // task aimed at a long-busy session would block on the 12s idle wait every
     // tick -- defeating the very purpose of forceSend (inject regardless, let
     // Claude Code queue it). All non-forceSend tasks keep the gate ON.
-    sendPromptToSession(session, fullPrompt, host, { waitForIdle: !task.forceSend })
+    const sendResult = sendPromptToSession(session, fullPrompt, host, { waitForIdle: !task.forceSend })
     scheduleLastRun.set(task.name, now)
     persistScheduleLastRun()
+    // A synchronous 'gave-up' means the prompt was NOT delivered -- most often
+    // the pane is parked in a permission dialog, where a submitting Enter would
+    // blind-approve the highlighted option, so sendPromptToSession refuses to
+    // type (agent-process.ts). The old code DISCARDED this result and always
+    // logged 'fired', so a task blocked by a dialog was recorded as run yet
+    // never delivered: the exact "the log lies" class that turned a
+    // missed-schedule diagnosis into a two-hour hunt (card sched-fired-lie,
+    // same family as the 2026-07-31 schedule-last-run.json morning). Compensate
+    // like the async swallowed-Enter path below: record 'gave-up', enqueue the
+    // never-abandon pending retry (isSessionReadyForPrompt gates it, so it
+    // re-injects only once the dialog is resolved), and skip the false 'fired'.
+    // scheduleLastRun stays stamped as the CRON double-fire guard, exactly as
+    // the resubmit branch documents.
+    if (sendResult === 'gave-up') {
+      appendTaskRun(task.name, agentName, 'gave-up')
+      insertPendingTaskRetryIfNew(task.name, agentName, now, 'giveup')
+      logger.warn(
+        { task: task.name, agent: agentName, session },
+        'Scheduled task NOT delivered (sendPromptToSession gave up -- pane likely parked in a permission dialog); pending retry enqueued',
+      )
+      return 'fired'
+    }
     // A lateCatchUpMs value means this tick only matched because of an
     // enlarged catch-up window (see startScheduleRunner), i.e. the task missed
     // its normal tick -- the process was down/restarting at the scheduled
