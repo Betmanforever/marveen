@@ -25,7 +25,7 @@ import {
   SCHEDULED_TASK_PREAMBLE,
   wrapScheduledTask,
 } from '../prompt-safety.js'
-import { cronMatchesNow } from './cron.js'
+import { computeCatchUpWindow, cronMatchesNow, NORMAL_CATCH_UP_MS } from './cron.js'
 import {
   listScheduledTasks,
   SCHEDULED_TASKS_DIR,
@@ -183,11 +183,12 @@ function mcpMissingReason(taskName: string, agentName: string): string {
 // Both are fail-open: a broken script or an unreadable MCP state never
 // blocks the task.
 //
-// lateCatchUpMs is set by the caller when this tick only matched because of
-// the enlarged restart catch-up window (see startScheduleRunner) -- i.e. the
-// task missed its normal tick and is only firing now as a catch-up; it is
-// recorded as a distinct 'fired_late' run status further down instead of
-// silently folding into 'fired'.
+// lateCatchUpMs is set by the caller when this tick only matched because of an
+// ENLARGED catch-up window (see startScheduleRunner) -- either the first tick
+// after a process restart, or a gap-resume tick after the host slept. Both
+// mean the same thing: the task missed its normal tick and is only firing now
+// as a catch-up, so it is recorded as a distinct 'fired_late' run status
+// further down instead of silently folding into 'fired'.
 function attemptFireTask(
   task: ScheduledTask,
   agentName: string,
@@ -236,11 +237,27 @@ function attemptFireTask(
   // retry loop observed when the target session stays busy for hours
   // (275 retries overnight in production).
   //
-  // KNOWN FOLLOW-UP: forceSend also bypasses the context-saturation refusal
-  // now folded into isSessionReadyForPrompt(). A forceSend task can therefore
-  // still land on a 100%-context session. Left open deliberately -- forceSend's
-  // contract is "always eventually land, never silently drop", and a saturated
-  // session needs a separate delivery policy, tracked as future work.
+  // CONTEXT SATURATION IS ALREADY WIRED HERE -- do not add a second gate.
+  // isSessionReadyForPrompt() refuses a pane showing "100% context used"
+  // (paneShowsContextSaturation, agent-process.ts) and returns false, so a
+  // saturated target lands on exactly this branch and becomes a plain 'busy'
+  // outcome: the caller then applies the normal semantics -- skipIfBusy=true
+  // tasks drop the tick, everything else queues a pending_task_retries row and
+  // alerts once it ages past the threshold. Verified in production on
+  // 2026-07-31 09:11:16, where "dispatch: refusing prompt - session shows
+  // context saturation" is followed 1ms later by this warning and a queued
+  // retry for pending-uzenet-watchdog@mr-wolfe. A saturation refusal is
+  // therefore never a silent drop.
+  //
+  // KNOWN FOLLOW-UPS (deliberately open, both need their own delivery policy):
+  //   1. forceSend bypasses this check entirely, so a forceSend task can still
+  //      land on a 100%-context session. forceSend's contract is "always
+  //      eventually land, never silently drop".
+  //   2. For a skipIfBusy=true task the "the next tick is already on the way"
+  //      assumption behind dropping a busy tick does NOT hold under
+  //      saturation: saturation persists until the session is restarted, so
+  //      every subsequent tick is refused too. The context-budget watchdog
+  //      (channel-monitor) is what escalates that condition today.
   if (!task.forceSend && !isSessionReadyForPrompt(session, host)) {
     logger.warn({ task: task.name, agent: agentName, session }, 'Schedule target session busy or has pending input, will retry')
     return 'busy'
@@ -326,10 +343,10 @@ function attemptFireTask(
     sendPromptToSession(session, fullPrompt, host, { waitForIdle: !task.forceSend })
     scheduleLastRun.set(task.name, now)
     persistScheduleLastRun()
-    // A lateCatchUpMs value means this tick only matched because of the
-    // enlarged first-run catch-up window (see startScheduleRunner), i.e. the
-    // task missed its normal tick (e.g. the process was down/restarting at
-    // the scheduled minute) and is only firing now as a catch-up. Recording
+    // A lateCatchUpMs value means this tick only matched because of an
+    // enlarged catch-up window (see startScheduleRunner), i.e. the task missed
+    // its normal tick -- the process was down/restarting at the scheduled
+    // minute, or the host was suspended -- and is only firing now. Recording
     // a distinct status -- instead of silently folding it into 'fired' --
     // means the existing per-task run-history view (dashboard schedule
     // history) surfaces exactly which tasks were missed and had to be
@@ -339,7 +356,7 @@ function attemptFireTask(
       appendTaskRun(task.name, agentName, 'fired_late')
       logger.warn(
         { task: task.name, agent: agentName, session, lateCatchUpMinutes: Math.round(lateCatchUpMs / 60000) },
-        'Scheduled task fired via restart catch-up window -- missed its normal tick',
+        'Scheduled task fired via enlarged catch-up window -- missed its normal tick',
       )
     } else {
       appendTaskRun(task.name, agentName, 'fired')
@@ -534,19 +551,42 @@ function sendPendingRetryAlert(view: PendingRetryView, nowMs: number): void {
   })()
 }
 
+// On the first tick after a process restart, look back this far for slots the
+// restart itself swallowed.
+const FIRST_RUN_CATCH_UP_MS = 30 * 60000
+
 export function startScheduleRunner(): NodeJS.Timeout {
   // Reload the persisted last-run times so a restart inside a task's catch-up
   // window does not re-fire an already-run task.
   loadScheduleLastRun()
   let firstRun = true
+  // Wall-clock time of the previous tick, used to detect a host-suspend gap
+  // (see computeCatchUpWindow in cron.ts). In-memory ON PURPOSE: a process
+  // restart is covered by FIRST_RUN_CATCH_UP_MS, and the case this exists for
+  // -- a suspended host -- keeps the process, and this variable, alive.
+  let lastTickAt: number | null = null
 
   function runCheck() {
     const tasks = listScheduledTasks()
     const now = Date.now()
     // On first run after restart, catch up missed tasks from last 30 min
     const isFirstRunTick = firstRun
-    const catchUp = isFirstRunTick ? 30 * 60000 : 60000
     firstRun = false
+
+    // Gap detection runs on the tick's START time, and lastTickAt is stamped
+    // immediately: the window then means "everything since we last looked",
+    // which is exactly what the `now - lastRun < catchUp` guard below cancels
+    // out, so a slow tick can never double-fire what it just fired.
+    const gap = computeCatchUpWindow(now, lastTickAt)
+    lastTickAt = now
+    // The first-run and gap-resume windows are the same kind of thing (an
+    // enlarged tick), so take the wider of the two. On a first tick lastTickAt
+    // is null, so gap.catchUpMs is the normal window and the 30-minute
+    // first-run semantics survive untouched.
+    const catchUp = Math.max(isFirstRunTick ? FIRST_RUN_CATCH_UP_MS : NORMAL_CATCH_UP_MS, gap.catchUpMs)
+    // Counted for the end-of-tick summary log, so a gap-resume is auditable:
+    // how long the fleet was blind and what it actually pulled back in.
+    let catchUpFires = 0
 
     // Retry tasks that were busy-skipped on earlier ticks (persisted in
     // pending_task_retries so they survive dashboard restart). cronMatchesNow
@@ -623,12 +663,12 @@ export function startScheduleRunner(): NodeJS.Timeout {
       const lastRun = scheduleLastRun.get(task.name) || 0
       if (now - lastRun < catchUp) continue
 
-      // This tick only matched because of the enlarged first-run catch-up
-      // window, not the normal ~1-tick tolerance -- i.e. the task's own
-      // scheduled minute was missed (process was down/restarting) and it is
-      // only firing now as a catch-up. Recorded further down via
-      // attemptFireTask's lateCatchUpMs param so the run-history shows it.
-      const lateCatchUpMs = isFirstRunTick && catchUp > 60000 && !cronMatchesNow(task.schedule, 60000)
+      // This tick only matched because of an ENLARGED catch-up window (first
+      // tick after a restart, or a gap-resume after the host slept), not the
+      // normal ~1-tick tolerance -- i.e. the task's own scheduled minute was
+      // missed and it is only firing now as a catch-up. Recorded further down
+      // via attemptFireTask's lateCatchUpMs param so the run-history shows it.
+      const lateCatchUpMs = catchUp > NORMAL_CATCH_UP_MS && !cronMatchesNow(task.schedule, NORMAL_CATCH_UP_MS)
         ? catchUp
         : undefined
 
@@ -640,6 +680,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
         runCommandTask(task, now)
         scheduleLastRun.set(task.name, now)
         persistScheduleLastRun()
+        if (lateCatchUpMs != null) catchUpFires++
         continue
       }
 
@@ -671,6 +712,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
         // the retry handler -- don't re-queue or double-fire.
         if (pendingKeys.has(key)) continue
         const result = attemptFireTask(task, agentName, now, cronPc.prefix, lateCatchUpMs)
+        if (lateCatchUpMs != null && result === 'fired') catchUpFires++
         // Run-log every non-fired decision too (fired/skipped/error were
         // already logged): a missed day must be visible as an explicit row,
         // not as an absent one (Auditor finding, card c3157583).
@@ -709,6 +751,28 @@ export function startScheduleRunner(): NodeJS.Timeout {
           insertPendingTaskRetryIfNew(task.name, agentName, now, mcpMissingReason(task.name, agentName))
         }
       }
+    }
+
+    // Gap-resume summary. Logged AFTER the loops so `catchUpFires` is real,
+    // and only on a tick that actually saw a gap -- an ordinary tick stays
+    // silent. Without this line a host suspend leaves no trace at all in the
+    // dashboard log, which is how 2026-07-31 went unnoticed until the
+    // operator asked.
+    if (gap.gapResume) {
+      logger.info(
+        {
+          gapMinutes: Math.round(gap.gapMs / 60000),
+          catchUpMinutes: Math.round(gap.catchUpMs / 60000),
+          effectiveCatchUpMinutes: Math.round(catchUp / 60000),
+          catchUpFires,
+        },
+        'Schedule tick gap detected (host suspend?) -- enlarged catch-up window applied',
+      )
+    } else if (gap.quietSkipped) {
+      logger.info(
+        { gapMinutes: Math.round(gap.gapMs / 60000) },
+        'Schedule tick gap detected inside the quiet band -- no catch-up (night slots stay missed)',
+      )
     }
   }
 
