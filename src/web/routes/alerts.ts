@@ -12,11 +12,18 @@ import type { RouteContext } from './types.js'
 export async function tryHandleAlerts(ctx: RouteContext): Promise<boolean> {
   const { res, path, method, url } = ctx
 
+  // Read-only: look at the pending digest without touching it.
   if (path === '/api/alerts/digest' && method === 'GET') {
-    // consume=1 clears the buffer, so the same finding is never reported twice.
-    // Callers that only want to LOOK (dashboard, a human checking) must omit it.
-    const consume = url.searchParams.get('consume') === '1'
-    json(res, renderDigest(Date.now(), { consume }))
+    json(res, renderDigest(Date.now()))
+    return true
+  }
+
+  // Consuming read: returns the section AND clears the buffer, so the same
+  // finding is never reported twice. POST, not a GET flag: it mutates state,
+  // and only non-safe methods pass through this server's cross-origin write
+  // guard (isBlockedCrossOriginWrite treats every GET as safe by definition).
+  if (path === '/api/alerts/digest/consume' && method === 'POST') {
+    json(res, renderDigest(Date.now(), { consume: true }))
     return true
   }
 

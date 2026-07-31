@@ -14,6 +14,22 @@ vi.mock('../notify.js', () => ({
   notifyTelegram: vi.fn(async () => {}),
 }))
 
+// sendAlert also consults the persistent alert state for the owner-facing rate
+// ceiling (audit AC-8). Stub ONLY its file I/O -- the decisions stay real --
+// so these cases neither write the live store/alert-state.json (they run under
+// fake timers, so their stamps would be nonsense) nor inherit a ceiling from a
+// previous run. The ceiling's own behaviour is covered in alert-policy.test.ts
+// and by the dedicated case at the bottom of this file.
+let fakeAlertState = { emits: {}, ownerSends: [] as number[], lastBreakerAt: null as number | null, digest: [] as unknown[], digestDropped: 0 }
+vi.mock('../alert-policy.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../alert-policy.js')>()
+  return {
+    ...actual,
+    loadAlertState: () => fakeAlertState,
+    saveAlertState: (s: typeof fakeAlertState) => { fakeAlertState = s },
+  }
+})
+
 const { notifyChannel } = await import('../notify.js')
 const {
   sendAlert,
@@ -36,6 +52,7 @@ beforeEach(() => {
   vi.setSystemTime(at(12))
   flushQuietAlerts()
   sent.mockClear()
+  fakeAlertState = { emits: {}, ownerSends: [], lastBreakerAt: null, digest: [], digestDropped: 0 }
 })
 
 afterAll(() => {
@@ -135,5 +152,33 @@ describe('bufferQuietAlert / buildQuietAlertSummary (tiszta reszek)', () => {
 
   it('ures gyujtore null (nincs mit kuldeni)', () => {
     expect(buildQuietAlertSummary(EMPTY_QUIET_ALERT_BUFFER)).toBeNull()
+  })
+})
+
+describe('sendAlert -- owner-facing rate ceiling (audit AC-8)', () => {
+  it('lets 3 through per hour, mutes the rest into the digest, and says so ONCE', () => {
+    vi.setSystemTime(at(10))
+    for (let i = 0; i < 20; i++) sendAlert(`⚠️ riasztas ${i}`)
+
+    // 3 real alerts + exactly 1 breaker notice.
+    expect(sent).toHaveBeenCalledTimes(4)
+    const texts = sent.mock.calls.map((c) => c[0] as string)
+    expect(texts.slice(0, 3)).toEqual(['⚠️ riasztas 0', '⚠️ riasztas 1', '⚠️ riasztas 2'])
+    expect(texts[3]).toContain('elnemitva')
+
+    // Nothing was lost: the other 17 are in the digest buffer.
+    expect(fakeAlertState.digest).toHaveLength(17)
+    expect(fakeAlertState.ownerSends).toHaveLength(3)
+  })
+
+  it('a quiet-hours alert never touches the ceiling (it is buffered, not sent)', () => {
+    vi.setSystemTime(at(2))
+    for (let i = 0; i < 20; i++) sendAlert(`⚠️ ejjeli ${i}`)
+    expect(sent).not.toHaveBeenCalled()
+    expect(fakeAlertState.ownerSends).toHaveLength(0)
+    // The night still leaves exactly ONE morning summary, ceiling untouched.
+    vi.setSystemTime(at(7))
+    flushQuietAlerts()
+    expect(sent).toHaveBeenCalledTimes(1)
   })
 })

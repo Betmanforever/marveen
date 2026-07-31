@@ -236,21 +236,29 @@ export type CeilingVerdict = 'allow' | 'hour-ceiling' | 'day-ceiling'
 /**
  * Pure decision: may one more owner-facing alert go out now? Counts the sends
  * inside each rolling window; strictly-less-than, so the Nth send is allowed and
- * the N+1th is not. Future-dated stamps (clock skew) are counted as if they were
- * now -- the conservative direction for a ceiling.
+ * the N+1th is not.
+ *
+ * A stamp dated in the FUTURE beyond the window is ignored, not counted. It is
+ * not a real send -- it is a clock jump (or a corrupt file), and counting it
+ * would gag the owner FOREVER, since a future stamp never leaves a
+ * `ts > now - window` filter. A ceiling that can silence itself permanently is
+ * the silence failure the audit's section 8 warns about, and it is strictly
+ * worse than the spam it replaces.
  */
 export function decideOwnerSendAllowance(ownerSends: number[], nowMs: number): CeilingVerdict {
-  const inHour = ownerSends.filter((ts) => ts > nowMs - OWNER_HOUR_MS).length
-  const inDay = ownerSends.filter((ts) => ts > nowMs - OWNER_DAY_MS).length
+  const inWindow = (ts: number, windowMs: number): boolean => ts > nowMs - windowMs && ts <= nowMs + windowMs
+  const inHour = ownerSends.filter((ts) => inWindow(ts, OWNER_HOUR_MS)).length
+  const inDay = ownerSends.filter((ts) => inWindow(ts, OWNER_DAY_MS)).length
   if (inHour >= OWNER_SENDS_PER_HOUR) return 'hour-ceiling'
   if (inDay >= OWNER_SENDS_PER_DAY) return 'day-ceiling'
   return 'allow'
 }
 
-/** Record an owner-facing send, dropping stamps outside the day window. */
+/** Record an owner-facing send, dropping stamps outside the day window in
+ * EITHER direction (see decideOwnerSendAllowance on future-dated stamps). */
 export function recordOwnerSend(state: AlertState, nowMs: number): AlertState {
-  const ownerSends = [...state.ownerSends.filter((ts) => ts > nowMs - OWNER_DAY_MS), nowMs]
-  return { ...state, ownerSends }
+  const kept = state.ownerSends.filter((ts) => ts > nowMs - OWNER_DAY_MS && ts <= nowMs + OWNER_DAY_MS)
+  return { ...state, ownerSends: [...kept, nowMs] }
 }
 
 /**
