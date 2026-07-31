@@ -94,6 +94,7 @@ MESSAGES_API = "http://localhost:3420/api/messages"
 DAILY_LOG_API = "http://localhost:3420/api/daily-log"
 ALERT_FROM = "neo"
 ALERT_TO = "mr-wolfe"
+DRILL = False  # --drill: [TESZT]-prefixed alerts for live acceptance drills
 
 # AC-B6. 8 weekly + 6 monthly is ~1.6 GB at the current 111 MB/archive.
 KEEP_WEEKLY = 8
@@ -237,6 +238,12 @@ def send_alert(text, quiet=False):
     Returns True if the message was accepted -- the caller records that, so a
     failed send is retried next week instead of being silently swallowed.
     """
+    if DRILL:
+        # Wolfe alert-policy rule (msg 3613): a live drill's alert must carry
+        # the [TESZT] label IN the alert text itself, not in an after-the-fact
+        # explanation -- a real-looking ADATSERULES at a bad moment breeds a
+        # bad decision.
+        text = "[TESZT] Eles drill, NEM valos esemeny. " + text
     if quiet:
         log("DRY-RUN, riasztas NEM ment el:\n" + text)
         return False
@@ -853,7 +860,13 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="mindent megcsinal, kiveve a meghajtora irast, a prune-t, "
                          "a riasztast es az allapot/napi-naplo irast")
+    ap.add_argument("--drill", action="store_true",
+                    help="eles gyakorlat (pl. csonkitas-teszt): minden riasztas "
+                         "[TESZT] prefixet kap, hogy a koordinator/Gabor ne "
+                         "valosnak lassa (wolfe alert-policy, msg 3613)")
     args = ap.parse_args()
+    global DRILL
+    DRILL = args.drill
 
     try:
         return run_weekly(args.dry_run)
