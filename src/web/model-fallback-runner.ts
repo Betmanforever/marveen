@@ -30,7 +30,7 @@ import { paneLooksIdle } from '../pane-state.js'
 import { readModelFallbackConfig } from './model-fallback-store.js'
 import {
   detectsUsageLimit, detectsModelAccessFailure, decideModelAction,
-  detectsUnrecognizedApiError, sanitizeFailureSnippet,
+  detectsUnrecognizedApiError, sanitizeFailureSnippet, isQuietHour,
 } from '../model-fallback.js'
 import { logConfigChange, createAgentMessage } from '../db.js'
 
@@ -53,15 +53,74 @@ const INTERVAL_MS = 60_000
 //           fleet (fable primary here, opus primary there) reverts each agent
 //           to ITS OWN model, not to the global chain[0]
 //   sticky: access-failure driven -- never auto-revert (permanent error class)
-// In-memory: a dashboard restart loses this, so a downgraded agent would not be
-// auto-reverted until the next downgrade cycle. Acceptable; the agent keeps
-// working on the fallback model, and the operator can revert manually.
+// Mirrored to disk on every mutation and reloaded at boot. While this map was
+// in-memory only, a dashboard restart erased it and a downgraded agent NEVER
+// auto-reverted: with no record the revert branch is unreachable, so the agent
+// kept running on the fallback model until someone noticed (2026-07-06: an
+// agent sat on haiku overnight and had to be restored by hand).
 interface DowngradeRecord {
   at: number
   from: string
   sticky: boolean
 }
 const downgraded = new Map<string, DowngradeRecord>()
+
+// Only the downgrade records are persisted. The short-lived maps below
+// (cooldown, tombstone, pending-access, probe bookkeeping) are deliberately
+// left in memory: each is at most a few sweeps' worth of state, and losing it
+// costs one round of re-detection -- cheap next to the risk of resurrecting a
+// stale tombstone or cooldown that suppresses a real signal after a restart.
+const STATE_PATH = join(PROJECT_ROOT, 'store', 'model-fallback-state.json')
+
+// Longest model id accepted back from the state file. `from` is written into
+// the agent's config on revert and handed to the probe as --model, so it gets
+// the same type+bounds check as any other store-sourced value.
+const MAX_MODEL_ID_LEN = 200
+
+/**
+ * Reload the downgrade records left by a previous dashboard process. Fail-open
+ * like every other store reader (see model-fallback-store.ts): a missing,
+ * unreadable or malformed file just means "nothing is downgraded" -- worst
+ * case we lose one auto-revert, which is the pre-existing behaviour.
+ */
+function loadDowngradeState(): void {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(STATE_PATH, 'utf-8'))
+  } catch {
+    return
+  }
+  const root = (parsed && typeof parsed === 'object') ? parsed as Record<string, unknown> : {}
+  const raw = (root.downgraded && typeof root.downgraded === 'object')
+    ? root.downgraded as Record<string, unknown>
+    : {}
+  let restored = 0
+  for (const [name, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object') continue
+    const rec = value as Record<string, unknown>
+    const { at, from } = rec
+    if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) continue
+    if (typeof from !== 'string' || !from.trim() || from.length > MAX_MODEL_ID_LEN) continue
+    downgraded.set(name, { at, from, sticky: rec.sticky === true })
+    restored++
+  }
+  if (restored > 0) logger.info({ restored }, 'model-fallback: downgrade state restored from disk')
+}
+
+/**
+ * Mirror the records to disk. Called after EVERY mutation (including the
+ * enabled=false reset) so a crash between the model write and the next sweep
+ * cannot lose a record that the auto-revert depends on.
+ */
+function persistDowngradeState(): void {
+  const out: Record<string, DowngradeRecord> = {}
+  for (const [name, rec] of downgraded) out[name] = rec
+  try {
+    atomicWriteFileSync(STATE_PATH, JSON.stringify({ downgraded: out }, null, 2))
+  } catch (err) {
+    logger.warn({ err }, 'model-fallback: downgrade state persist failed')
+  }
+}
 
 // Post-switch cooldown (audit C1): the respawn uses --continue, so the OLD
 // error banner can re-render from the replayed transcript right after a
@@ -96,6 +155,8 @@ const PENDING_MAX_AGE_MS = 5 * 60_000
 
 // Rate-limit for the unrecognized-error telemetry log (audit F8), per agent.
 const lastUnrecognizedLogAt = new Map<string, number>()
+// Throttle for the cascade-guard hold log (audit P3), per agent.
+const lastCascadeLogAt = new Map<string, number>()
 
 // --- Reset-trigger probe (Gabor, 2026-07-04): sticky means "no TIMER revert",
 // not "never revert". While a sticky downgrade is active, probe the preferred
@@ -226,14 +287,55 @@ function sessionFor(name: string): string {
   return name === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(name)
 }
 
+function tryResolveFromPath(bin: string): string | null {
+  try { return resolveFromPath(bin) } catch { return null }
+}
+
+// systemd --user unit that owns the main channels session on Linux.
+// install-linux.sh names it "${SERVICE_ID}-channels" (install-linux.sh:1173),
+// verified live on this host: SERVICE_ID=mr-wolfe -> mr-wolfe-channels.service.
+const MAIN_CHANNELS_UNIT = `${SERVICE_ID}-channels.service`
+
+// Resolved once, tolerantly: a Linux box without systemd (or without systemctl
+// on PATH) has no way to respawn the main session. Writing the model there
+// without a restart would be a silent settings.json drift (audit C2), so
+// checkAgent skips the main agent instead -- see mainAgentRestartSupported.
+const SYSTEMCTL_BIN = process.platform === 'linux' ? tryResolveFromPath('systemctl') : null
+
+/**
+ * True when this platform can actually respawn the main channels session.
+ * Both transports re-run scripts/channels.sh, which reads the main agent's
+ * model from the repo-root .claude/settings.json and passes it as --model
+ * (channels.sh:204-222) before re-creating the tmux session (channels.sh:368-370)
+ * -- so a plain restart is what applies the new model.
+ */
+function mainAgentRestartSupported(): boolean {
+  if (process.platform === 'darwin') return true
+  return process.platform === 'linux' && SYSTEMCTL_BIN !== null
+}
+
 function restartFor(name: string): void {
   if (name === MAIN_AGENT_ID) {
-    // The main channels session is launchd-managed; a kickstart re-reads
-    // .claude/settings.json (and thus the new model) on relaunch. KeepAlive
-    // brings it straight back. channels.sh always starts fresh for main, so a
-    // conversation is not preserved here -- the model swap is what matters.
-    const uid = typeof process.getuid === 'function' ? process.getuid() : ''
-    execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/com.${SERVICE_ID}.channels`], { timeout: 10_000 })
+    // channels.sh always starts FRESH for main (kill-session + new-session, no
+    // --continue), so the main agent's conversation is NOT preserved across a
+    // model switch -- the model swap is what matters here.
+    if (process.platform === 'darwin') {
+      // launchd-managed; a kickstart re-reads .claude/settings.json (and thus
+      // the new model) on relaunch. KeepAlive brings it straight back.
+      const uid = typeof process.getuid === 'function' ? process.getuid() : ''
+      execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/com.${SERVICE_ID}.channels`], { timeout: 10_000 })
+    } else if (SYSTEMCTL_BIN) {
+      // systemd --user; Restart=always brings the session back. Longer timeout
+      // than launchctl because the unit's ExecStartPre rebuilds the native
+      // modules before channels.sh runs.
+      execFileSync(SYSTEMCTL_BIN, ['--user', 'restart', MAIN_CHANNELS_UNIT], { timeout: 15_000 })
+    } else {
+      // checkAgent gates on mainAgentRestartSupported(), so this is reachable
+      // only if systemctl disappeared mid-run. Throw rather than no-op: the
+      // caller logs it and announces that the switch applies on the next
+      // respawn, instead of silently reporting a restart that never happened.
+      throw new Error(`no main-agent restart transport on platform ${process.platform}`)
+    }
   } else {
     // 'continue' (fresh: false) re-spawns with --continue so the conversation
     // survives the model swap.
@@ -242,12 +344,14 @@ function restartFor(name: string): void {
 }
 
 function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: string[]): void {
-  // Main-agent restarts go through launchctl (macOS-only). On other platforms
-  // we could write the new model but NOT restart the session -- a silent
-  // settings.json drift (audit C2). Skip the main agent entirely there; its
-  // model stays operator-managed. Sub-agents are fully covered everywhere.
-  if (name === MAIN_AGENT_ID && process.platform !== 'darwin') return
-  // Sub-agents must be up; the main session is launchd-managed (always present).
+  // Main-agent restarts go through launchctl (macOS) or systemd --user
+  // (Linux). Where neither transport exists we could write the new model but
+  // NOT restart the session -- a silent settings.json drift (audit C2). Skip
+  // the main agent entirely there; its model stays operator-managed. Sub-agents
+  // are fully covered everywhere.
+  if (name === MAIN_AGENT_ID && !mainAgentRestartSupported()) return
+  // Sub-agents must be up; the main session is service-managed (launchd
+  // KeepAlive / systemd Restart=always), so it is always present.
   if (name !== MAIN_AGENT_ID && agentRunState(name) !== 'running') return
 
   const session = sessionFor(name)
@@ -311,7 +415,37 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
     now: nowMs,
     revertAfterMs,
   })
-  if (action.kind === 'none') return
+  if (action.kind === 'none') {
+    // Cascade-guard observability (audit 2026-07-31, P3): the guard's skip is
+    // deliberate but must not be invisible -- a persistent limit banner over a
+    // fresh downgrade record is exactly the 07-05 pattern being suppressed.
+    // Once per 30 min per agent, so a whole limit window logs 1-2 lines.
+    if (limitDetected && record && nowMs - record.at < revertAfterMs
+      && nowMs - (lastCascadeLogAt.get(name) ?? 0) > 30 * 60_000) {
+      lastCascadeLogAt.set(name, nowMs)
+      logger.info({ name, downgradedAt: record.at, from: record.from },
+        'model-fallback: limit still visible but cascade guard holds (one step per window)')
+    }
+    return
+  }
+
+  // Quiet-hours gate: a revert costs a session restart and is never urgent --
+  // the agent is working fine on the fallback model -- so between 22:00 and
+  // 06:00 local time we let it be and the next daytime sweep does it. A
+  // sub-agent DOWNGRADE is intentionally NOT gated: that one frees an agent
+  // sitting deaf on a limited or unusable model, which the night shift must
+  // not sleep through. The MAIN agent is the exception in BOTH directions
+  // (audit 2026-07-31, P2): its Linux restart path is a fresh spawn with no
+  // --continue, so an unattended 03:00 switch would wipe Mr. Wolfe's live
+  // conversation for a limit that resolves by morning anyway -- and during
+  // quiet hours no traffic depends on him. Same clock as the rest of the
+  // sweep, so the whole tick agrees.
+  const quietNow = isQuietHour(new Date(nowMs).getHours())
+  if (quietNow && (action.kind === 'revert' || name === MAIN_AGENT_ID)) {
+    logger.info({ name, action: action.kind, model: action.model },
+      'model-fallback: action due but quiet hours, deferring')
+    return
+  }
 
   // Downgrade may run on a limit-paused pane (which reads idle); revert must not
   // cut a live turn. Both go through restart, so require idle for both.
@@ -352,6 +486,7 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
       from: record?.from ?? currentModel,
       sticky: action.sticky || (record?.sticky ?? false),
     })
+    persistDowngradeState()
     // Tombstone the acted-on line so it never re-triggers -- not even after a
     // later revert removes the downgrade record (C-A).
     if (accessFailure) handledLine.set(name, { line: accessFailure, missingSweeps: 0 })
@@ -360,6 +495,7 @@ function checkAgent(name: string, nowMs: number, revertAfterMs: number, chain: s
     lastProbeAt.delete(name)
   } else {
     downgraded.delete(name)
+    persistDowngradeState()
     probeConfirmed.delete(name)
     lastProbeAt.delete(name)
     // Time-box the surviving tombstone (T1): a byte-identical genuine new
@@ -411,7 +547,12 @@ export function startModelFallbackRunner(): NodeJS.Timeout {
   function sweep() {
     const cfg = readModelFallbackConfig()
     if (!cfg.enabled) {
-      if (downgraded.size > 0) downgraded.clear() // re-seed cleanly if re-enabled
+      // Re-seed cleanly if re-enabled -- on disk too, or a restart would
+      // resurrect records the operator already turned the feature off for.
+      if (downgraded.size > 0) {
+        downgraded.clear()
+        persistDowngradeState()
+      }
       pendingAccess.clear()
       probeConfirmed.clear()
       lastProbeAt.clear()
@@ -429,6 +570,10 @@ export function startModelFallbackRunner(): NodeJS.Timeout {
       catch (err) { logger.debug({ err, agent: name }, 'model-fallback: agent check error') }
     }
   }
+  // Restore before the first sweep: a downgraded agent must keep its record
+  // across a dashboard restart, otherwise the revert branch is unreachable and
+  // it stays on the fallback model forever.
+  loadDowngradeState()
   setTimeout(sweep, INITIAL_DELAY_MS)
   return setInterval(sweep, INTERVAL_MS)
 }

@@ -15,14 +15,20 @@
 
 // Resolved full model IDs, mirroring MODEL_ALIASES in src/web/agent-config.ts.
 // The full fleet ladder (Gabor's final order, 2026-07-04): each agent's HOME
-// RUNG on it is a monthly-review decision; the chain itself walks STRICTLY
-// CHEAPER per pricing confirmed from the primary source (Fable $10/$50 ->
-// Opus 4.8 $5/$25 -> Sonnet 5 $3/$15, intro $2/$10 through 2026-08-31 ->
-// Sonnet 4.6, same list price but older tier -> Haiku $1/$5) -- downgrading
-// onto a pricier model during limit exhaustion would be counterproductive.
+// RUNG on it is a monthly-review decision; the chain itself never steps onto a
+// PRICIER model, per pricing re-verified from the primary source 2026-07-31
+// (Fable $10/$50 -> Opus 5 $5/$25 -> Opus 4.8 $5/$25, same price but older
+// tier -> Sonnet 5 $3/$15, intro $2/$10 through 2026-08-31 -> Sonnet 4.6,
+// same list price but older tier -> Haiku $1/$5) -- downgrading onto a pricier
+// model during limit exhaustion would be counterproductive.
+// Opus 5 is the fleet's current PRIMARY rung (repo-root .claude/settings.json
+// for the main agent, agent-config.json for most sub-agents); while it was
+// missing from this list a limited primary read as an unrecognised model and
+// landed straight on Sonnet 5, skipping the whole Opus tier.
 // Kept as literals to preserve the zero-import, trivially-testable property.
 export const DEFAULT_MODEL_CHAIN: readonly string[] = [
   'claude-fable-5',
+  'claude-opus-5',
   'claude-opus-4-8[1m]',
   'claude-sonnet-5',
   'claude-sonnet-4-6',
@@ -275,7 +281,8 @@ export type ModelAction =
  *
  *   - access failure & a lower model exists -> STICKY downgrade (no
  *     time-based auto-revert: the error is permanent as far as waiting goes).
- *   - limit detected & a lower model exists -> downgrade (auto-reverts later).
+ *   - limit detected & a lower model exists -> downgrade (auto-reverts later),
+ *     but at most ONE step per limit window (see the cascade guard below).
  *   - already at the bottom -> nothing (cannot go lower).
  *   - sticky downgrade & a probe confirmed the preferred model works again
  *     (quota reset / usage credit added) -> revert to it. This is the
@@ -287,6 +294,28 @@ export type ModelAction =
 export function decideModelAction(f: ModelFallbackFacts): ModelAction {
   const accessFailure = f.accessFailure ?? null
   if (accessFailure || f.limitDetected) {
+    // Cascade guard (2026-07-05 incident, config_change_log 6-9): the plan
+    // limit is ACCOUNT-scoped, not per-model, so every respawn onto a cheaper
+    // rung re-hit the SAME limit and the runner walked the whole ladder
+    // fable -> opus -> sonnet -> haiku, one step per cooldown expiry. Stepping
+    // down under a limit buys nothing and destroys capability, so a limit
+    // signal is worth exactly ONE step per limit window: while a non-sticky
+    // downgrade record is still inside the revert window, sit tight. Past the
+    // window the record ages out and a fresh limit opens a new window.
+    // Deliberately NOT applied to an access failure: that is a different error
+    // class (this specific model is unusable, the next one may not be), so it
+    // keeps walking the chain even with an active record. The guard keys on
+    // the SIGNAL (limit vs access), not on the record's stickiness: a sticky
+    // record (access-driven downgrade) followed by a genuine limit banner is
+    // the same account-scoped limit, and stepping further down is just as
+    // futile there (audit 2026-07-31, P1).
+    if (
+      !accessFailure
+      && f.downgradedAt !== null
+      && f.now - f.downgradedAt < f.revertAfterMs
+    ) {
+      return { kind: 'none' }
+    }
     const next = nextFallbackModel(f.currentModel, f.chain)
     if (next && next !== f.currentModel) {
       return accessFailure
@@ -306,4 +335,22 @@ export function decideModelAction(f: ModelFallbackFacts): ModelAction {
     if (target && f.currentModel !== target) return { kind: 'revert', model: target }
   }
   return { kind: 'none' }
+}
+
+// The fleet's nightly pause: 22:00-06:00 in the host's local timezone
+// (Europe/Budapest on this install). A REVERT costs a session restart and is
+// never urgent -- the agent is working fine on the fallback model -- so it is
+// deferred to the next daytime sweep. A DOWNGRADE is NOT gated: that one
+// unsticks an agent sitting deaf on a limited or unusable model, which is
+// exactly the failure the night shift must not sleep through.
+export const QUIET_HOURS_START = 22
+export const QUIET_HOURS_END = 6
+
+/**
+ * True when the given local hour-of-day (0-23) falls inside the fleet's quiet
+ * window. Pure so the boundary is testable without mocking the clock; the
+ * runner supplies `new Date(now).getHours()`.
+ */
+export function isQuietHour(hour: number): boolean {
+  return hour >= QUIET_HOURS_START || hour < QUIET_HOURS_END
 }

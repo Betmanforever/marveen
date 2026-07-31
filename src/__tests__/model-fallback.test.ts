@@ -8,17 +8,19 @@ import {
   nextFallbackModel,
   decideModelAction,
   normalizeModelFallbackConfig,
+  isQuietHour,
   DEFAULT_MODEL_CHAIN,
   DEFAULT_MODEL_FALLBACK,
 } from '../model-fallback.js'
 
 const CHAIN = [...DEFAULT_MODEL_CHAIN]
-// Full fleet ladder: [fable, opus-4-8[1m], sonnet-5, sonnet-4-6, haiku]
+// Full fleet ladder: [fable, opus-5, opus-4-8[1m], sonnet-5, sonnet-4-6, haiku]
 const FABLE = CHAIN[0]
-const OPUS = CHAIN[1]
-const SONNET5 = CHAIN[2]
-const SONNET46 = CHAIN[3]
-const HAIKU = CHAIN[4]
+const OPUS5 = CHAIN[1]
+const OPUS48 = CHAIN[2]
+const SONNET5 = CHAIN[3]
+const SONNET46 = CHAIN[4]
+const HAIKU = CHAIN[5]
 
 describe('detectsUsageLimit', () => {
   it('matches Claude plan usage-limit banners in the live region', () => {
@@ -90,8 +92,9 @@ describe('extractLimitReset', () => {
 
 describe('nextFallbackModel', () => {
   it('walks one step down the chain', () => {
-    expect(nextFallbackModel(FABLE, CHAIN)).toBe(OPUS)
-    expect(nextFallbackModel(OPUS, CHAIN)).toBe(SONNET5)
+    expect(nextFallbackModel(FABLE, CHAIN)).toBe(OPUS5)
+    expect(nextFallbackModel(OPUS5, CHAIN)).toBe(OPUS48)
+    expect(nextFallbackModel(OPUS48, CHAIN)).toBe(SONNET5)
     expect(nextFallbackModel(SONNET5, CHAIN)).toBe(SONNET46)
     expect(nextFallbackModel(SONNET46, CHAIN)).toBe(HAIKU)
   })
@@ -101,11 +104,36 @@ describe('nextFallbackModel', () => {
   it('an unknown current model lands on the fleet-default rung, not the pricey head', () => {
     expect(nextFallbackModel('some-unknown-model', CHAIN)).toBe(SONNET5)
     // operator chain without the default rung: falls back to chain[1]
-    expect(nextFallbackModel('some-unknown-model', [OPUS, SONNET46, HAIKU])).toBe(SONNET46)
+    expect(nextFallbackModel('some-unknown-model', [OPUS48, SONNET46, HAIKU])).toBe(SONNET46)
   })
   it('returns null for a degenerate chain', () => {
     expect(nextFallbackModel(FABLE, [FABLE])).toBeNull()
     expect(nextFallbackModel(FABLE, [])).toBeNull()
+  })
+
+  it('carries the fleet primary (opus-5) between fable and opus-4.8', () => {
+    // Without this rung a limited primary read as an UNKNOWN model and dropped
+    // straight to the sonnet landing, skipping the whole opus tier.
+    expect(CHAIN).toContain('claude-opus-5')
+    expect(nextFallbackModel('claude-fable-5', CHAIN)).toBe('claude-opus-5')
+    expect(nextFallbackModel('claude-opus-5', CHAIN)).toBe('claude-opus-4-8[1m]')
+  })
+
+  it('never steps onto a pricier rung than the one it left', () => {
+    // $/MTok input, verified from the primary source 2026-07-31.
+    const inputPrice: Record<string, number> = {
+      'claude-fable-5': 10,
+      'claude-opus-5': 5,
+      'claude-opus-4-8[1m]': 5,
+      'claude-sonnet-5': 3,
+      'claude-sonnet-4-6': 3,
+      'claude-haiku-4-5-20251001': 1,
+    }
+    for (const model of CHAIN) {
+      const next = nextFallbackModel(model, CHAIN)
+      if (!next) continue
+      expect(inputPrice[next]).toBeLessThanOrEqual(inputPrice[model]!)
+    }
   })
 })
 
@@ -195,7 +223,9 @@ describe('decideModelAction', () => {
 
   it('downgrades when a limit is detected and a lower model exists', () => {
     expect(decideModelAction({ ...base, limitDetected: true, currentModel: FABLE, downgradedAt: null }))
-      .toEqual({ kind: 'downgrade', model: OPUS, sticky: false, cause: 'usage-limit' })
+      .toEqual({ kind: 'downgrade', model: OPUS5, sticky: false, cause: 'usage-limit' })
+    // downgradedAt is 500_000 ms back, far past the 60_000 ms window, so the
+    // cascade guard has aged out and this is a fresh limit window.
     expect(decideModelAction({ ...base, limitDetected: true, currentModel: SONNET46, downgradedAt: 500_000 }))
       .toEqual({ kind: 'downgrade', model: HAIKU, sticky: false, cause: 'usage-limit' })
   })
@@ -229,14 +259,14 @@ describe('decideModelAction', () => {
     expect(decideModelAction({
       ...base, limitDetected: true, accessFailure: 'API Error: 403 ... model',
       currentModel: FABLE, downgradedAt: null,
-    })).toEqual({ kind: 'downgrade', model: OPUS, sticky: true, cause: 'model-access' })
+    })).toEqual({ kind: 'downgrade', model: OPUS5, sticky: true, cause: 'model-access' })
   })
 
   it('access failure on the fable rung walks to opus (fable is IN the chain now)', () => {
     expect(decideModelAction({
       ...base, limitDetected: false, accessFailure: 'API Error: 404 model not found',
       currentModel: 'claude-fable-5', downgradedAt: null,
-    })).toEqual({ kind: 'downgrade', model: OPUS, sticky: true, cause: 'model-access' })
+    })).toEqual({ kind: 'downgrade', model: OPUS5, sticky: true, cause: 'model-access' })
   })
 
   it('a sticky downgrade never auto-reverts on a TIMER, no matter how old', () => {
@@ -274,8 +304,82 @@ describe('decideModelAction', () => {
     // mixed fleet: this agent's home rung is opus, chain[0] is fable
     expect(decideModelAction({
       ...base, limitDetected: false, currentModel: SONNET5,
-      downgradedAt: 1_000_000 - 60_000, downgradedFrom: OPUS, downgradeSticky: false,
-    })).toEqual({ kind: 'revert', model: OPUS })
+      downgradedAt: 1_000_000 - 60_000, downgradedFrom: OPUS5, downgradeSticky: false,
+    })).toEqual({ kind: 'revert', model: OPUS5 })
+  })
+
+  // --- Cascade guard (2026-07-05 incident, config_change_log 6-9) ---
+  // The plan limit is ACCOUNT-scoped: every respawn onto a cheaper rung re-hit
+  // the same limit, so the runner walked the whole ladder one step per cooldown
+  // expiry. A limit signal is worth exactly ONE step per limit window.
+
+  it('does NOT walk further down while a non-sticky limit downgrade is still fresh', () => {
+    expect(decideModelAction({
+      ...base, limitDetected: true, currentModel: OPUS5,
+      downgradedAt: 1_000_000 - 59_999, downgradedFrom: FABLE, downgradeSticky: false,
+    })).toEqual({ kind: 'none' })
+  })
+
+  it('holds the line at every rung of the chain, not just the first step', () => {
+    // The 07-05 cascade was fable->opus->sonnet5->sonnet46->haiku; each of those
+    // hops must be blocked while the window is open.
+    for (const rung of [OPUS5, OPUS48, SONNET5, SONNET46]) {
+      expect(decideModelAction({
+        ...base, limitDetected: true, currentModel: rung,
+        downgradedAt: 1_000_000 - 30_000, downgradedFrom: FABLE, downgradeSticky: false,
+      })).toEqual({ kind: 'none' })
+    }
+  })
+
+  it('steps again once the window has elapsed (a genuinely new limit window)', () => {
+    expect(decideModelAction({
+      ...base, limitDetected: true, currentModel: OPUS5,
+      downgradedAt: 1_000_000 - 60_000, downgradedFrom: FABLE, downgradeSticky: false,
+    })).toEqual({ kind: 'downgrade', model: OPUS48, sticky: false, cause: 'usage-limit' })
+  })
+
+  it('an ACCESS failure still walks the chain during an active downgrade window', () => {
+    // Different error class: this model is unusable, the next one may not be.
+    expect(decideModelAction({
+      ...base, limitDetected: false, accessFailure: 'API x model y',
+      currentModel: OPUS5, downgradedAt: 1_000_000 - 1_000,
+      downgradedFrom: FABLE, downgradeSticky: false,
+    })).toEqual({ kind: 'downgrade', model: OPUS48, sticky: true, cause: 'model-access' })
+  })
+
+  it('an access failure alongside a limit banner is not blocked by the guard', () => {
+    expect(decideModelAction({
+      ...base, limitDetected: true, accessFailure: 'API x model y',
+      currentModel: OPUS5, downgradedAt: 1_000_000 - 1_000,
+      downgradedFrom: FABLE, downgradeSticky: true,
+    })).toEqual({ kind: 'downgrade', model: OPUS48, sticky: true, cause: 'model-access' })
+  })
+
+  it('the guard needs a record: a first limit with no history still steps down', () => {
+    expect(decideModelAction({
+      ...base, limitDetected: true, currentModel: OPUS5, downgradedAt: null,
+    })).toEqual({ kind: 'downgrade', model: OPUS48, sticky: false, cause: 'usage-limit' })
+  })
+})
+
+describe('isQuietHour', () => {
+  it('covers the fleet night pause, 22:00 through 05:59', () => {
+    expect(isQuietHour(22)).toBe(true)
+    expect(isQuietHour(23)).toBe(true)
+    expect(isQuietHour(0)).toBe(true)
+    expect(isQuietHour(3)).toBe(true)
+    expect(isQuietHour(5)).toBe(true)
+  })
+
+  it('is false right at the boundaries and through the working day', () => {
+    expect(isQuietHour(6)).toBe(false)
+    expect(isQuietHour(12)).toBe(false)
+    expect(isQuietHour(21)).toBe(false)
+  })
+
+  it('classifies every hour of the day exactly once', () => {
+    const quiet = [...Array(24).keys()].filter(isQuietHour)
+    expect(quiet).toEqual([0, 1, 2, 3, 4, 5, 22, 23])
   })
 })
 
