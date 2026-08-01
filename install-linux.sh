@@ -1287,7 +1287,6 @@ EOF
 cat >"$SYSTEMD_DIR/${MORN_UNIT}.timer" <<EOF
 [Unit]
 Description=${BOT_NAME} Reggeli Napindito Timer
-Requires=${MORN_UNIT}.service
 
 [Timer]
 OnCalendar=*-*-* 07:27:00

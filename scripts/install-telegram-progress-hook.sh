@@ -189,7 +189,6 @@ UNITEOF
   cat > "$UNIT_DIR/$SVC.timer" <<TIMEREOF
 [Unit]
 Description=Run the Telegram progress watchdog every 60s
-Requires=$SVC.service
 
 [Timer]
 OnBootSec=60
