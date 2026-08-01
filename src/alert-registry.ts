@@ -178,6 +178,77 @@ export const ALERT_REGISTRY: AlertEmitter[] = [
       + 'outside is worse), and 19:00 is outside the window.',
   },
 
+  // --- host guards (audit C-1, card 5e68c5e1: coordinator-first since c6f466b)
+  {
+    id: 'host-worker-guard',
+    signalId: 'agent-worker-failure',
+    source: 'scripts/worker-guard.sh (notify)',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'dashboard.log line matches "worker not ready|Failed to generate agent" '
+      + '(event-driven tail -F, zero polling)',
+    dedupKey: 'in-process debounce, at most one action per 120s (DEBOUNCE_SEC)',
+    quietHours: 'coordinator via /api/messages while the dashboard answers; direct Bot API '
+      + 'only as the dashboard-down backstop, 22-06 deferred to host-watchdog.log -- the '
+      + 'guard keeps running, so a persisting failure re-alerts after 06:00',
+    enabled: true,
+    notes: 'Also remediates (kill + relaunch of a dirty marveen-worker pane) before alerting; '
+      + 'the alert reports the self-heal, it does not ask for one.',
+  },
+  {
+    id: 'host-stuck-modal-guard',
+    signalId: 'channels-stuck-modal',
+    source: 'scripts/stuck-modal-guard.sh (alert_owner)',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'main channels pane classifies STUCK (no idle footer, no busy marker -- '
+      + 'src/pane-state.ts contract) and persists >= 120s (2 consecutive 1-min ticks)',
+    dedupKey: 'store/.stuck-modal-firstseen + .stuck-modal-backoff-alerted; respawn grace '
+      + 'stamp SHARED with channel-watchdog.sh (no double-respawn storm)',
+    quietHours: 'coordinator via /api/messages while the dashboard answers; direct Bot API '
+      + 'only as the dashboard-down backstop, 22-06 deferred to the log -- the timer loops, '
+      + 'so a persisting modal re-alerts after 06:00',
+    enabled: true,
+    notes: 'Remediation-first: bounded Escape, then respawn-pane; alerts only after '
+      + 'MAX_CONSECUTIVE=3 respawns force backoff (self-heal failed, not on first sight).',
+  },
+  {
+    id: 'host-disk-space-guard',
+    signalId: 'host-disk-full',
+    source: 'scripts/disk-space-guard.sh (alert)',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: 'root usage >= 90% triggers allowlisted scratch reap; still >= 95% AFTER '
+      + 'the reap triggers the alert',
+    dedupKey: 'store/.disk-guard-alerted cooldown stamp, at most one alert per 3600s',
+    quietHours: 'coordinator via /api/messages while the dashboard answers; direct Bot API '
+      + 'only as the dashboard-down backstop, 22-06 deferred to the log. Under disk-FULL the '
+      + 'dashboard API may itself fail -- that is the designed fall-through to the backstop.',
+    enabled: true,
+    notes: 'The 2026-06-03 disk-full incident guard. Reap is allowlist+age-guarded; every '
+      + 'stamp write is best-effort under ENOSPC.',
+  },
+  {
+    id: 'host-restart-watchdog',
+    signalId: 'host-restart',
+    source: 'scripts/host-restart-watchdog.sh',
+    owner: true,
+    route: 'coordinator',
+    ownerFacing: false,
+    threshold: '/proc/stat btime changed since the stored baseline (whole-VM/host reboot; '
+      + 'app crashes never change btime and are the OnFailure= drop-ins\' job)',
+    dedupKey: 'store/.last-btime baseline -- structurally at most one alert per boot',
+    quietHours: 'oneshot races the dashboard at boot, so it waits up to 60s for it; then '
+      + 'coordinator via /api/messages. Backstop leg 22-06 defers to the journal only (a '
+      + 'oneshot has no re-run; the down dashboard is what the morning round surfaces).',
+    enabled: true,
+    notes: 'Informational machine fact (host/WSL-VM restart + estimated downtime), never a '
+      + 'decision -- ownerFacing false by construction.',
+  },
+
   // --- shared transports -----------------------------------------------------
   {
     id: 'notify-sh',
