@@ -13,6 +13,16 @@ import { defineConfig, configDefaults } from 'vitest/config'
 // each project's own concern, from its own directory.
 export default defineConfig({
   test: {
-    exclude: [...configDefaults.exclude, 'tests/smoke/**', 'projects/**'],
+    exclude: [
+      ...configDefaults.exclude,
+      'tests/smoke/**',
+      'projects/**',
+      // Claude plugin caches (user-level and per-agent CLAUDE_CONFIG_DIR)
+      // carry third-party plugins' OWN test suites (bun:test-based, e.g.
+      // slack-channel server.test.ts), which are not this codebase's tests
+      // and cannot even load under vitest.
+      '**/.claude-config/**',
+      '**/.claude/plugins/**',
+    ],
   },
 })
