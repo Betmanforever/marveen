@@ -1906,6 +1906,7 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
             paneDialogEscalation.delete(t.session)
             logger.warn({ session: t.session, agent: label, configuredModel, optionNum },
               'Model-credit dialog detected -- navigating to the configured model option (NOT Escape)')
+            let navigated = false
             try {
               // Digit + settle + Enter, the same select-modal sequence
               // dismissResumeSummaryModalIfPresent uses (agent-process.ts). If
@@ -1915,17 +1916,33 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
               execFileSync(TMUX, ['send-keys', '-t', t.session, String(optionNum)], { timeout: 5000 })
               execFileSync('/bin/sleep', ['0.1'], { timeout: 2000 })
               execFileSync(TMUX, ['send-keys', '-t', t.session, 'Enter'], { timeout: 5000 })
+              navigated = true
             } catch (err) {
               logger.warn({ err, session: t.session }, 'Model-credit dialog navigation failed')
             }
-            // configuredModel comes from our own agent config and optionNum is
-            // a parsed integer, so neither interpolates untrusted pane text.
-            sendAlert(
-              `🔀 A(z) ${label} session model-credit dialogusban allt (a beallitott modell included kerete elfogyott). ` +
-              `Escape-et NEM kuldtunk (az neman a fallback modellre valtana) -- explicit a konfiguralt modell opciojara ` +
-              `navigaltunk: ${configuredModel} (${optionNum}. opcio). Innentol ez a session usage-creditet fogyaszt. ` +
-              'Ha ezt nem akarod, allitsd at az agent modelljet a dashboardon.',
-            )
+            if (navigated) {
+              // Successful resolution onto the CONFIGURED model is routine
+              // under Gabor's standing decisions (2026-07-20
+              // accept-the-credits, 2026-08-01 "modell setup marad") --
+              // digest, not owner ping (card 012a417a, "Fix it" after 3 pings
+              // in one day). The no-unambiguous-option branch below keeps its
+              // own escalation path untouched.
+              appendDigestEntry({
+                category: 'auto-fixed',
+                source: 'model-credit-gate',
+                summary: `${label}: model-credit dialogus feloldva a konfiguralt modellre (${configuredModel}, ${optionNum}. opcio) -- a session innentol usage-creditet fogyaszt`,
+              })
+            } else {
+              // Navigation error: the dialog may still be parked and the next
+              // sweep may not see it the same way -- this is one of the two
+              // branches the card keeps owner-facing. (Previously the success
+              // text was sent here too, claiming a resolution that never
+              // happened.)
+              sendAlert(
+                `🔀 A(z) ${label} session model-credit dialogusban all, a konfiguralt modell (${configuredModel}) ` +
+                `opciojara navigalas HIBAZOTT -- a dialogus valoszinuleg tovabbra is nyitva. Kezi feloldas kell.`,
+              )
+            }
           } else {
             // No unambiguous option for the configured model (unknown model id,
             // or the dialog offers none that names it). Do NOT guess a

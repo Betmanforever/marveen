@@ -93,11 +93,26 @@ describe('channel-monitor: model-credit dialog branch', () => {
     expect(enterIdx).toBeGreaterThan(sleepIdx)
   })
 
-  it('the navigation alert names the configured model and the credit consequence', () => {
+  it('successful resolution goes to the digest, not an owner ping (card 012a417a)', () => {
     const region = menuRecoveryRegion()
-    expect(region).toContain('${configuredModel} (${optionNum}. opcio)')
-    expect(region).toContain('Escape-et NEM kuldtunk')
-    expect(region).toContain('usage-creditet fogyaszt')
+    // Success branch: digest entry naming the model, the option and the
+    // credit consequence -- no sendAlert on this path.
+    const successBranch = region.slice(region.indexOf('if (navigated) {'), region.indexOf('} else {', region.indexOf('if (navigated) {')))
+    expect(successBranch).toContain('appendDigestEntry({')
+    expect(successBranch).toContain("category: 'auto-fixed'")
+    expect(successBranch).toContain("source: 'model-credit-gate'")
+    expect(successBranch).toContain('${configuredModel}, ${optionNum}. opcio')
+    expect(successBranch).toContain('usage-creditet fogyaszt')
+    expect(successBranch).not.toContain('sendAlert(')
+  })
+
+  it('a FAILED navigation stays owner-facing (the dialog may still be parked)', () => {
+    const region = menuRecoveryRegion()
+    const navIdx = region.indexOf('let navigated = false')
+    expect(navIdx).toBeGreaterThan(-1)
+    const failBranch = region.slice(region.indexOf('} else {', region.indexOf('if (navigated) {')))
+    expect(failBranch).toContain('sendAlert(')
+    expect(failBranch).toContain('navigalas HIBAZOTT')
   })
 
   it('escalates two-phase (coordinator first) when no option matches -- never guesses', () => {
