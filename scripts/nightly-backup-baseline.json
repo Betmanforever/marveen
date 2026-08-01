@@ -1,69 +1,70 @@
 {
   "version": 1,
-  "created_at": "2026-07-30T17:00:57",
+  "created_at": "2026-08-01T08:26:34",
   "created_by": "scripts/nightly-memory-backup.py --update-baseline",
-  "previous_created_at": "2026-07-30T15:24:29",
+  "previous_created_at": "2026-07-30T17:00:57",
   "note": "Kategoriankenti nem-ures assertion bazisvonala (plan C1/D4/23). A nightly script SOHA nem irja ezt a fajlt magatol: ha hianyzik, leall es riaszt. Csak tudatos, emberi/agent dontessel frissul. files>0 baseline mellett a 0 fajl hard stop; bytes>0 mellett a 0 bajt hard stop; a bytes==0 kategoriak ('0 is OK' placeholderek) novekedese figyelmeztetes, ami ezt a fajlt frissitendove teszi.",
   "categories": {
     "identity": {
       "files": 10,
-      "bytes": 138236
+      "bytes": 139831
     },
     "neo_file_memory": {
-      "files": 6,
-      "bytes": 6467
+      "files": 7,
+      "bytes": 7752
     },
     "agent_memory_placeholder": {
       "files": 3,
       "bytes": 0
     },
     "mrwolfe_home_memory": {
-      "files": 65,
-      "bytes": 187674
+      "files": 74,
+      "bytes": 215921
     },
     "repo_agent_memory": {
-      "files": 54,
-      "bytes": 185028
+      "files": 65,
+      "bytes": 234589
     },
     "scattered_memory_dirs": {
-      "files": 90,
-      "bytes": 248829
+      "files": 104,
+      "bytes": 306665
     },
     "skills": {
-      "files": 182,
-      "bytes": 2574746
+      "files": 189,
+      "bytes": 2709567
     },
     "subagent_defs": {
-      "files": 4,
-      "bytes": 34933
+      "files": 5,
+      "bytes": 58298
     },
     "slash_commands": {
-      "files": 2,
-      "bytes": 2226
+      "files": 3,
+      "bytes": 3405
     },
     "scheduled_tasks": {
       "files": 52,
-      "bytes": 73404
+      "bytes": 77126
     },
     "mcp_config": {
       "files": 5,
-      "bytes": 11745
+      "bytes": 12730
     },
     "projects": {
-      "files": 1219,
-      "bytes": 156070546
+      "files": 1422,
+      "bytes": 162991804
     },
     "baseline_state": {
       "files": 1,
-      "bytes": 2593
+      "bytes": 2637
     },
     "self_script": {
       "files": 3,
-      "bytes": 69326
+      "bytes": 76388
     }
   },
   "db_tables": [
     "agent_messages",
+    "alert_claims",
     "background_tasks",
     "config_change_log",
     "conversation_log",
@@ -100,12 +101,13 @@
     "vault_ssh_servers"
   ],
   "db_row_counts": {
-    "memories": 904,
-    "daily_logs": 515,
-    "kanban_cards": 158,
-    "kanban_comments": 648,
+    "memories": 951,
+    "daily_logs": 614,
+    "kanban_cards": 182,
+    "kanban_comments": 746,
     "kanban_card_labels": 0,
     "labels": 0,
-    "config_change_log": 47
+    "config_change_log": 62,
+    "alert_claims": 0
   }
 }

@@ -112,6 +112,10 @@ EXPORT_TABLES = (
     "kanban_card_labels",
     "labels",
     "config_change_log",
+    # alerting governance dedup/lease table (card 8cacdfa1, wolfe 2026-08-01):
+    # was schema-drift + unbacked-up. Operational metadata only (signal_id,
+    # item_key, claimed_by, timestamps) -- no secret-bearing column.
+    "alert_claims",
 )
 TABLE_ALLOWLIST = frozenset(EXPORT_TABLES)
 
