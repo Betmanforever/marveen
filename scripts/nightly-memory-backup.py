@@ -166,6 +166,11 @@ PROJECTS_PENDING_GABOR = (
     f"{PROJECTS_ROOT}/zenom/confidential",
     f"{PROJECTS_ROOT}/legal-share-exit",
 )
+# AC-A3 (audit 2026-07-31): d_projects prunes by a NAME list, and a name list
+# misses new dependency trees (the .venv-crossval lesson). If the projects
+# payload grows past the baseline by more than this fraction, warn -- a silent
+# 3x growth is how an unpruned node_modules-shaped tree sneaks offsite.
+PROJECTS_DRIFT_MARGIN = 0.20
 
 
 class BackupError(Exception):
@@ -776,6 +781,24 @@ def verify_archive(archive_path, expected_members):
     return len(members)
 
 
+def assert_pending_excluded_absent(archive_path):
+    """AC-A1 (audit 2026-07-31): a STANDING assertion that the Gabor-pending
+    directories never reach the archive, independent of the discovery-time
+    pruning in d_projects. Defense in depth: the pruning keeps them out, this
+    proves they stayed out by reading the built tar back. A single decoy file
+    under either tree must fail the run before anything is uploaded."""
+    prefixes = tuple(stage_rel(os.path.realpath(p)) + "/" for p in PROJECTS_PENDING_GABOR)
+    with tarfile.open(archive_path, "r:gz") as tar:
+        leaked = [m.name for m in tar.getmembers()
+                  if any(m.name.startswith(pre) for pre in prefixes)]
+    if leaked:
+        raise BackupError(
+            f"AC-A1 megsertve: Gabor-dontesre varo, KIZART fa tagjai kerultek az "
+            f"archivumba ({len(leaked)} db, pl. {leaked[0]}) -- a futas leall, semmi "
+            "nem toltodik fel. Ellenorizd a d_projects pruning-logikat es a "
+            "PROJECTS_PENDING_GABOR listat.")
+
+
 def sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -1012,6 +1035,24 @@ def run_nightly(dry_run):
     if unknown:
         raise BackupError(f"ismeretlen kategoria a baseline-ban: {unknown} -- a baseline "
                           "elavult, futtasd: --update-baseline (tudatos lepes)")
+
+    # AC-A3: projects drift guard. Warn (never fail) if the projects payload
+    # outgrew the baseline past the margin -- a growing tree that name-based
+    # pruning did not catch. Printed in the manifest and the summary.
+    projects_drift = None
+    proj_cur, proj_ref = stats.get("projects"), base_cats.get("projects")
+    if proj_cur and proj_ref:
+        thr = 1 + PROJECTS_DRIFT_MARGIN
+        f_over = proj_ref["files"] > 0 and proj_cur["files"] > proj_ref["files"] * thr
+        b_over = proj_ref["bytes"] > 0 and proj_cur["bytes"] > proj_ref["bytes"] * thr
+        if f_over or b_over:
+            projects_drift = (
+                f"projects: {proj_cur['files']} fajl / {human(proj_cur['bytes'])} "
+                f"(baseline {proj_ref['files']} fajl / {human(proj_ref['bytes'])}, "
+                f"kuszob +{int(PROJECTS_DRIFT_MARGIN*100)}%) -- lehet uj, nem-pruned fa; "
+                "ellenorizd, majd --update-baseline ha jogos")
+            log(f"  FIGYELEM (AC-A3): {projects_drift}")
+
     staged, excluded = stage_raw_files(found, payload_dir)
     log(f"nyers fajlok stagelve: {staged} (denylist-kizaras: {len(excluded)})")
 
@@ -1052,6 +1093,7 @@ def run_nightly(dry_run):
         "quarantine_keyword_hits": soft,
         "baseline_created_at": baseline.get("created_at"),
         "git_bundle": bundle_info,
+        "projects_drift": projects_drift,
     }
     with open(f"{payload_dir}/BACKUP-INFO.json", "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
@@ -1061,6 +1103,7 @@ def run_nightly(dry_run):
     archive_path = os.path.join(night_dir, archive_name)
     member_count = build_archive(payload_dir, archive_path)
     verify_archive(archive_path, member_count)
+    assert_pending_excluded_absent(archive_path)  # AC-A1 standing assertion
     archive_size = os.path.getsize(archive_path)
     digest = sha256_file(archive_path)
     log(f"archivum: {archive_name} {human(archive_size)}, {member_count} fajl, "
@@ -1124,6 +1167,8 @@ def run_nightly(dry_run):
                f"Karanten (kulcsszo-emlites, emberi atnezesre): {soft_total}\n"
                f"Lokalis prune: daily -{len(pruned_daily)}, monthly -{len(pruned_monthly)}\n"
                f"Drive prune: {drive_prune_note}")
+    if projects_drift:
+        summary += f"\nFIGYELEM (AC-A3) projects-drift: {projects_drift}"
     if table_drift:
         summary += f"\nFIGYELEM tabla-drift a baseline ota: {', '.join(table_drift)}"
     if grown:
@@ -1155,6 +1200,25 @@ def render_manifest(info, archive_name, archive_size, digest, member_count, stag
         "SQL TABLAK (allowlist, sorszam a konzisztens pillanatkepbol):",
     ]
     lines += [f"  {t:24} {n:6} sor" for t, n in info["db_row_counts"].items()]
+    # AC-C4 (audit 2026-07-31): a restorer must not have to INFER that the
+    # schema holds more tables than the export carries. List the tables that
+    # exist in the snapshot but are deliberately NOT exported (excluding the
+    # sqlite_* internals and the FTS5 shadow tables, which carry no independent
+    # data). Their row data is lost on host death -- that is an explicit,
+    # accepted scope decision, stated here rather than left silent.
+    exported = set(info["db_row_counts"])
+    fts = tuple(info.get("fts_tables", []))
+    not_exported = [t for t in info.get("db_tables_in_schema", [])
+                    if t not in exported and not t.startswith("sqlite_")
+                    and not any(t == f or t.startswith(f + "_") for f in fts)]
+    lines += ["", "NEM EXPORTALT SQL TABLAK (a semaban leteznek, a payload NEM viszi -- "
+                  "host-vesztes eseten a sordata elvesz, tudatosan vallalt hatokor):"]
+    if not_exported:
+        lines += [f"  {t}" for t in not_exported]
+        lines += [f"  ({len(not_exported)} tabla; a sema-DDL viszont mindegyikuket rogzitti, "
+                  "ures szerkezet visszaallithato)"]
+    else:
+        lines += ["  nincs (minden nem-belso tabla exportalva)"]
     lines += ["", "SEMA-DDL:",
               f"  megtartva: {len(info['ddl_objects'])} objektum",
               f"  kiszurve:  {len(info['ddl_skipped'])} (FTS5 shadow + sqlite_* belso)",
@@ -1195,6 +1259,8 @@ def render_manifest(info, archive_name, archive_size, digest, member_count, stag
         if len(hits) > 10:
             lines.append(f"      ... es meg {len(hits) - 10} fajl")
 
+    if info.get("projects_drift"):
+        lines += ["", f"FIGYELEM (AC-A3) projects-drift: {info['projects_drift']}"]
     if table_drift:
         lines += ["", f"TABLA-DRIFT a baseline ota: {', '.join(table_drift)}"]
     if grown:
