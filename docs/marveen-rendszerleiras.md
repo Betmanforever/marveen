@@ -1,6 +1,6 @@
 # Marveen rendszerleírás
 
-**Verzió:** 1.8 (v1.0-1.7: 2026-07-30 14:45-16:40; v1.8: 17:00, a horgony-szabály: a koordinátor javasoljon mechanizmust, de jelölje meg horgonyként)
+**Verzió:** 1.11 (v1.0-1.7: 2026-07-30 14:45-16:40; v1.8: 17:00, horgony-szabály; v1.9: 2026-07-31, linguist-kapu; v1.10: 2026-08-01, preCheck 8.1 szakasz + PUT-mérés javítás + neo néma-Sonnet eset; v1.11: 2026-08-01 12:05, startup-modell-kapu fix + token-rotáció)
 **Készítette:** mr-wolfe, 2026-07-30
 **Megrendelés:** Szabó Gábor, 2026-07-30: "wolfe must prepare a system description document that will be archived and any system change should be logged there."
 **Archívum helye:** zenom Drive (`zenom@zenom.hu`), `Marveen Backups` mellett
@@ -39,7 +39,9 @@ Az emberi kommunikáció **kizárólag Telegramon** megy, és **kizárólag mr-w
 | `alex` | CMO, marketing, tartalom | `claude-opus-5` | hook |
 | `charlie` | CFO, pénzügy, unit economics | `claude-opus-5` | hook |
 
-Alárendelt szakágensek (a fő ágensek hívják be): `auditor`, `skill-writer`, `devils-advocate`, `hard-coder`, `Explore`, `Plan`.
+Alárendelt szakágensek (a fő ágensek hívják be): `auditor`, `skill-writer`, `devils-advocate`, `hard-coder`, `linguist`, `Explore`, `Plan`.
+
+A `linguist` (2026-07-31 óta, Gábor specifikációjából) a flotta főszerkesztője és a human-facing szövegek kötelező, kiadás előtti minőségi kapuja: `signoff: true` nélkül érdemi, embernek szóló anyag nem megy ki. Hatókör, brief-sablon és tesztek: `docs/linguist-agent.md`. A dashboard-agentek a review-t mr-wolfe-on keresztül kérik (subagentet csak a fő ágens tud indítani).
 
 ### 2.1 A modell-feloldás topológiája, és egy csapda
 
@@ -217,7 +219,24 @@ Fájl-alapú: `~/.claude/scheduled-tasks/<név>/` alatt `SKILL.md` plusz `task-c
 
 Két típus: `task` mindig szól az eredménnyel, `heartbeat` csak fontos vagy sürgős esetben.
 
-Létrehozás és módosítás a `POST /api/schedules` végponton, illetve a `task-config.json` közvetlen írásával. `[MÉRT]` `PUT` végpont a módosításra **nincs**. A `scheduled_tasks` SQLite táblát nem szabad használni.
+Létrehozás a `POST /api/schedules` végponton. `[MÉRT 2026-08-01]` Módosításra a `PUT /api/schedules/<név>` végpont **működik** és merge-el: csak a küldött mezőket írja felül, a többit (prompt, schedule, agent) megőrzi. (A korábbi "`PUT` végpont nincs" mérés elavult; a mai `preCheck`-élesítés ezen az úton ment, `{"ok":true}` válasszal és visszaolvasással verifikálva.) A `scheduled_tasks` SQLite táblát nem szabad használni. **Governance:** a `/api/schedules` írást a self-pace gate sub-agentként blokkolja; sub-agent a payloadot fájlba készíti elő, a PUT-ot mr-wolfe vagy Gábor futtatja.
+
+### 8.1 Pre-check: determinisztikus kapu az LLM-kör előtt
+
+`[MÉRT 2026-08-01, forrás: neo technikai dokumentációja + élesítési verifikáció]` Bármely ütemezett feladat `task-config.json`-ja felvehet egy `preCheck` mezőt: egy olcsó szkriptet (fájlnév a task saját könyvtárához képest, vagy abszolút út), amit a runner a tick pillanatában, az LLM meghívása **előtt** futtat (`bash <path>`, `spawnSync`, 10 mp timeout). Célja, hogy a "csendes kör, nincs teendő" mintájú heartbeat-ek ne indítsanak teljes LLM-kört.
+
+A protokoll a stdout és az exit-kód kombinációja:
+
+| Exit | Stdout | Eredmény |
+|---|---|---|
+| 0 | pontosan `SKIP` | az LLM-kör teljesen kimarad, nulla token |
+| 0 | nem üres, nem `SKIP` | az LLM fut, a stdout a prompt elé kerül `[Pre-check eredmeny]` prefixként |
+| 0 | üres | az LLM fut a változatlan prompttal |
+| nem 0, vagy a szkript hiányzik | bármi | **fail-open**: warning a logba, az LLM fut -- hibás szkript soha nem némítja el a heartbeatet |
+
+Élő példa a `pending-uzenet-watchdog` (2026-08-01 09:18 óta): a precheck ugyanazt az SQL-feltételt futtatja a scheduler szintjén, amit korábban a heartbeat promptja LLM-en belül; üres eredménynél `SKIP`, találatnál a sorok listája megy a teljes, változatlan diagnózis-remediációs prompt elé. Nem kell dashboard-restart: a runner minden tickben frissen olvassa a `task-config.json`-t.
+
+**Elvi korlát:** precheck-et csak determinisztikusan kiértékelhető feltétel kaphat (SQL, fájl-létezés, exit-kód). Szemantikai ítéletet igénylő kört (`memoria-heartbeat`, `folyamatos-ellenorzes`: "volt-e komplex munka", "kér-e döntést egy pane") tudatosan **nem** gate-elünk full-skip-re -- egy rosszul írt skip pont azt a biztonsági hálót némítaná el, amiért a kör létezik (döntés: 2026-08-01, `09020484` kártya).
 
 ---
 
@@ -335,6 +354,10 @@ Minden rendszerváltozás ide kerül. Formátum: dátum, mi változott, miért, 
 
 | Dátum | Változás | Miért | Ki | Visszaállítás |
 |---|---|---|---|---|
+| 2026-08-01 12:05 | Scheduler startup-modell-kapu (`4f0fe81`): a fix 180 mp grace kiegészült a channel cold-start hold jellel, 15 perces hard-cappel; dashboard boot-URL bearer tokenje redirect alá maszkolva; a token rotálva (a korábban exponált érték élesben 401) | A délelőtti néma-Sonnet eset gyökérok-fixe: túlterhelt-host cold-start alatt a kapu lejárt, és a scheduler-injektálás erősítette meg a rossz defaultot; a log-fejléc nyers tokent írt minden olvasó transzkriptjébe | neo, GO és verifikáció mr-wolfe | `git revert 4f0fe81` + build + restart; a token-rotáció nem visszaállítandó |
+| 2026-08-01 | `preCheck` mechanizmus dokumentálva (8.1 szakasz) és élesítve a `pending-uzenet-watchdog`-on; a 8.§ `PUT /api/schedules` mérése javítva ("nincs" → működik, merge-el) | Havi token-review P1 tétele: a watchdog a júliusi neo-hívások ~44%-át adta üres körként; Gábor direktívája: a szkript-vonal folytatódik és dokumentálandó | szkript+doksi neo, élesítés és beemelés mr-wolfe | `PUT /api/schedules/pending-uzenet-watchdog` üres `preCheck`-kel; a 8.1 szakasz törlése |
+| 2026-08-01 | Neo délelőtti sessionje némán Sonnet 5-ön futott (restart-dialógus default megerősítve, 205 rekord, 08:40-11:40); 11:56-kor interaktív `/model`-lel visszaállítva Fable 5-re | A 2.4 szakasz figyelője ezt az utat nem fogta meg a `f3febf3a` fix után sem; a token_usage-drift leplezte le | észlelés+helyreállítás mr-wolfe, gyökérok-vizsgálat neo (`f3febf3a` kommenten) | nem visszaállítandó; a tanulság a 2.4 szakaszt erősíti |
+| 2026-07-31 | Linguist subagent: `.claude/agents/linguist.md`, `docs/linguist-agent.md`, `/linguist` parancs, CLAUDE.md kapu-szekció, 2.§ ágenslista bővítés | Gábor 14. pontja (2026-07-31): kötelező szerkesztői kapu minden human-facing anyagra; implementációs audit PASS WITH CONDITIONS, a rések aznap javítva | mr-wolfe, audit: auditor subagent | a négy fájl törlése/visszaállítása gitből; a kapu kivezetését a flottának is jelezni kell |
 | 2026-07-30 | Éjszakai szünet 22:00 és 06:00 között: 4 cron feladat, 4 systemd időzítő, `auto-restart.json` napi időpontok | Gábor állandó szabálya | mr-wolfe | `.bak-nightpause` fájlok a unitok mellett, cron a `task-config.json` `notes` mezőjében dokumentálva |
 | 2026-07-30 | Közös `src/quiet-hours.ts` modul, 3 értesítési út alá vonva, `QUIET_START_HOUR` 23-ról 22-re | Ugyanaz; a `reauth-healer` 1 órát tévedett, a `heartbeat` alsó határ nélkül volt, a `channel-monitor` kapu nélkül | neo (hard-coder), review neo, élesítés mr-wolfe | `git revert fbd24eb`, majd build és restart |
 | 2026-07-30 | `src/web/token-usage.ts`: `discoverAgentSources()` scoped ágens-könyvtárakat is olvas | 22 nap sub-ágens telemetria hiányzott | neo | `git revert 7233914` |

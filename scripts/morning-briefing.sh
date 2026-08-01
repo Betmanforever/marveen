@@ -11,7 +11,10 @@ LOG="$INSTALL_DIR/store/morning.log"
 
 # Load config
 if [ -f "$INSTALL_DIR/.env" ]; then
-  export $(grep -v '^#' "$INSTALL_DIR/.env" | xargs)
+  while IFS='=' read -r key value; do
+    case "$key" in ''|\#*) continue ;; esac
+    export "$key=$value"
+  done < "$INSTALL_DIR/.env"
 fi
 
 CHAT_ID="${ALLOWED_CHAT_ID:-0}"
