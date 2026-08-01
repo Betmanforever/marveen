@@ -571,6 +571,49 @@ export function decideMidSessionDriftAction(f: MidSessionDriftFacts): MidSession
   return { kind: 'alert', measured: f.streak.model }
 }
 
+export type StartupModelGateVerdict = 'verified' | 'unverified' | 'not-applicable'
+
+export interface StartupModelGateFacts {
+  /** Session age in seconds (now - transcript source since). */
+  ageSec: number
+  /** Base grace window: below this a rows-less session always holds. */
+  graceSec: number
+  /** Absolute ceiling: past this the gate opens no matter what. */
+  hardCapSec: number
+  /** deriveMeasuredModel() over the boot rows; null while no rows landed. */
+  measured: string | null
+  configured: string
+  /**
+   * Lazy channel cold-start hold probe (channelColdStartHoldActive). Thunk so
+   * the tmux/ps shell-outs only run on the one branch that needs them.
+   */
+  coldStartHold: () => boolean
+}
+
+/**
+ * Pure verdict for the scheduler's session-start model gate (f3febf3a).
+ *
+ * The 2026-08-01 incident: an overloaded host (load1 ~23 on 8 cores)
+ * stretched a respawned agent's plugin init past the old fixed 180s grace,
+ * the gate expired with ZERO assistant rows ever measured, and the first
+ * scheduled injection's Enter confirmed a wrong-model startup dialog -- the
+ * whole morning ran on the fallback model unnoticed. Fix: past the base
+ * grace a rows-less session keeps holding WHILE the channel cold-start hold
+ * is provably active (no bun poller, no .in_use marker), bounded by a hard
+ * cap aligned with the wedged-claude ceiling so a session that never comes
+ * up cannot starve its scheduled work forever.
+ */
+export function decideStartupModelGate(f: StartupModelGateFacts): StartupModelGateVerdict {
+  if (f.ageSec > f.hardCapSec) return 'not-applicable'
+  if (f.measured) {
+    return normalizeModelId(f.measured) === normalizeModelId(f.configured)
+      ? 'verified'
+      : 'unverified'
+  }
+  if (f.ageSec <= f.graceSec) return 'unverified'
+  return f.coldStartHold() ? 'unverified' : 'not-applicable'
+}
+
 // The fleet's nightly pause: 22:00-06:00 in the host's local timezone
 // (Europe/Budapest on this install). A REVERT costs a session restart and is
 // never urgent -- the agent is working fine on the fallback model -- so it is

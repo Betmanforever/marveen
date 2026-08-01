@@ -25,6 +25,7 @@ import {
   capturePane,
   getAgentRunningSince,
   getSessionCreatedAt,
+  channelColdStartHoldActive,
   FLEET_OAUTH_TOKEN_PATH,
   hasFleetOauthToken,
 } from './agent-process.js'
@@ -38,6 +39,7 @@ import {
   detectsUnrecognizedApiError, sanitizeFailureSnippet, isQuietHour,
   deriveMeasuredModel, advanceDriftStreak, decideDriftAction,
   decideMidSessionDriftAction, normalizeModelId,
+  decideStartupModelGate, type StartupModelGateVerdict,
   DRIFT_SAMPLE_ROWS, MIN_MIDSESSION_DRIFT_SWEEPS, type ModelDriftStreak,
 } from '../model-fallback.js'
 import { logConfigChange, createAgentMessage } from '../db.js'
@@ -574,29 +576,28 @@ function checkMidSessionDrift(
 // How long after a session's start the scheduler holds work back while the
 // model is unconfirmed. Sized to the detector above: first rows land with the
 // first turn, the startup burst + 60s sweeps need ~2 sightings, and the
-// correction restart resolves inside ~3 minutes. Past this age the gate opens
-// unconditionally -- the drift machinery owns the problem from here, and a
-// session that never verifies (e.g. one that never got a first prompt) must
-// not starve its scheduled work forever.
+// correction restart resolves inside ~3 minutes. Past this age a rows-less
+// session only keeps holding while the channel cold-start hold is provably
+// active (see decideStartupModelGate) -- the 2026-08-01 incident showed a
+// fixed expiry alone opens the gate mid-cold-start on an overloaded host.
 const STARTUP_MODEL_CHECK_GRACE_SEC = 180
+// Absolute ceiling for the gate, aligned with CHANNEL_INIT_PENDING_MAX_MS
+// (the wedged-claude ceiling): a session that never verifies past this must
+// not starve its scheduled work forever.
+const STARTUP_MODEL_CHECK_HARD_CAP_SEC = 900
 
-export type StartupModelCheck = 'verified' | 'unverified' | 'not-applicable'
+export type StartupModelCheck = StartupModelGateVerdict
 
 /**
- * Session-start model gate for the schedule runner (card b0c90a8a, audit M2):
- * in the incident the scheduler injected a task 9 seconds after boot and the
- * fleet went back to work without knowing what it was running on. A YOUNG
- * session whose boot rows do not yet confirm the configured model reads
- * 'unverified' -- the scheduler defers via its pending-retry queue and the
- * next tick re-checks. 'not-applicable' means the gate has nothing to say
- * (session past the grace window, remote host, no session): deliver normally.
- *
- * Deliberately time-bounded: a fresh session produces NO assistant rows until
- * its first prompt, so an unconditional "verify first" gate would deadlock a
- * session whose only input source is the scheduler itself. Worst case under
- * the bound: delivery slips by the grace window, then the boot-drift
- * corrector fixes any wrong model within ~2 sweeps of the rows that first
- * delivery produces -- while the context is still essentially empty.
+ * Session-start model gate for the schedule runner (card b0c90a8a, audit M2;
+ * hold-extension f3febf3a 2026-08-01): in the original incident the scheduler
+ * injected a task 9 seconds after boot and the fleet went back to work without
+ * knowing what it was running on. A YOUNG session whose boot rows do not yet
+ * confirm the configured model reads 'unverified' -- the scheduler defers via
+ * its pending-retry queue and the next tick re-checks. 'not-applicable' means
+ * the gate has nothing to say (past the hard cap, remote host, no session):
+ * deliver normally. Verdict logic is pure (decideStartupModelGate); this
+ * wrapper only gathers the facts.
  */
 export function startupModelCheck(name: string): StartupModelCheck {
   try {
@@ -604,13 +605,16 @@ export function startupModelCheck(name: string): StartupModelCheck {
     const src = transcriptSourceFor(name)
     if (src.since === null) return 'not-applicable'
     const ageSec = Date.now() / 1000 - src.since
-    if (ageSec > STARTUP_MODEL_CHECK_GRACE_SEC) return 'not-applicable'
+    if (ageSec > STARTUP_MODEL_CHECK_HARD_CAP_SEC) return 'not-applicable'
     const sample = readBootModelSample(src.workingDir, src.since, src.configDir, DRIFT_SAMPLE_ROWS)
-    const measured = deriveMeasuredModel(sample.bootModels)
-    if (!measured) return 'unverified'
-    return normalizeModelId(measured) === normalizeModelId(readModelFor(name))
-      ? 'verified'
-      : 'unverified'
+    return decideStartupModelGate({
+      ageSec,
+      graceSec: STARTUP_MODEL_CHECK_GRACE_SEC,
+      hardCapSec: STARTUP_MODEL_CHECK_HARD_CAP_SEC,
+      measured: deriveMeasuredModel(sample.bootModels),
+      configured: readModelFor(name),
+      coldStartHold: () => channelColdStartHoldActive(name),
+    })
   } catch {
     // A broken measurement must never block the scheduler outright.
     return 'not-applicable'
