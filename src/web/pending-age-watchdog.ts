@@ -47,6 +47,10 @@ export interface DigestAppend {
 export interface WatchdogDeps {
   nowMs: number
   pending: PendingRow[]
+  /** The coordinator's agent id. When every stalled target IS the coordinator,
+   * the coordinator-flag rung is undeliverable by definition and the ladder
+   * switches to self-heal (see the catch-22 branch below). */
+  coordinatorAgentId: string
   /** Which session name a target agent's pane lives under (identity for the
    * progress tracker, so two agents never share a hash history). */
   sessionFor(agent: string): string
@@ -62,6 +66,10 @@ export interface WatchdogDeps {
   /** Owner-facing Telegram. Rate-ceilinged + quiet-hours-buffered by the
    * caller (channel-monitor.sendAlert). */
   sendOwner(text: string): void
+  /** Preserve the coordinator's parked input, then restart its channels
+   * session. Returns true when the restart was actually initiated. Only ever
+   * called from the catch-22 branch (every stalled target IS the coordinator). */
+  selfHealCoordinator(): boolean
   appendDigest(entry: DigestAppend): void
   /** Emit-dedup gate shared with the other emitters (alert-policy claimEmit). */
   claimEmit(kind: string, key: string, dedupMs: number): boolean
@@ -72,7 +80,7 @@ export interface WatchdogOutcome {
   overThreshold: number
   /** ... of which the target pane is stalled (the alert-worthy set). */
   stalled: number
-  routes: Array<'coordinator' | 'user-telegram' | 'digest' | 'log-only'>
+  routes: Array<'coordinator' | 'user-telegram' | 'digest' | 'log-only' | 'self-heal'>
 }
 
 export const SIGNAL_ID = 'queue-starving'
@@ -102,6 +110,10 @@ export const BOOT_GRACE_MS = 5 * 60 * 1000
 export const COORDINATOR_GRACE_MS = 10 * 60 * 1000
 // Re-flag the coordinator about a still-stuck episode at most this often.
 export const COORDINATOR_REFLAG_MS = 30 * 60 * 1000
+// Minimum spacing between two self-heal restarts of the coordinator session. A
+// restart is heavier than a flag, so it gets at least the re-flag cadence: a
+// self-heal that did not take must never turn into a restart loop.
+export const SELF_HEAL_DEDUP_MS = COORDINATOR_REFLAG_MS
 
 interface EpisodeState {
   escalation: DialogEscalationState
@@ -273,6 +285,46 @@ export function runPendingAgeWatchdog(deps: WatchdogDeps): WatchdogOutcome {
     outcome.routes.push('digest')
     return outcome
   }
+
+  // CATCH-22 (2026-08-01 incident, card 919b96a8): every stalled target IS the
+  // coordinator. The coordinator-flag rung would then enqueue a message INTO the
+  // stuck queue addressed to the agent that is stuck -- undeliverable by
+  // definition -- and 10 minutes later the unanswered grace expires and the
+  // OWNER is paged about a purely internal wedge (2026-08-01 13:21, Gabor msg
+  // 4251: never). Skip that rung and self-heal instead. The escalation machine
+  // is deliberately NOT committed here, so an episode that later involves a real
+  // sub-agent target still gets its full ladder.
+  if (stuck.every((x) => x.m.to_agent === deps.coordinatorAgentId)) {
+    if (deps.claimEmit(SIGNAL_ID, `self-heal:${setKey}`, SELF_HEAL_DEDUP_MS)) {
+      logger.error(
+        { stuck: stuck.length, oldestMin, coordinator: sanitizeAgentIdent(deps.coordinatorAgentId) },
+        'Inter-agent queue starving and every stalled target IS the coordinator -- self-healing (no coordinator flag, no owner ping)',
+      )
+      const healed = deps.selfHealCoordinator()
+      deps.appendDigest({
+        category: healed ? 'auto-fixed' : 'open',
+        source: SIGNAL_ID,
+        summary: healed
+          ? `${stuck.length} uzenet allt a koordinator elott (legregebbi ${oldestMin}p), a panelje nem mozdult: parkolt input elmentve, session ujrainditva. Erintett: ${list}`
+          : `${stuck.length} uzenet all a koordinator elott (legregebbi ${oldestMin}p) es az automatikus ujrainditas NEM indult el. Erintett: ${list}`,
+      })
+      outcome.routes.push('self-heal')
+    } else if (deps.claimEmit(SIGNAL_ID, `self-heal-open:${setKey}`, COORDINATOR_REFLAG_MS)) {
+      // Still stuck sweeps after a self-heal already ran. It goes on the record
+      // as an OPEN digest item -- never an owner ping, and never a second
+      // restart inside the dedup window.
+      deps.appendDigest({
+        category: 'open',
+        source: SIGNAL_ID,
+        summary: `${stuck.length} uzenet tovabbra is all a koordinator elott (legregebbi ${oldestMin}p) az automatikus ujrainditas utan is. Erintett: ${list}`,
+      })
+      outcome.routes.push('digest')
+    } else {
+      outcome.routes.push('log-only')
+    }
+    return outcome
+  }
+
   episode.escalation = esc.next
 
   if (esc.action === 'notify-wolfe') {

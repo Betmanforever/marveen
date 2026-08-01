@@ -68,11 +68,14 @@ describe('channel-monitor: context-budget escalation (coordinator-first, recomme
     // from = t.agentName, to = MAIN_AGENT_ID (decision-flag.py convention).
     expect(region).toContain('createAgentMessage(t.agentName, MAIN_AGENT_ID, buildContextBudgetCoordinatorFlag(t.agentName))')
     expect(region).toContain('if (!t.isMarveen && t.agentName) {')
-    // A router enqueue failure must not silently drop the escalation.
-    expect(region).toContain('sendAlert(buildContextBudgetOwnerFallback(label))')
+    // A router enqueue failure must not silently drop the finding -- but it is
+    // internal ops state, so it lands in the digest, never an owner ping
+    // (card 919b96a8 doctrine).
+    expect(region).toContain('recordInternalOpsFinding(CONTEXT_BUDGET_SOURCE, buildContextBudgetOwnerFallback(label))')
+    expect(region).not.toContain('sendAlert(buildContextBudgetOwnerFallback')
   })
 
-  it('the main channels session gets a deduped owner heads-up on context-LOW only, never a self-flag', () => {
+  it('the main channels session gets a deduped digest finding on context-LOW only, never a self-flag', () => {
     const region = contextBudgetRegion()
     // Isolate the main branch by its unique banner comment (the sub-agent branch
     // has its own `} else {` for the !signal reset, so a bare indexOf would
@@ -135,13 +138,17 @@ describe('channel-monitor: in-process pending-age watchdog (I/O wiring only)', (
   // replayable with injected senders, so it now lives in pending-age-watchdog.ts
   // (behavioural tests: pending-age-watchdog.test.ts). What must stay true HERE
   // is the wiring: the queue is read directly, and both transports are supplied.
-  it('reads the queue directly and injects both transports into the watchdog', () => {
+  it('reads the queue directly and injects every transport into the watchdog', () => {
     const region = pendingWatchdogRegion()
     expect(region).toContain('getPendingMessages()')
     expect(region).toContain('runPendingAgeWatchdog(')
-    // Coordinator leg (routine findings) AND the independent owner leg.
+    // Coordinator leg (routine findings), the independent owner leg -- FATAL
+    // class since 3f6c8457, because suppressing THIS one is the silence risk --
+    // and, since card 919b96a8, the self-heal leg for the catch-22 shape where
+    // the stalled target IS the coordinator and no flag can reach it.
     expect(region).toContain('createAgentMessage')
-    expect(region).toContain('sendAlert(text)')
+    expect(region).toContain('sendAlert(text, { fatal: true })')
+    expect(region).toContain('selfHealCoordinator:')
     // Claim table wiring (AC-4): the shared "someone already owns this" ledger.
     expect(region).toContain('claimAlertItem(')
     expect(region).toContain('getLiveAlertClaim(')

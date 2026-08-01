@@ -15,6 +15,7 @@ import {
   clearInputBuffer,
   dismissResumeSummaryModalIfPresent,
   isAgentRunning,
+  saveParkedInputRollback,
   sendPromptToSession,
   startAgentProcess,
   stopAgentProcess,
@@ -438,8 +439,18 @@ const paneDialogEscalation: Map<string, DialogEscalationState> = new Map()
 // Phase-1 dedup: re-flag the coordinator for the SAME persisting dialog at most
 // this often (the 5-min menu dedup would otherwise emit ~12 flags/hour).
 const DIALOG_ESCALATE_DEDUP_MS = 30 * 60 * 1000
-// Grace after the coordinator is flagged before the direct owner fallback fires.
+// Grace after the coordinator is flagged before the terminal rung fires. Since
+// card 919b96a8 that rung is a digest 'open' item, not an owner alert -- see
+// recordInternalOpsFinding.
 const DIALOG_WOLFE_GRACE_MS = 6 * 60 * 1000
+
+// Digest `source` ids for the three internal-operations controls whose terminal
+// rung was downgraded from an owner alert to a digest 'open' item (card
+// 919b96a8). Stable strings: the daily digest groups and dedups on them.
+const PERMISSION_DIALOG_SOURCE = 'permission-dialog'
+const THINKING_BLOCK_SOURCE = 'thinking-block-wedge'
+const MODEL_CREDIT_SOURCE = 'model-credit-gate'
+const CONTEXT_BUDGET_SOURCE = 'context-budget'
 
 // Second call-site for the SAME two-phase escalation: the thinking-block wedge
 // (see the pane-level error pass). Kept in its OWN map so it can never cross-
@@ -1119,6 +1130,56 @@ export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
   return { ok: false, error: 'hard restart failed: tmux respawn-pane failed' }
 }
 
+/**
+ * Self-heal the coordinator's own channels session (card 919b96a8, catch-22).
+ *
+ * Called ONLY by the pending-age watchdog, and only when every stalled target of
+ * the inter-agent queue IS the coordinator -- the one shape where the normal
+ * "flag the coordinator" rung is undeliverable by construction, because the flag
+ * would be enqueued into the stuck queue addressed to the stuck agent. Before
+ * card 919b96a8 that ladder ran deterministically to an owner ping about a
+ * purely internal wedge; now it runs to here.
+ *
+ * Two steps, in this order (preserve-before-clearing):
+ *   1. PRESERVE the coordinator's pane to a rollback file. The restart discards
+ *      the input box, and a parked line there can be a real half-written reply --
+ *      the 2026-06-30 near-miss is why the janitor never auto-clears this box in
+ *      the first place. The WHOLE capture is written, not just the extracted
+ *      parked text: parkedInputText only reports on a 'typing' pane, and a box
+ *      holding a `[Pasted text #N]` stub reads 'busy', so gating the preserve on
+ *      it would silently destroy exactly the shape that wedges the pane.
+ *   2. RESTART via resumeMarveenSession() -- `tmux respawn-pane -k --continue`.
+ *      Deliberately NOT hardRestartMarveenChannels() (that respawns FRESH and
+ *      drops the conversation) and emphatically NOT `systemctl --user restart`
+ *      (the channels unit runs KillMode=control-group and owns the shared tmux
+ *      server, so bouncing it kills EVERY agent session -- see the comment in
+ *      hardRestartMarveenChannels). --continue keeps the conversation, which is
+ *      the whole point: the wedge is a stuck input box, not a corrupt session.
+ *
+ * Returns true when the restart was initiated. The watchdog turns a false into a
+ * digest 'open' item -- never an owner ping -- and its own dedup keeps this from
+ * becoming a restart loop.
+ */
+function selfHealCoordinatorSession(): boolean {
+  // Dim-stripped view first (the same DIM-GUARD clearStaleParkedInput uses), so
+  // a ghost autocomplete hint is not preserved as if it were real input.
+  const pane = captureParkedInputView(MAIN_CHANNELS_SESSION) ?? capturePane(MAIN_CHANNELS_SESSION)
+  const parked = pane != null ? parkedInputText(pane) : null
+  const rollback = pane != null
+    ? saveParkedInputRollback(MAIN_CHANNELS_SESSION, pane, parked ?? '(no parked input extracted -- see the pane capture below)')
+    : null
+  logger.error(
+    { session: MAIN_CHANNELS_SESSION, hadParkedInput: parked != null, rollback },
+    'Coordinator is the stalled target of its own queue -- self-healing with a --continue respawn (no owner ping)',
+  )
+  try {
+    return resumeMarveenSession()
+  } catch (err) {
+    logger.error({ err, session: MAIN_CHANNELS_SESSION }, 'Coordinator self-heal respawn threw')
+    return false
+  }
+}
+
 // Escalate a main channel input that survived the full soft recovery to a hard
 // restart (respawn-pane). Driven by the pure decideStuckInputRestart; this
 // wrapper owns the I/O + counters. Called once per monitor tick right after the
@@ -1378,12 +1439,38 @@ export function buildQuietAlertSummary(state: QuietAlertBuffer, max = QUIET_ALER
 let quietAlerts: QuietAlertBuffer = EMPTY_QUIET_ALERT_BUFFER
 
 /** Add one line to the 24h digest buffer (audit AC-7). Best-effort: a digest
- * write must never break the monitor tick or swallow the caller's own path. */
-export function appendDigestEntry(entry: Omit<DigestEntry, 'ts'>): void {
+ * write must never break the monitor tick or swallow the caller's own path.
+ * Returns false when the write failed, so a caller that DOWNGRADED an owner
+ * alert to a digest line can still fall back rather than drop it silently. */
+export function appendDigestEntry(entry: Omit<DigestEntry, 'ts'>): boolean {
   try {
     saveAlertState(bufferDigestEntry(loadAlertState(), { ts: Date.now(), ...entry }))
+    return true
   } catch (err) {
     logger.warn({ err, source: entry.source }, 'appendDigestEntry failed (non-fatal)')
+    return false
+  }
+}
+
+// OWNER-ALERT DOCTRINE (Gabor, msg 4251 / card 919b96a8). An owner ping is
+// legitimate for exactly two things: a decision only Gabor can make, or an
+// impact he actually feels (deliverable, deadline, security). INTERNAL
+// OPERATIONAL STATE -- a starving queue, a parked pane, a restart, a stuck
+// dialog, a model drift -- goes self-heal -> coordinator -> daily digest and
+// NEVER to the owner, however long it has been unresolved. "The coordinator did
+// not get around to it" is not an owner decision; it is an open item.
+//
+// This helper is the last rung for those controls: what used to be a direct
+// sendAlert is now an 'open' digest entry. The coordinator rung ABOVE it is
+// unchanged -- it is only the terminal owner-fallback that is downgraded.
+//
+// The single exception is the digest write ITSELF failing: at that point
+// staying quiet would lose the finding entirely, so sendAlert remains as the
+// never-silent-drop backstop (same reasoning as the rate ceiling's breaker
+// notice -- a control that hides its own failure turns spam into silence).
+function recordInternalOpsFinding(source: string, summary: string): void {
+  if (!appendDigestEntry({ category: 'open', source, summary })) {
+    sendAlert(summary)
   }
 }
 
@@ -1690,14 +1777,15 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
               const msg = createAgentMessage(t.agentName, MAIN_AGENT_ID, buildThinkingBlockCoordinatorFlag(label))
               logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
             } catch (err) {
-              // Router enqueue failed -- do not lose the escalation; fall
-              // straight to the direct owner alert.
-              logger.warn({ err, session: t.session }, 'Thinking-block coordinator flag enqueue failed -- direct owner fallback')
-              sendAlert(buildThinkingBlockOwnerFallback(label))
+              // Router enqueue failed -- do not lose the escalation. It is still
+              // internal operational state, so it goes on the digest as an open
+              // item, NOT to the owner (see recordInternalOpsFinding).
+              logger.error({ err, session: t.session }, 'Thinking-block coordinator flag enqueue failed -- recording as an open digest item')
+              recordInternalOpsFinding(THINKING_BLOCK_SOURCE, buildThinkingBlockOwnerFallback(label))
             }
           } else if (esc.action === 'fallback-gabor') {
-            logger.error({ session: t.session, agent: label }, 'Thinking-block wedge unresolved after coordinator grace -- direct owner fallback')
-            sendAlert(buildThinkingBlockOwnerFallback(label))
+            logger.error({ session: t.session, agent: label }, 'Thinking-block wedge unresolved after coordinator grace -- open digest item (no owner ping)')
+            recordInternalOpsFinding(THINKING_BLOCK_SOURCE, buildThinkingBlockOwnerFallback(label))
           }
         } else {
           // The main channels session IS the coordinator: it cannot flag itself
@@ -1705,13 +1793,15 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           // could not act on an inter-agent message anyway. Unlike the
           // permission-dialog case (skip-permissions means main never parks in a
           // dialog), main CAN genuinely hit this error, so keep a single
-          // 30-min-throttled DIRECT owner alert as the safety net. Reuses the
-          // same map (wolfeFlaggedAt as the throttle stamp) so the cleanup path
-          // clears one map, not two.
+          // 30-min-throttled record of it. That record is a digest 'open' item,
+          // not an owner ping: a wedged coordinator is internal operational
+          // state, and the pending-age watchdog's self-heal is what recovers it.
+          // Reuses the same map (wolfeFlaggedAt as the throttle stamp) so the
+          // cleanup path clears one map, not two.
           if (prevEsc.wolfeFlaggedAt === null || now - prevEsc.wolfeFlaggedAt >= DIALOG_ESCALATE_DEDUP_MS) {
             paneErrorEscalation.set(t.session, { wolfeFlaggedAt: now, gaborNotifiedAt: prevEsc.gaborNotifiedAt })
-            logger.error({ session: t.session, agent: label }, 'Main channels session wedged on thinking-block API error -- direct owner alert (no coordinator to delegate to)')
-            sendAlert(buildThinkingBlockOwnerFallback(label))
+            logger.error({ session: t.session, agent: label }, 'Main channels session wedged on thinking-block API error -- open digest item (no coordinator to delegate to, no owner ping)')
+            recordInternalOpsFinding(THINKING_BLOCK_SOURCE, buildThinkingBlockOwnerFallback(label))
           }
         }
       }
@@ -1757,14 +1847,14 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
             const msg = createAgentMessage(t.agentName, MAIN_AGENT_ID, buildContextBudgetCoordinatorFlag(t.agentName))
             logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
           } catch (err) {
-            // Router enqueue failed -- do not lose the escalation; fall straight
-            // to the direct owner alert.
-            logger.warn({ err, session: t.session }, 'Context-budget coordinator flag enqueue failed -- direct owner fallback')
-            sendAlert(buildContextBudgetOwnerFallback(label))
+            // Router enqueue failed -- do not lose the finding; internal ops
+            // state goes to the digest, never an owner ping (card 919b96a8).
+            logger.error({ err, session: t.session }, 'Context-budget coordinator flag enqueue failed -- digest')
+            recordInternalOpsFinding(CONTEXT_BUDGET_SOURCE, buildContextBudgetOwnerFallback(label))
           }
         } else if (esc.action === 'fallback-gabor') {
-          logger.warn({ session: t.session, agent: label }, 'Sub-agent context ceiling unresolved after coordinator grace -- direct owner fallback')
-          sendAlert(buildContextBudgetOwnerFallback(label))
+          logger.error({ session: t.session, agent: label }, 'Sub-agent context ceiling unresolved after coordinator grace -- digest (no owner ping)')
+          recordInternalOpsFinding(CONTEXT_BUDGET_SOURCE, buildContextBudgetOwnerFallback(label))
         }
       } else {
         // Main channels session: full saturation is already handled by the
@@ -1775,8 +1865,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
         if (low) {
           if (mainContextLowAlertAt === null || now < mainContextLowAlertAt || now - mainContextLowAlertAt >= DIALOG_ESCALATE_DEDUP_MS) {
             mainContextLowAlertAt = now
-            logger.warn({ session: t.session }, 'Main channels session approaching context ceiling -- deduped owner heads-up')
-            sendAlert(buildContextBudgetOwnerFallback(BOT_NAME))
+            logger.warn({ session: t.session }, 'Main channels session approaching context ceiling -- digest (no owner ping, card 919b96a8)')
+            recordInternalOpsFinding(CONTEXT_BUDGET_SOURCE, buildContextBudgetOwnerFallback(BOT_NAME))
           }
         } else {
           mainContextLowAlertAt = null
@@ -1856,27 +1946,27 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
                 const msg = createAgentMessage(t.agentName, MAIN_AGENT_ID, buildDialogCoordinatorFlag(label))
                 logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
               } catch (err) {
-                // Router enqueue failed -- do not lose the escalation; fall
-                // straight to the direct owner alert so a stuck dialog is never
-                // silently dropped.
-                logger.warn({ err, session: t.session }, 'Permission-dialog coordinator flag enqueue failed -- direct owner fallback')
-                sendAlert(buildDialogOwnerFallback(label))
+                // Router enqueue failed -- do not lose the escalation. A stuck
+                // dialog is internal operational state, so it lands on the
+                // digest as an open item rather than paging the owner.
+                logger.error({ err, session: t.session }, 'Permission-dialog coordinator flag enqueue failed -- recording as an open digest item')
+                recordInternalOpsFinding(PERMISSION_DIALOG_SOURCE, buildDialogOwnerFallback(label))
               }
             } else if (esc.action === 'fallback-gabor') {
-              logger.warn({ session: t.session, agent: label }, 'Permission dialog unresolved after coordinator grace -- direct owner fallback')
-              sendAlert(buildDialogOwnerFallback(label))
+              logger.warn({ session: t.session, agent: label }, 'Permission dialog unresolved after coordinator grace -- open digest item (no owner ping)')
+              recordInternalOpsFinding(PERMISSION_DIALOG_SOURCE, buildDialogOwnerFallback(label))
             }
           } else {
             // Main channels session runs --dangerously-skip-permissions and so
             // never actually reaches here; if it ever did, the coordinator
             // cannot delegate its own dialog to itself. Keep a single
-            // 30-min-throttled DIRECT owner alert as a defensive net, reusing
-            // the same map (wolfeFlaggedAt as the throttle stamp) so the
-            // cleanup path clears one map, not two.
+            // 30-min-throttled record as a defensive net -- a digest 'open'
+            // item, not an owner ping -- reusing the same map (wolfeFlaggedAt as
+            // the throttle stamp) so the cleanup path clears one map, not two.
             if (prevEsc.wolfeFlaggedAt === null || Date.now() - prevEsc.wolfeFlaggedAt >= DIALOG_ESCALATE_DEDUP_MS) {
               paneDialogEscalation.set(t.session, { wolfeFlaggedAt: Date.now(), gaborNotifiedAt: prevEsc.gaborNotifiedAt })
-              logger.warn({ session: t.session, agent: label }, 'Main channels session parked in a permission dialog -- direct owner alert (no coordinator to delegate to)')
-              sendAlert(buildDialogOwnerFallback(label))
+              logger.warn({ session: t.session, agent: label }, 'Main channels session parked in a permission dialog -- open digest item (no coordinator to delegate to, no owner ping)')
+              recordInternalOpsFinding(PERMISSION_DIALOG_SOURCE, buildDialogOwnerFallback(label))
             }
           }
         } else if (pane != null && detectsModelCreditDialog(pane)) {
@@ -1929,7 +2019,7 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
               // own escalation path untouched.
               appendDigestEntry({
                 category: 'auto-fixed',
-                source: 'model-credit-gate',
+                source: MODEL_CREDIT_SOURCE,
                 summary: `${label}: model-credit dialogus feloldva a konfiguralt modellre (${configuredModel}, ${optionNum}. opcio) -- a session innentol usage-creditet fogyaszt`,
               })
             } else {
@@ -1962,23 +2052,25 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
                   const msg = createAgentMessage(t.agentName, MAIN_AGENT_ID, buildModelCreditCoordinatorFlag(label, configuredModel))
                   logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Agent message created')
                 } catch (err) {
-                  logger.warn({ err, session: t.session }, 'Model-credit coordinator flag enqueue failed -- direct owner fallback')
-                  sendAlert(buildModelCreditOwnerFallback(label))
+                  logger.error({ err, session: t.session }, 'Model-credit coordinator flag enqueue failed -- recording as an open digest item')
+                  recordInternalOpsFinding(MODEL_CREDIT_SOURCE, buildModelCreditOwnerFallback(label))
                 }
               } else if (esc.action === 'fallback-gabor') {
-                logger.warn({ session: t.session, agent: label }, 'Model-credit dialog unresolved after coordinator grace -- direct owner fallback')
-                sendAlert(buildModelCreditOwnerFallback(label))
+                logger.warn({ session: t.session, agent: label }, 'Model-credit dialog unresolved after coordinator grace -- open digest item (no owner ping)')
+                recordInternalOpsFinding(MODEL_CREDIT_SOURCE, buildModelCreditOwnerFallback(label))
               }
             } else {
               // Main channels session: the coordinator cannot delegate its own
-              // dialog to itself. Single throttled DIRECT owner alert, reusing
-              // wolfeFlaggedAt as the throttle stamp (same as the D1 fallback)
-              // so the spell-clear path still only has one map to clear.
+              // dialog to itself. Single throttled digest 'open' item (not an
+              // owner ping -- Gabor's standing model decisions already cover the
+              // routine case), reusing wolfeFlaggedAt as the throttle stamp
+              // (same as the D1 fallback) so the spell-clear path still only has
+              // one map to clear.
               if (prevEsc.wolfeFlaggedAt === null || Date.now() - prevEsc.wolfeFlaggedAt >= DIALOG_ESCALATE_DEDUP_MS) {
                 paneDialogEscalation.set(t.session, { wolfeFlaggedAt: Date.now(), gaborNotifiedAt: prevEsc.gaborNotifiedAt })
                 logger.warn({ session: t.session, agent: label, configuredModel },
-                  'Main channels session parked in a model-credit dialog with no matching option -- direct owner alert')
-                sendAlert(buildModelCreditOwnerFallback(label))
+                  'Main channels session parked in a model-credit dialog with no matching option -- open digest item (no owner ping)')
+                recordInternalOpsFinding(MODEL_CREDIT_SOURCE, buildModelCreditOwnerFallback(label))
               }
             }
           }
@@ -2250,7 +2342,10 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     // path must be replayable with injected senders); this block is the I/O
     // wiring. Routing per audit AC-2/AC-4/AC-5: routine findings go to the
     // coordinator with a claim on each item, and the owner is alerted only when
-    // the coordinator was told and went silent through the grace window.
+    // the coordinator was told and went silent through the grace window. The one
+    // case that never reaches the owner is the catch-22 (card 919b96a8): when
+    // every stalled target IS the coordinator the flag is undeliverable by
+    // definition, so the watchdog calls selfHealCoordinator instead.
     // Wrapped so a DB hiccup can never break the rest of the monitor tick.
     try {
       const nowMs = Date.now()
@@ -2258,6 +2353,7 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       runPendingAgeWatchdog({
         nowMs,
         pending: getPendingMessages(),
+        coordinatorAgentId: MAIN_AGENT_ID,
         sessionFor: (agent) => (agent === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(agent)),
         probeTarget: (agent) => {
           const session = agent === MAIN_AGENT_ID ? MAIN_CHANNELS_SESSION : agentSessionName(agent)
@@ -2275,6 +2371,7 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
         // and went silent through the grace window (AC-5) -- the class whose
         // suppression IS the silence risk, hence fatal (own, higher ceiling).
         sendOwner: (text) => sendAlert(text, { fatal: true }),
+        selfHealCoordinator: () => selfHealCoordinatorSession(),
         appendDigest: (entry) => appendDigestEntry(entry),
         claimEmit: (kind, key, dedupMs) => claimEmit(kind, key, nowMs, dedupMs),
       })

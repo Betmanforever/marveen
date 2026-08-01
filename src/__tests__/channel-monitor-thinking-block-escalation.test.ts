@@ -70,8 +70,13 @@ describe('channel-monitor: thinking-block wedge escalates to the coordinator fir
     // Escalation is sub-agent-scoped (the main session runs skip-permissions
     // and is itself the coordinator).
     expect(region).toContain('if (!t.isMarveen && t.agentName) {')
-    // A router enqueue failure must not silently drop the escalation.
-    expect(region).toContain('sendAlert(buildThinkingBlockOwnerFallback(label))')
+    // A router enqueue failure must not silently drop the escalation -- since
+    // card 919b96a8 it is recorded as a digest 'open' item rather than paged to
+    // the owner (a wedged agent is internal operational state, not his call).
+    // The "no owner transport anywhere in this pass" assertion lives in
+    // channel-monitor-internal-ops-digest.test.ts, where the region is sliced
+    // tightly enough to exclude the untouched context-budget pass.
+    expect(region).toContain('recordInternalOpsFinding(THINKING_BLOCK_SOURCE, buildThinkingBlockOwnerFallback(label))')
   })
 
   it('clears the escalation state when the error spell clears', () => {

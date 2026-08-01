@@ -76,9 +76,11 @@ describe('channel-monitor: limit-aware menu-recovery alert', () => {
     // FROM the stuck sub-agent (decision-flag.py convention)...
     expect(region).toContain('createAgentMessage(t.agentName, MAIN_AGENT_ID, buildDialogCoordinatorFlag(label))')
     expect(region).toContain("esc.action === 'notify-wolfe'")
-    // ...and only phase 2 (grace expired) falls back to a direct owner alert.
+    // ...and phase 2 (grace expired) records an OPEN digest item. It used to be
+    // a direct owner alert; card 919b96a8 downgraded that rung, because a stuck
+    // dialog is internal operational state and never Gabor's decision.
     expect(region).toContain("esc.action === 'fallback-gabor'")
-    expect(region).toContain('sendAlert(buildDialogOwnerFallback(label))')
+    expect(region).toContain('recordInternalOpsFinding(PERMISSION_DIALOG_SOURCE, buildDialogOwnerFallback(label))')
     // Escalation is sub-agent-scoped (the main session runs skip-permissions).
     expect(region).toContain('if (!t.isMarveen && t.agentName) {')
     // The old raw "attach to the terminal and decide" alert is gone from the

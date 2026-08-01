@@ -22,6 +22,7 @@ import {
   PENDING_AGE_THRESHOLD_MS,
   COORDINATOR_GRACE_MS,
   PANE_STALL_SWEEPS,
+  SELF_HEAL_DEDUP_MS,
   SIGNAL_ID,
   type PendingRow,
   type WatchdogDeps,
@@ -31,11 +32,15 @@ import {
 const MIN = 60 * 1000
 const TICK_MS = 60 * 1000 // the channel-monitor sweep interval
 
+const COORDINATOR = 'mr-wolfe'
+
 interface Recorder {
   coordinator: string[]
   owner: string[]
   digest: DigestAppend[]
   claims: Map<string, { by: string; expiresAt: number }>
+  /** One entry per selfHealCoordinator() call (card 919b96a8). */
+  selfHeals: number
 }
 
 interface HarnessOpts {
@@ -45,6 +50,8 @@ interface HarnessOpts {
   procAgeMs?: number | null
   /** Pre-existing foreign claim (audit AC-4). */
   foreignClaim?: { itemKey: string; by: string }
+  /** What the injected self-heal reports back. Default: the restart started. */
+  selfHealOk?: boolean
 }
 
 function makeDeps(rec: Recorder, nowMs: number, opts: HarnessOpts, sweep: number, pending: PendingRow[]): WatchdogDeps {
@@ -54,6 +61,7 @@ function makeDeps(rec: Recorder, nowMs: number, opts: HarnessOpts, sweep: number
   return {
     nowMs,
     pending,
+    coordinatorAgentId: COORDINATOR,
     sessionFor: (agent) => `agent-${agent}`,
     probeTarget: () => ({ pane: opts.paneAt(sweep), procAgeMs: opts.procAgeMs ?? 60 * 60 * 1000 }),
     liveClaimBy: (itemKey, nowSec) => {
@@ -65,6 +73,7 @@ function makeDeps(rec: Recorder, nowMs: number, opts: HarnessOpts, sweep: number
     releaseClaim: (itemKey) => { rec.claims.delete(itemKey) },
     sendCoordinator: (text) => { rec.coordinator.push(text) },
     sendOwner: (text) => { rec.owner.push(text) },
+    selfHealCoordinator: () => { rec.selfHeals++; return opts.selfHealOk !== false },
     appendDigest: (entry) => { rec.digest.push(entry) },
     claimEmit: (kind, key, dedupMs) => {
       const k = `${kind}:${key}`
@@ -77,7 +86,7 @@ function makeDeps(rec: Recorder, nowMs: number, opts: HarnessOpts, sweep: number
 }
 
 function newRecorder(): Recorder {
-  return { coordinator: [], owner: [], digest: [], claims: new Map() }
+  return { coordinator: [], owner: [], digest: [], claims: new Map(), selfHeals: 0 }
 }
 
 /** Sweep the watchdog every 60s from `fromMs` to `toMs`. */
@@ -248,5 +257,101 @@ describe('boot grace and self-healing', () => {
     expect(rec.claims.size).toBe(0)
     expect(rec.digest.at(-1)).toMatchObject({ category: 'auto-fixed', source: SIGNAL_ID })
     expect(rec.owner).toEqual([])
+  })
+})
+
+// Card 919b96a8 / incident 2026-08-01 13:04-13:21. A dashboard restart left an
+// unconfirmed typed prompt parked in the coordinator's own panel; the queue
+// backed up BEHIND the coordinator, so the watchdog's notify-wolfe rung was
+// undeliverable by construction (the flag would be enqueued into the stuck queue
+// addressed to the stuck agent), the grace expired unanswered, and at 13:21 the
+// fallback rung paged Gabor about a purely internal wedge. Gabor, msg 4251:
+// "Ilyeneket sem akarok latni."
+describe('catch-22: every stalled target IS the coordinator', () => {
+  // to_agent === COORDINATOR is the whole point of the fixture.
+  const TO_COORDINATOR: PendingRow = { id: 3756, from_agent: 'alert-policy', to_agent: COORDINATOR, created_at: 1785585869 }
+  const START = TO_COORDINATOR.created_at * 1000
+
+  it('self-heals instead of flagging the coordinator, and NEVER pages the owner', () => {
+    const rec = newRecorder()
+    const opts: HarnessOpts = { paneAt: () => 'frozen coordinator pane' }
+    // Well past the coordinator grace: under the old ladder this window is
+    // exactly what produced the 13:21 owner ping.
+    replay(rec, () => [TO_COORDINATOR], START, START + 40 * MIN, opts)
+
+    expect(rec.owner).toEqual([])
+    // The undeliverable rung is skipped entirely -- not sent and rotting.
+    expect(rec.coordinator).toEqual([])
+    // 40 minutes at a 30-minute dedup = two attempts. A wedge that outlives one
+    // respawn earns a second try, on the same cadence the coordinator would have
+    // been re-flagged on -- and still no owner ping.
+    expect(SELF_HEAL_DEDUP_MS).toBe(30 * MIN)
+    expect(rec.selfHeals).toBe(2)
+    expect(rec.digest[0]).toMatchObject({ category: 'auto-fixed', source: SIGNAL_ID })
+    expect(rec.digest[0].summary).toContain('#3756')
+  })
+
+  it('restarts at most once per dedup window, then records the episode as open', () => {
+    const rec = newRecorder()
+    const opts: HarnessOpts = { paneAt: () => 'frozen coordinator pane' }
+    replay(rec, () => [TO_COORDINATOR], START, START + 25 * MIN, opts)
+
+    // One restart across ~25 minutes of unbroken staleness, and the persisting
+    // wedge lands in the digest as OPEN rather than as a second respawn.
+    expect(rec.selfHeals).toBe(1)
+    expect(rec.digest.map((d) => d.category)).toEqual(['auto-fixed', 'open'])
+    expect(rec.owner).toEqual([])
+  })
+
+  it('a self-heal that could not start is an open digest item, still not an owner ping', () => {
+    const rec = newRecorder()
+    const opts: HarnessOpts = { paneAt: () => 'frozen coordinator pane', selfHealOk: false }
+    replay(rec, () => [TO_COORDINATOR], START, START + 8 * MIN, opts)
+
+    expect(rec.selfHeals).toBe(1)
+    expect(rec.digest[0]).toMatchObject({ category: 'open', source: SIGNAL_ID })
+    expect(rec.owner).toEqual([])
+  })
+
+  it('a foreign claim still wins: no self-heal while another emitter owns the item', () => {
+    const rec = newRecorder()
+    const opts: HarnessOpts = {
+      paneAt: () => 'frozen coordinator pane',
+      foreignClaim: { itemKey: `msg:${TO_COORDINATOR.id}`, by: 'pending-uzenet-watchdog' },
+    }
+    replay(rec, () => [TO_COORDINATOR], START, START + 40 * MIN, opts)
+
+    expect(rec.selfHeals).toBe(0)
+    expect(rec.owner).toEqual([])
+    expect(rec.digest.every((d) => d.category === 'muted')).toBe(true)
+  })
+
+  it('a MIXED stuck set is not the catch-22: the normal ladder still runs', () => {
+    // Only when EVERY stalled target is the coordinator is the flag provably
+    // undeliverable. One sub-agent in the set means the coordinator can still be
+    // told, so the untouched ladder (flag -> grace -> owner) must survive.
+    const rec = newRecorder()
+    const toSub: PendingRow = { id: 3757, from_agent: COORDINATOR, to_agent: 'neo', created_at: TO_COORDINATOR.created_at }
+    const opts: HarnessOpts = { paneAt: () => 'frozen pane' }
+    replay(rec, () => [TO_COORDINATOR, toSub], START, START + 40 * MIN, opts)
+
+    expect(rec.selfHeals).toBe(0)
+    expect(rec.coordinator.length).toBeGreaterThan(0)
+    expect(rec.owner).toHaveLength(1)
+  })
+
+  it('the catch-22 pass does not burn the episode ladder for a later real target', () => {
+    // The escalation machine must NOT advance on the self-heal path: if it did,
+    // this episode's single owner-fallback would be spent on a rung nobody ran.
+    const rec = newRecorder()
+    const opts: HarnessOpts = { paneAt: () => 'frozen pane' }
+    replay(rec, () => [TO_COORDINATOR], START, START + 20 * MIN, opts)
+    expect(rec.coordinator).toEqual([])
+
+    // The coordinator-bound row drains; a sub-agent-bound one is now the wedge.
+    const toSub: PendingRow = { id: 3758, from_agent: COORDINATOR, to_agent: 'neo', created_at: Math.floor((START + 21 * MIN) / 1000) }
+    replay(rec, () => [toSub], START + 25 * MIN, START + 60 * MIN, opts)
+    expect(rec.coordinator.length).toBeGreaterThan(0)
+    expect(rec.owner).toHaveLength(1)
   })
 })

@@ -10,6 +10,8 @@ import {
   paneLooksIdle,
   decideSubmitVerdict,
   type SubmitVerdictState,
+  decideParkedPromptRollback,
+  shouldRetrySubmit,
   shouldClearTruncatedPreamble,
   detectsPastePlaceholder,
   detectsPermissionDialog,
@@ -1550,12 +1552,22 @@ const PLACEHOLDER_DISCARD_SETTLE_S = '0.45'
 // detectsPastePlaceholder guarantees at the call site. We re-check before each
 // press and stop the instant the placeholder is gone, so we never press Ctrl-C
 // into an already-empty box. Returns true if the placeholder was cleared.
-function discardPlaceholderBuffer(session: string, host: string | null = null): boolean {
+//
+// `payloadHint` widens the "still parked" test to the SAME stuck signature the
+// send loop matched on (placeholder OR the payload verbatim), which is what the
+// give-up rollback path needs: by then the stub has usually expanded into a
+// multi-row verbatim buffer that detectsPastePlaceholder alone no longer sees.
+// Empty hint (the clear-and-resend call site) keeps the placeholder-only test
+// unchanged. shouldRetrySubmit reads false on a busy or empty box, so the loop
+// still stops before pressing Ctrl-C into either.
+function discardPlaceholderBuffer(session: string, host: string | null = null, payloadHint = ''): boolean {
+  const stillParked = (pane: string): boolean =>
+    detectsPastePlaceholder(pane) || (payloadHint !== '' && shouldRetrySubmit(pane, payloadHint))
   for (let i = 0; i < PLACEHOLDER_DISCARD_MAX; i++) {
     const pane = capturePane(session, host)
     // Stop pressing once the stub is gone -- a further Ctrl-C on an empty box
     // would quit the TUI.
-    if (pane != null && !detectsPastePlaceholder(pane)) return true
+    if (pane != null && !stillParked(pane)) return true
     try {
       runTmux(host, ['send-keys', '-t', session, 'C-c'], { timeout: 5000 })
     } catch (err) {
@@ -1565,7 +1577,77 @@ function discardPlaceholderBuffer(session: string, host: string | null = null): 
     try { execFileSync('/bin/sleep', [PLACEHOLDER_DISCARD_SETTLE_S], { timeout: 2000 }) } catch { /* best effort */ }
   }
   const finalPane = capturePane(session, host)
-  return finalPane != null && !detectsPastePlaceholder(finalPane)
+  return finalPane != null && !stillParked(finalPane)
+}
+
+// Where an unconfirmed typed prompt is preserved before its buffer is cleared.
+// One file per rollback (epoch-ms in the name) so a repeat never overwrites an
+// earlier one.
+export const PARKED_ROLLBACK_DIR = join(STORE_DIR, 'parked-input-rollback')
+
+/**
+ * Write parked pane content + the exact payload we typed to a rollback file,
+ * BEFORE anything clears the buffer (preserve-before-clearing). Returns the
+ * file path, or null when the write failed -- and a null MUST abort the clear:
+ * silently destroying text we never proved delivered is the one outcome worse
+ * than a wedged pane.
+ *
+ * `dir` is injectable so the contract test writes to a tmpdir instead of the
+ * live store.
+ */
+export function saveParkedInputRollback(
+  session: string,
+  pane: string | null,
+  payload: string,
+  dir: string = PARKED_ROLLBACK_DIR,
+): string | null {
+  // The session name reaches a filesystem path, so keep it to a safe charset --
+  // it can never traverse out of the rollback dir.
+  const safe = session.replace(/[^A-Za-z0-9._-]/g, '_') || 'session'
+  const file = join(dir, `${safe}-${Date.now()}.txt`)
+  const body = [
+    `# session: ${session}`,
+    `# saved:   ${new Date().toISOString()}`,
+    '# --- payload (as typed) ---',
+    payload,
+    '# --- pane capture ---',
+    pane ?? '(capture failed)',
+    '',
+  ].join('\n')
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    // Append-safe + owner-only: the payload can carry prompt content, and a name
+    // collision must append rather than truncate the earlier rollback.
+    appendFileSync(file, body, { mode: 0o600 })
+    return file
+  } catch (err) {
+    logger.warn({ err, session }, 'saveParkedInputRollback: could not preserve parked input -- NOT clearing the buffer')
+    return null
+  }
+}
+
+// Take an unconfirmed typed prompt back out of the target's input box: preserve
+// the parked content to a file FIRST, only then clear the buffer. Returns the
+// rollback file path, or null when nothing was rolled back.
+//
+// The decision is pure (decideParkedPromptRollback): only content this send can
+// attribute to ITSELF is ever cleared. Unexplained parked content -- a human's
+// draft, another sender's stranded message -- keeps the previous hands-off
+// behaviour, and a failed preserve aborts the clear.
+function rollbackUnconfirmedPrompt(
+  session: string,
+  host: string | null,
+  pane: string | null,
+  payloadHint: string,
+  payload: string,
+): string | null {
+  if (decideParkedPromptRollback(pane, payloadHint) !== 'preserve-then-clear') return null
+  const file = saveParkedInputRollback(session, pane, payload)
+  if (file == null) return null
+  if (!discardPlaceholderBuffer(session, host, payloadHint)) {
+    logger.warn({ session, rollback: file }, 'sendPromptToSession: parked prompt preserved but the buffer resisted clearing')
+  }
+  return file
 }
 
 // Outcome of a sendPromptToSession call, so a caller can tell a real delivery
@@ -1749,7 +1831,15 @@ export function sendPromptToSession(
       // unexplained sample. Report gave-up so the router leaves the message
       // pending (retry next tick) instead of a false delivered -- the 4fddd480
       // false-landed fix (msg 1105 read delivered while parked 20+ min).
-      logger.warn({ session, attempt }, 'sendPromptToSession: prompt not confirmed landed after retries')
+      //
+      // ROLLBACK (2026-08-01, card 919b96a8): giving up used to LEAVE our own
+      // typed text parked in the box, and a multi-row parked prompt blocks the
+      // pane until a human presses Enter -- that is what locked the
+      // coordinator's panel for 24 minutes. Take it back: preserve to a file
+      // first, then clear. Content we cannot attribute to this send stays
+      // untouched (decideParkedPromptRollback).
+      const rollback = rollbackUnconfirmedPrompt(session, host, pane, payloadHint, oneLine)
+      logger.warn({ session, attempt, rollback }, 'sendPromptToSession: prompt not confirmed landed after retries')
       return 'gave-up'
     }
     if (decision.verdict === 'resample') {

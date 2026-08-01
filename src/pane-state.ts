@@ -1253,6 +1253,36 @@ export function decideSubmitVerdict(
   return { verdict: sawUnexplained ? 'gave-up' : 'landed', next: { attempt: nextAttempt, sawUnexplained } }
 }
 
+/** What an unconfirmed ('gave-up') send may do with the target's input box. */
+export type ParkedPromptRollback = 'preserve-then-clear' | 'hands-off'
+
+/**
+ * Decide whether a send that ended in 'gave-up' may roll its own text back out
+ * of the target's input box.
+ *
+ * 'gave-up' historically LEFT the typed prompt parked there, and a multi-row
+ * parked input blocks the pane until somebody presses Enter by hand: on
+ * 2026-08-01 that wedged the coordinator's own panel for 24 minutes, and the
+ * downstream queue watchdog then paged the owner about a purely internal wedge
+ * (card 919b96a8). So the loop takes its own text back -- but ONLY when the box
+ * provably holds OUR payload:
+ *
+ *   - 'preserve-then-clear' -- the box still matches the stuck signature of THIS
+ *     send: the `[Pasted text #N]` placeholder our chunk stream tripped, or the
+ *     payload verbatim. The caller must write the content out to a file FIRST
+ *     and only then clear the buffer (preserve-before-clearing).
+ *   - 'hands-off' -- anything else: a failed capture, a busy pane, a clean box,
+ *     or UNEXPLAINED parked content (decideSubmitVerdict's third landing class --
+ *     a human's draft, another sender's stranded message, a bracketed-paste-
+ *     mutated payload we can no longer attribute to ourselves). Never cleared.
+ *
+ * Pure, so the "never clear what is not ours" invariant is testable without tmux.
+ */
+export function decideParkedPromptRollback(pane: string | null, payloadHint: string): ParkedPromptRollback {
+  if (pane == null) return 'hands-off'
+  return shouldRetrySubmit(pane, payloadHint) ? 'preserve-then-clear' : 'hands-off'
+}
+
 export interface PaneErrorAlertState {
   /** When the session was first observed in the error state during the
    * current spell, or null when there is no active spell. */

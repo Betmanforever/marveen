@@ -100,7 +100,7 @@ describe('channel-monitor: model-credit dialog branch', () => {
     const successBranch = region.slice(region.indexOf('if (navigated) {'), region.indexOf('} else {', region.indexOf('if (navigated) {')))
     expect(successBranch).toContain('appendDigestEntry({')
     expect(successBranch).toContain("category: 'auto-fixed'")
-    expect(successBranch).toContain("source: 'model-credit-gate'")
+    expect(successBranch).toContain('source: MODEL_CREDIT_SOURCE')
     expect(successBranch).toContain('${configuredModel}, ${optionNum}. opcio')
     expect(successBranch).toContain('usage-creditet fogyaszt')
     expect(successBranch).not.toContain('sendAlert(')
@@ -128,11 +128,14 @@ describe('channel-monitor: model-credit dialog branch', () => {
     // ...phase 1 flags the coordinator FROM the stuck sub-agent...
     expect(escalate).toContain('createAgentMessage(t.agentName, MAIN_AGENT_ID, buildModelCreditCoordinatorFlag(label, configuredModel))')
     expect(escalate).toContain("esc.action === 'notify-wolfe'")
-    // ...and only phase 2 falls back to a direct owner alert.
+    // ...and phase 2 records an OPEN digest item. Card 919b96a8 downgraded this
+    // rung from a direct owner alert: an unresolved model-credit gate is
+    // internal operational state. The FAILED-navigation branch above is the one
+    // that stays owner-facing, and it is asserted separately.
     expect(escalate).toContain("esc.action === 'fallback-gabor'")
-    expect(escalate).toContain('sendAlert(buildModelCreditOwnerFallback(label))')
+    expect(escalate).toContain('recordInternalOpsFinding(MODEL_CREDIT_SOURCE, buildModelCreditOwnerFallback(label))')
     // Escalation is sub-agent-scoped; the main session gets the throttled
-    // direct alert instead (it cannot delegate its own dialog to itself).
+    // digest item instead (it cannot delegate its own dialog to itself).
     expect(escalate).toContain('if (!t.isMarveen && t.agentName) {')
   })
 
