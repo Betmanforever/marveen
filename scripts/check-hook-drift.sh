@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # Silent-by-default drift check for the skill-index-autoregen PostToolUse hook
-# across the 5 fleet registration points (0123b6bd, 2026-07-29). This is a NET,
+# across the 5 fleet registration points (0123b6bd, 2026-07-29).
+#
+# SCOPE: this script proves REGISTRATION only. A green result here does NOT
+# mean the hook fired or the index is fresh. If you are investigating a
+# suspected missed regen:
+#   - the canonical run register is store/skill-index-autoregen.log
+#     (QUEUE lines = hook fired, OK/FAIL lines = regen outcome) -- read THAT,
+#     not the index mtime;
+#   - the hook is DEBOUNCED (45s quiet window + regen runtime), so for ~1-2
+#     minutes after an edit burst the index legitimately predates the newest
+#     SKILL.md -- a mid-window mtime read is not a miss (2026-08-02 lesson);
+#   - the output-side guard is check-skill-index-freshness.sh (grace-aware);
+#     run that instead of comparing mtimes by hand. This is a NET,
 # not the primary defense -- the primary defense is templates/settings.json.template
 # (single source, applied via the idempotent ensureAgentHooks() merge on every
 # dashboard startup AND every agent spawn). This script exists only to catch a
