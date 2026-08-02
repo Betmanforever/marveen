@@ -37,7 +37,12 @@ cd "$INSTALL_DIR"
 DIGEST=""
 ACK_TOKEN=""
 TOKEN_FILE="$INSTALL_DIR/store/.dashboard-token"
-if [ -r "$TOKEN_FILE" ]; then
+# Dry-run must be side-effect-free: consume PARKS entries under an ack token
+# for the TTL, so a test assembly would hide real findings from a briefing
+# that runs within that window.
+if [ "${MORNING_DRY_RUN:-0}" = "1" ]; then
+  DIGEST="(dry-run: digest-szekcio helye)"
+elif [ -r "$TOKEN_FILE" ]; then
   # Two-phase consume (close condition C-4): the fetch PARKS the entries under
   # an ack token; the delete happens only at the ack after claude -p exited 0.
   # A briefing that dies mid-flight never acks, and the entries return to the
@@ -66,18 +71,47 @@ $DIGEST
 "
 fi
 
-$CLAUDE --dangerously-skip-permissions \
-  --channels plugin:telegram@claude-plugins-official \
-  -p "Reggeli napindító - készítsd el és küld el Telegramra (chat_id: $CHAT_ID).
+# Single prompt source (2026-08-02): the full briefing prompt lives in
+# morning-briefing-prompt.md, NOT inline -- the old two-path setup (this
+# script's inline prompt + the reggeli-napindito scheduled task's SKILL.md)
+# meant an edit to one path silently never reached the other. Placeholder
+# substitution is python (no shell expansion of the file's $-bearing code
+# blocks); the digest section is appended by the script because its
+# consume/ack lifecycle is this script's mechanism.
+PROMPT_FILE="$INSTALL_DIR/scripts/morning-briefing-prompt.md"
+if [ -r "$PROMPT_FILE" ]; then
+  PROMPT="$(CHAT_ID="$CHAT_ID" CALENDAR_ID="$CALENDAR_ID" python3 -c '
+import os,sys
+t = open(sys.argv[1]).read()
+t = t.replace("{{CHAT_ID}}", os.environ.get("CHAT_ID",""))
+t = t.replace("{{CALENDAR_ID}}", os.environ.get("CALENDAR_ID",""))
+print(t)' "$PROMPT_FILE")"
+else
+  # Fallback: a missing prompt file must not silence the whole briefing.
+  echo "WARN: $PROMPT_FILE missing -- falling back to minimal inline prompt" >> "$LOG"
+  PROMPT="Reggeli napindító - készítsd el és küld el Telegramra (chat_id: $CHAT_ID).
 
 1. Email check: search_emails az elmúlt 12 órából, szűrd ki a spam/promo emaileket
 2. Naptár: getCalendarEvents a mai napra a $CALENDAR_ID naptárból (Europe/Budapest timezone)
 3. AI hírek: WebSearch \"AI news [tegnapi dátum]\"
 4. Küld el Telegramra a reply tool-lal (chat_id: $CHAT_ID)
 
-${DIGEST_STEP}
+Tömör, lényegre törő. Ékezetesen írj magyarul."
+fi
 
-Tömör, lényegre törő. Ékezetesen írj magyarul." >> "$LOG" 2>&1
+PROMPT="$PROMPT
+
+${DIGEST_STEP}"
+
+if [ "${MORNING_DRY_RUN:-0}" = "1" ]; then
+  # Test hook: print the assembled prompt instead of launching claude.
+  printf '%s\n' "$PROMPT"
+  exit 0
+fi
+
+$CLAUDE --dangerously-skip-permissions \
+  --channels plugin:telegram@claude-plugins-official \
+  -p "$PROMPT" >> "$LOG" 2>&1
 CLAUDE_EXIT=$?
 
 # Ack only on success: exit 0 is the best delivery signal this script has (the
